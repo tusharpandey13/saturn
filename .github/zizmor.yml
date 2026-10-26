@@ -1,0 +1,8 @@
+# Reviewed exceptions (one line of reason each).
+rules:
+  artipacked:
+    ignore:
+      - batch.yml   # the records checkout keeps its job-scoped App token for the batch push; no artifacts are uploaded
+  adhoc-packages:
+    ignore:
+      - batch.yml   # the LLM CLI is installed at an exact version pinned in env vars; bump deliberately

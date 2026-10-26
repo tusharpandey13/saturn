@@ -1,0 +1,1 @@
+{"rt": "ref", "id": "ref:drug:examplezole", "ns": "ref", "kind": "drug", "name": "Examplezole", "data": {"brand": "Examplezole", "generic": "examplezole", "ingredients": ["examplezole"], "certainty": "confirmed", "persons": ["alice"]}, "recorded_by": "fixture", "created_at": "2026-10-26", "status": "active", "supersedes": null, "tags": [], "note": null}

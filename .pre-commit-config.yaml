@@ -1,0 +1,51 @@
+# The single gate (split plan section 8), same config locally and in CI: `pre-commit run --all-files`.
+# Hook repos are pinned by commit SHA (Dependabot does not bump these; `pre-commit autoupdate --freeze` does).
+# PHI/deployment term rules are NOT here: each environment keeps its own private gitleaks rule file and runs
+# `gitleaks dir --config <private.toml>` over this repo (the denylist gate, docs/security.md).
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/lycheeverse/lychee
+    rev: 2bba271688c1abb1503097a064e6c3bc1d1b6a9b # lychee-v0.24.2
+    hooks:
+      - id: lychee
+        args: ["--no-progress", "--offline"]
+        files: \.md$
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0494aa7fa1314e98913a41227d8f0a515b2c1049 # 0.38.2
+    hooks:
+      - id: check-jsonschema
+        name: agent task pack matches agent-tasks/task.schema.json
+        files: ^agent-tasks/[^/]+\.yaml$
+        args: [--schemafile, agent-tasks/task.schema.json]
+      - id: check-metaschema
+        name: KB schemas are valid JSON Schema
+        files: ^schema/[^/]+\.schema\.json$
+      - id: check-github-workflows
+      - id: check-dependabot
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+    hooks:
+      - id: actionlint
+        files: ^(\.github/workflows|deploy/github)/[^/]+\.ya?ml$
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: c92afdf2c6ca336aaa8f39e2bd8d48f62dbd8e1f # v1.31.1
+    hooks:
+      - id: zizmor
+        files: ^(\.github/workflows|deploy/github)/[^/]+\.ya?ml$
+  - repo: local
+    hooks:
+      - id: kb-example
+        name: example records build; their generated pages are current (gen-views --check)
+        language: system
+        entry: sh -c 'python3 -I tools/kb/build --records fixtures/records-example --check && python3 -I tools/kb/test_gen.py'
+        pass_filenames: false
+        files: ^(tools/kb/|schema/|fixtures/records-example/)
+      - id: no-binaries-outside-fixtures
+        name: binary files only under fixtures/
+        language: fail
+        entry: binary files belong under fixtures/ (synthetic only)
+        types: [binary]
+        exclude: ^fixtures/

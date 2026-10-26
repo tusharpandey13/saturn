@@ -1,0 +1,54 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "ref.data for kind=drug (Indian brand -> generic). ref.name = brand (or generic when no brand)",
+ "type": "object",
+ "properties": {
+  "brand": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "generic": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "ingredients": {
+   "type": "array"
+  },
+  "class": {
+   "type": "string"
+  },
+  "certainty": {
+   "enum": [
+    "confirmed",
+    "probable",
+    "uncertain"
+   ]
+  },
+  "evidence": {
+   "type": "string"
+  },
+  "persons": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "pattern": "^[a-z][a-z0-9-]*$",
+    "x-ns": true
+   }
+  },
+  "brand_variants": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  }
+ },
+ "additionalProperties": false,
+ "required": [
+  "certainty",
+  "ingredients"
+ ]
+}

@@ -1,0 +1,27 @@
+# Saturn task stub. PHI: refs-only params, claude tier only, output as a PR on jobs/<id>.
+# Phase 1: enabled, but the dispatcher does not implement git_pr delivery yet, so a submitted job
+# fails as a contract error (dead). Do not submit until phase 2.
+name: hl.doctor_brief
+description: Weekly doctor brief (docs/analysis/YYYY-MM).
+enabled: true
+tiers: [deep, standard]
+max_class: phi
+min_class: phi               # hl.* is always phi: a client that labels it lower is rejected
+subscription: owner_use
+tools: [Read, Grep, Glob]
+outputs: [git_pr]
+max_attempts: 3
+budget: { max_usd: 5, max_turns: 40, timeout_s: 1800 }
+params_schema:
+  type: object
+  additionalProperties: false
+  properties:
+    queue_id: { type: string, maxLength: 200 }
+    paths: { type: array, maxItems: 50, items: { type: string, maxLength: 300 } }
+output_schema:
+  type: object
+  required: [summary]
+  properties:
+    summary: { type: string }
+prompt: |
+  TODO(phase 2): hl.doctor_brief prompt. Inputs are git refs only: {{paths}}

@@ -1,0 +1,50 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "fact.data for kind=event (ADR 007). Visits/admissions (ADR 004 encounters) are events; other facts point at them with context_id",
+ "type": "object",
+ "properties": {
+  "type": {
+   "enum": [
+    "opd",
+    "admission",
+    "teleconsult",
+    "test_visit",
+    "in_absentia",
+    "home",
+    "procedure",
+    "travel",
+    "fall",
+    "missed_dose",
+    "hospitalisation",
+    "other"
+   ]
+  },
+  "label": {
+   "type": "string"
+  },
+  "end": {
+   "type": "string"
+  },
+  "org_id": {
+   "type": "string",
+   "x-ref": "party"
+  },
+  "practitioner_id": {
+   "type": "string",
+   "x-ref": "party"
+  },
+  "reason_text": {
+   "type": "string"
+  },
+  "detail": {
+   "type": [
+    "object",
+    "string"
+   ]
+  }
+ },
+ "additionalProperties": false,
+ "required": [
+  "type"
+ ]
+}

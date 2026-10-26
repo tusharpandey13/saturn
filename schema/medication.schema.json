@@ -1,0 +1,66 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "fact.data for kind=medication (ADR 007). status = what the statement says (prescription vs taken), not how well it was read",
+ "type": "object",
+ "properties": {
+  "status": {
+   "enum": [
+    "prescribed",
+    "dispensed",
+    "taking",
+    "stopped"
+   ]
+  },
+  "brand": {
+   "type": "string"
+  },
+  "drug_id": {
+   "type": "string",
+   "x-ref": "drug"
+  },
+  "strength": {
+   "type": "string"
+  },
+  "schedule_raw": {
+   "type": "string"
+  },
+  "dose_m": {
+   "type": "number"
+  },
+  "dose_n": {
+   "type": "number"
+  },
+  "dose_e": {
+   "type": "number"
+  },
+  "route": {
+   "type": "string"
+  },
+  "end": {
+   "type": "string"
+  },
+  "duration_text": {
+   "type": "string"
+  },
+  "prescriber_id": {
+   "type": "string",
+   "x-ref": "party"
+  }
+ },
+ "additionalProperties": false,
+ "required": [
+  "status"
+ ],
+ "anyOf": [
+  {
+   "required": [
+    "brand"
+   ]
+  },
+  {
+   "required": [
+    "drug_id"
+   ]
+  }
+ ]
+}

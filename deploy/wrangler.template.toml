@@ -1,0 +1,21 @@
+# Cloudflare Worker config template (ADR 005, Workers Free plan). Rendered to app/wrangler.toml by
+# `cd app && npm run render -- --env <env.yaml>` (app/scripts/render.ts); the rendered file is gitignored.
+# ${path} = a value from env.yaml; a line with ${?path} is dropped when the value is empty.
+# Resource auto-provisioning: with no database_id, `wrangler deploy` creates the D1 database (and the R2 bucket) on
+# the first deploy and binds it; pin the id in env.yaml afterwards so later deploys never create a second one.
+# Secrets (pushed by deploy/deploy.sh): TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET.
+name = "${cloudflare.worker_name}"
+main = "src/worker.ts"
+compatibility_date = "${cloudflare.compatibility_date}"
+
+# Allowed chats and senders live in D1 (tables chats, persons): chat ids change on a supergroup upgrade.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "${cloudflare.d1.name}"
+database_id = "${?cloudflare.d1.id}"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "${cloudflare.r2_bucket}"

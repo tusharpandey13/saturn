@@ -1,0 +1,17 @@
+# gitleaks for the product: the default rules plus the token formats this product handles.
+# PHI and deployment-term rules (names, hosts, ids, org) are kept privately by each environment / records repo and
+# run as a separate scan (`gitleaks dir --config <private.toml> .`); they are never committed here.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram bot token"
+regex = '''\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b'''
+keywords = [":AA"]
+
+[[rules]]
+id = "cloudflare-api-token"
+description = "Cloudflare API token (cfat_ prefix)"
+regex = '''\bcfat_[A-Za-z0-9_-]{30,}\b'''
+keywords = ["cfat_"]

@@ -1,0 +1,31 @@
+.DS_Store
+*.env
+.env*
+.dev.vars
+secrets/
+node_modules/
+__pycache__/
+.pytest_cache/
+
+# media never goes into git (ADR 002): videos, scans
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.LRF
+*.lrf
+*.zip
+scans/
+tools/doc-scan/out/
+tools/doc-scan/.venv/
+
+# derived
+*.sqlite
+data/kb.tmp
+fixtures/records-example/data/kb.sqlite
+site/
+.wrangler/
+.vitest/
+.batch/
+app/wrangler.toml
+.claude/worktrees/

@@ -1,0 +1,5 @@
+{
+  "name": "Saturn",
+  "slug": "saturn",
+  "note": "Working name (2026-10-26). The single product-name constant: code reads it from here; README and package names repeat it. Rename = edit this file, package names and README."
+}

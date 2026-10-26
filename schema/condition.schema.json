@@ -1,0 +1,28 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "fact.data for kind=condition (ADR 007)",
+ "type": "object",
+ "properties": {
+  "text_as_written": {
+   "type": "string"
+  },
+  "label": {
+   "type": "string"
+  },
+  "icd10": {
+   "type": "string"
+  },
+  "status_as_documented": {
+   "enum": [
+    "query",
+    "confirmed",
+    "resolved",
+    "history"
+   ]
+  }
+ },
+ "additionalProperties": false,
+ "required": [
+  "text_as_written"
+ ]
+}

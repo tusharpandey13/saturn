@@ -1,0 +1,98 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "fact.data for kind=observation (ADR 007)",
+ "type": "object",
+ "properties": {
+  "code": {
+   "type": "string",
+   "x-ref": "code"
+  },
+  "category": {
+   "enum": [
+    "lab",
+    "vital",
+    "imaging",
+    "ecg",
+    "symptom",
+    "exam"
+   ]
+  },
+  "value_num": {
+   "type": "number"
+  },
+  "value_text": {
+   "type": "string"
+  },
+  "unit": {
+   "type": "string"
+  },
+  "value_raw": {
+   "type": "string"
+  },
+  "unit_raw": {
+   "type": "string"
+  },
+  "ref_low": {
+   "type": "number"
+  },
+  "ref_high": {
+   "type": "number"
+  },
+  "ref_text": {
+   "type": "string"
+  },
+  "flag": {
+   "enum": [
+    "H",
+    "L",
+    "N"
+   ]
+  },
+  "flag_basis": {
+   "enum": [
+    "printed",
+    "bold",
+    "computed"
+   ]
+  },
+  "specimen": {
+   "type": "string"
+  },
+  "method": {
+   "type": "string"
+  },
+  "device": {
+   "type": "string"
+  },
+  "body_site": {
+   "type": "string"
+  },
+  "components": {
+   "type": "object"
+  },
+  "panel": {
+   "type": "string"
+  },
+  "org_id": {
+   "type": "string",
+   "x-ref": "party"
+  }
+ },
+ "additionalProperties": false,
+ "required": [
+  "code",
+  "category"
+ ],
+ "anyOf": [
+  {
+   "required": [
+    "value_num"
+   ]
+  },
+  {
+   "required": [
+    "value_text"
+   ]
+  }
+ ]
+}

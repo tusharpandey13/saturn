@@ -1,0 +1,434 @@
+#!/usr/bin/env -S python3 -I
+"""Validate <records>/data/**/*.ndjson and rebuild <records>/data/kb.sqlite (ADR 007: source / fact(kind) / ref).
+
+Usage: tools/kb/build --records DIR [--env FILE] [--db PATH] [--data DIR] [--telegram DIR] [--check]
+       (stdlib + sqlite3 only; exit 1 on any error)
+--records: the records repo root. Its records.yaml supplies the namespaces, the D1 person map and schema_version
+(checked against this product). --env: an env.yaml whose top-level `records_dir:` is used when --records is absent.
+--check: validate only; the database is built in a temp file and discarded. The schema is the product's schema/.
+Each NDJSON line is one record; "rt" names its table (person | ref | source | fact). Errors cite file:line.
+data/telegram/*.ndjson holds the Telegram rows ("rt": "d1.<table>", the bot's D1 row shape) written by the daily batch
+(app/batch, ADR 005); they are mapped here into source + fact. data/meta/ (id maps) and *.jsonl files are not read.
+--data: build from another data dir (tests); --telegram: read Telegram months from a fixture dir instead.
+"""
+import datetime, json, pathlib, re, sqlite3, sys, tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))  # python3 -I drops the script dir; the shared loader lives beside this file
+import records_config  # noqa: E402
+
+PRODUCT = HERE.parents[1]
+SCHEMA_DIR = PRODUCT / "schema"
+ID_RE = None  # built at runtime from records.yaml namespaces (records_config.id_regex)
+AT_RE = re.compile(r"^\d{4}(-\d{2}(-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?\+05:30)?)?)?$")
+PRECISION_LEN = {"year": 4, "month": 7, "day": 10}
+CLASS_RT = {"src": "source", "fact": "fact"}
+ORDER = ["person", "ref", "source", "fact"]
+REQUIRED = {  # envelope fields that must be present and non-null (beyond the SQL NOT NULLs)
+    "ref": ["id", "ns", "kind", "name", "data", "recorded_by", "created_at", "status", "tags"],
+    "source": ["id", "ns", "kind", "rank", "recorded_by", "created_at", "status", "tags"],
+    "fact": ["id", "ns", "kind", "at", "at_precision", "data", "source_id", "verification", "status", "recorded_by",
+             "created_at", "tags"],
+}
+# id-valued columns -> the class they must point at
+LINKS = {"source": {"duplicate_of": "source", "org_id": "ref:party", "practitioner_id": "ref:party", "context_id": "fact",
+                    "supersedes": "source"},
+         "fact": {"source_id": "source", "context_id": "fact", "supersedes": "fact"},
+         "ref": {"supersedes": "ref"}}
+
+# ---- Telegram (D1 export) -> source + fact ---------------------------------------------------------------------
+D1_TABLES = {"persons", "chats", "messages", "readings", "symptoms", "alerts"}
+D1_PERSON = {}  # D1 person id -> KB ns (same id otherwise); records.yaml d1_person_map
+# reading type -> (code local, category, canonical unit)
+D1_READING = {
+    "weight": ("weight", "vital", "kg"), "bp": ("bp", "vital", "mm[Hg]"), "pulse": ("pulse", "vital", "/min"),
+    "spo2": ("spo2", "vital", "%"), "potassium": ("potassium", "lab", "mmol/L"), "sodium": ("sodium", "lab", "mmol/L"),
+    "creatinine": ("creatinine", "lab", "mg/dL"), "glucose_fasting": ("glucose-fasting", "lab", "mg/dL"),
+    "glucose_pp": ("glucose-pp", "lab", "mg/dL"), "glucose_random": ("glucose-random", "lab", "mg/dL"),
+}
+SYMPTOM_DETAIL = ["location", "side", "character", "severity", "duration_min", "at_rest", "associated", "triggers"]
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def ist(ts):
+    """Any ISO timestamp -> ISO with +05:30 (seconds dropped when zero)."""
+    t = datetime.datetime.fromisoformat(ts).astimezone(IST).replace(microsecond=0)
+    return t.isoformat(timespec="minutes" if t.second == 0 else "seconds")
+
+
+def tg_local(ts, d1_id):
+    """KB local id for a Telegram row: IST date + 'tg.' + the D1 id (':' -> '.', other odd chars -> '-')."""
+    return f"{ist(ts)[:10]}-tg." + re.sub(r"[^a-z0-9.-]", "-", str(d1_id).lower().replace(":", "."))
+
+
+def _jl(v):
+    """D1 stores lists as JSON text."""
+    try:
+        return json.loads(v) if isinstance(v, str) else v
+    except json.JSONDecodeError:
+        return v
+
+
+def _envelope(row, msg, quote, ns, src_id):
+    # confirmed: 1 = patient confirmed, -1 = rejected, 0 = not confirmed (ADR 005 has no confirm step: always 0 now).
+    confirmed = row.get("confirmed", 0)
+    conf = row.get("confidence")
+    return {
+        "ns": ns, "source_id": src_id, "quote": quote[:200] if quote else None,
+        "recorded_by": row.get("extracted_by") or (msg or {}).get("extracted_by") or "telegram-bot",
+        "created_at": row.get("extracted_at") or (msg or {}).get("extracted_at") or (msg or {}).get("received_at"),
+        "verification": "patient" if confirmed == 1 else "unverified",
+        "status": "retracted" if confirmed == -1 else "active",
+        "tags": ["low-confidence"] if conf is not None and conf < 0.8 else [],
+    }
+
+
+def telegram_records(rows, root):
+    """rows: [(where, d1_table, d1_row)] -> ([(where, rt, kb_row)], errors)."""
+    out, errors = [], []
+    msgs = {r["id"]: r for _, t, r in rows if t == "messages" and "id" in r}
+    media = {f"telegram/{f.stem}": str(f.relative_to(root)) for f in root.glob("sources/*/media/telegram/*")}
+    src_ids = {}
+    for where, t, r in rows:
+        try:
+            if t in ("persons", "chats", "alerts"):
+                continue  # kept in git for a D1 rebuild; not clinical facts
+            ns = D1_PERSON.get(r["person_id"], r["person_id"])
+            if t == "messages":
+                ex = _jl(r.get("extraction_json")) if r.get("extraction_json") else None
+                kind = ex.get("media_kind") if isinstance(ex, dict) else None
+                parts = [f"telegram {r['kind']}", kind and kind != "none" and f"media_kind={kind}",
+                         r.get("transcript") and f"transcript: {r['transcript'][:500]}"]
+                sid = src_ids[r["id"]] = f"{ns}:src:{tg_local(r['received_at'], r['id'])}"
+                out.append((where, "source", {
+                    "id": sid, "ns": ns, "kind": "telegram_msg", "path": media.get(r.get("media_ref") or ""),
+                    "received_at": ist(r["received_at"]), "sender": r.get("sender_id"), "rank": "original",
+                    "identifiers": {"d1_id": r["id"], **{k: r[k] for k in ("external_id", "chat_id", "media_ref") if r.get(k)}},
+                    "recorded_by": r.get("extracted_by") or "telegram-bot",
+                    "created_at": r.get("extracted_at") or r["received_at"], "status": "active", "tags": [],
+                    "note": "; ".join(x for x in parts if x),
+                }))
+        except KeyError as e:
+            errors.append(f"{where}: d1.{t} row missing {e}")
+    for where, t, r in rows:
+        if t not in ("readings", "symptoms"):
+            continue
+        try:
+            ns = D1_PERSON.get(r["person_id"], r["person_id"])
+            msg = msgs.get(r["source_message_id"])
+            sid = src_ids.get(r["source_message_id"], f"{ns}:src:missing-tg.{r['source_message_id']}")
+            said = (msg.get("raw_text") or msg.get("transcript")) if msg else None
+            if t == "readings":
+                code, cat, unit = D1_READING[r["type"]]
+                at = ist(r["measured_at"])
+                env = _envelope(r, msg, said, ns, sid)
+                data = {"code": f"ref:code:{code}", "category": cat, "value_num": r["value"], "unit": unit,
+                        "value_raw": None if r.get("source_value") is None else str(r["source_value"]),
+                        "unit_raw": r.get("source_unit") or r["unit"],
+                        "method": "home glucometer" if code.startswith("glucose") else None}
+                if code == "bp":
+                    data["components"] = {"systolic": r["value"], "diastolic": r.get("value2")}
+                fid = f"{ns}:fact:{tg_local(r['measured_at'], r['id'])}"
+                out.append((where, "fact", {"id": fid, "kind": "observation", "at": at, "at_precision": "minute",
+                                            "data": data, **env}))
+                if code == "bp" and r.get("value3") is not None:  # pulse shown on the BP monitor
+                    out.append((where, "fact", {"id": f"{fid}.pulse", "kind": "observation", "at": at,
+                                                "at_precision": "minute", **env,
+                                                "data": {"code": "ref:code:pulse", "category": "vital",
+                                                         "value_num": r["value3"], "unit": "/min", "method": "BP monitor"}}))
+            else:
+                detail = {k: _jl(r.get(k)) for k in SYMPTOM_DETAIL if r.get(k) not in (None, "[]")}
+                env = _envelope(r, msg, r.get("free_text") or said, ns, sid)
+                fid = f"{ns}:fact:{tg_local(r['observed_at'], r['id'])}"
+                at = ist(r["observed_at"])
+                if r["symptom_type"] == "fall":  # a fall is an event, not a measurement
+                    out.append((where, "fact", {"id": fid, "kind": "event", "at": at, "at_precision": "minute",
+                                                "data": {"type": "fall", "label": "fall", "detail": detail}, **env}))
+                else:
+                    out.append((where, "fact", {"id": fid, "kind": "observation", "at": at, "at_precision": "minute",
+                                                "data": {"code": "ref:code:symptom", "category": "symptom",
+                                                         "value_text": r["symptom_type"], "body_site": r.get("location"),
+                                                         "components": detail}, **env}))
+        except KeyError as e:
+            errors.append(f"{where}: d1.{t} row missing {e} (or unknown reading type)")
+    clean = lambda d: {k: (clean(v) if k == "data" else v) for k, v in d.items() if v is not None}
+    return [(w, t, clean(r)) for w, t, r in out], errors
+
+
+# ---- minimal JSON Schema subset (type, enum, pattern, maxLength, minimum, maximum, required, properties,
+#      additionalProperties: false, items, anyOf) + "x-ref": <ref kind> -------------------------------------------
+TYPES = {"object": dict, "array": list, "string": str, "boolean": bool, "null": type(None)}
+
+
+def _is(v, t):
+    if t in ("number", "integer"):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and (t == "number" or float(v).is_integer())
+    return isinstance(v, TYPES[t])
+
+
+NAMESPACES = ()  # set in main from records.yaml; "x-ns": true checks a string is one of them
+# JSON Schema keywords this validator implements (+ x-ref, x-ns). Any other keyword in a schema is an error, so a
+# schema never silently promises a check that is not run.
+KNOWN_KEYWORDS = {"$schema", "$id", "title", "description", "type", "enum", "pattern", "maxLength", "minimum", "maximum",
+                  "properties", "required", "additionalProperties", "items", "anyOf", "x-ref", "x-ns", "examples",
+                  "$comment", "default"}
+
+
+def unknown_keywords(s, path="$"):
+    out = []
+    if isinstance(s, dict):
+        out += [f"{path}: unsupported keyword {k!r}" for k in s if k not in KNOWN_KEYWORDS]
+        for k in ("items",):
+            if isinstance(s.get(k), dict):
+                out += unknown_keywords(s[k], f"{path}.{k}")
+        for k, sub in (s.get("properties") or {}).items():
+            out += unknown_keywords(sub, f"{path}.properties.{k}")
+        for i, sub in enumerate(s.get("anyOf") or []):
+            out += unknown_keywords(sub, f"{path}.anyOf[{i}]")
+    return out
+
+
+def validate(v, s, path, refs_out):
+    errs = []
+    if "type" in s:
+        ts = s["type"] if isinstance(s["type"], list) else [s["type"]]
+        if not any(_is(v, t) for t in ts):
+            return [f"{path}: expected {'|'.join(ts)}, got {json.dumps(v, ensure_ascii=False)[:40]}"]
+    if "enum" in s and v not in s["enum"]:
+        errs.append(f"{path}: {v!r} not in {s['enum']}")
+    if isinstance(v, str):
+        if "pattern" in s and not re.search(s["pattern"], v):
+            errs.append(f"{path}: {v!r} does not match {s['pattern']}")
+        if "maxLength" in s and len(v) > s["maxLength"]:
+            errs.append(f"{path}: longer than {s['maxLength']}")
+        if s.get("x-ns") and v not in NAMESPACES:
+            errs.append(f"{path}: {v!r} is not a namespace in records.yaml")
+        if "x-ref" in s:
+            refs_out.append((path, v, s["x-ref"]))
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if "minimum" in s and v < s["minimum"]:
+            errs.append(f"{path}: {v} < {s['minimum']}")
+        if "maximum" in s and v > s["maximum"]:
+            errs.append(f"{path}: {v} > {s['maximum']}")
+    if isinstance(v, dict):
+        props = s.get("properties", {})
+        errs += [f"{path}: missing {k!r}" for k in s.get("required", []) if k not in v]
+        if s.get("additionalProperties") is False:
+            errs += [f"{path}: unknown key {k!r}" for k in v if k not in props]
+        for k, sub in props.items():
+            if k in v:
+                errs += validate(v[k], sub, f"{path}.{k}", refs_out)
+    if isinstance(v, list) and "items" in s:
+        for i, x in enumerate(v):
+            errs += validate(x, s["items"], f"{path}[{i}]", refs_out)
+    if "anyOf" in s and not any(not validate(v, sub, path, []) for sub in s["anyOf"]):
+        errs.append(f"{path}: matches none of anyOf {[sub.get('required', sub) for sub in s['anyOf']]}")
+    return errs
+
+
+def records_dir_from_env(path):
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^records_dir:\s*['\"]?([^'\"#]+?)['\"]?\s*(#.*)?$", line)
+        if m:
+            return (pathlib.Path(path).parent / m.group(1)).resolve()
+    return None
+
+
+def main(argv):
+    global ID_RE, NAMESPACES
+    opt = lambda k: argv[argv.index(k) + 1] if k in argv else None
+    data_dir = pathlib.Path(opt("--data")).resolve() if opt("--data") else None
+    records = opt("--records") or (opt("--env") and records_dir_from_env(opt("--env")))
+    root = pathlib.Path(records).resolve() if records else (data_dir.parent if data_dir else None)
+    if root is None:
+        print("error: --records <dir> is required (the records repo root)", file=sys.stderr)
+        return 2
+    try:
+        cfg = records_config.load(root)
+    except records_config.RecordsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    ID_RE = records_config.id_regex(cfg["namespaces"])
+    NAMESPACES = cfg["namespaces"]
+    D1_PERSON.clear()
+    D1_PERSON.update(cfg["d1_person_map"])
+    data_dir = data_dir or root / "data"
+    check = "--check" in argv
+    tmpdir = tempfile.TemporaryDirectory() if check else None
+    db_path = (pathlib.Path(tmpdir.name) / "kb.sqlite" if check else
+               pathlib.Path(opt("--db")) if opt("--db") else data_dir / "kb.sqlite")
+    tg_dir = pathlib.Path(opt("--telegram")).resolve() if opt("--telegram") else data_dir / "telegram"
+    show = lambda p: p.relative_to(root) if p.is_relative_to(root) else p
+    schemas = {p.name.split(".")[0]: json.loads(p.read_text()) for p in SCHEMA_DIR.glob("*.schema.json")}
+    bad = [f"schema/{k}.schema.json {e}" for k, sch in sorted(schemas.items()) for e in unknown_keywords(sch)]
+    if bad:
+        print("\n".join(f"error: {e}" for e in bad), file=sys.stderr)
+        return 2
+    tmp = db_path.with_suffix(".tmp")
+    tmp.unlink(missing_ok=True)
+    con = sqlite3.connect(tmp)
+    con.executescript((SCHEMA_DIR / "schema.sql").read_text())
+    con.execute("PRAGMA foreign_keys = OFF")  # load in any order, check all refs at the end
+    cols = {t: [r[1] for r in con.execute(f"PRAGMA table_info({t})")] for t in ORDER}
+
+    errors, warns, records, tg_rows = [], [], {t: [] for t in ORDER}, []
+    files = sorted(f for f in data_dir.rglob("*.ndjson")
+                   if f.parent != data_dir / "telegram" and (data_dir / "meta") not in f.parents)
+    files += sorted(tg_dir.glob("*.ndjson"))
+    for f in files:
+        rel = show(f)
+        is_tg = f.parent == tg_dir
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            where = f"{rel}:{n}"
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError as e:
+                errors.append(f"{where}: bad JSON ({e})"); continue
+            t = r.pop("rt", None)
+            if is_tg:
+                if isinstance(t, str) and t.startswith("d1.") and t[3:] in D1_TABLES:
+                    tg_rows.append((where, t[3:], r))
+                else:
+                    errors.append(f"{where}: data/telegram/ accepts only rt d1.<{'|'.join(sorted(D1_TABLES))}>, got {t!r}")
+                continue
+            if t not in cols:
+                errors.append(f"{where}: unknown rt {t!r} (ADR 007: person|ref|source|fact)"); continue
+            extra = set(r) - set(cols[t])
+            if extra:
+                errors.append(f"{where}: {t} has unknown keys {sorted(extra)}"); continue
+            records[t].append((where, f, r))
+
+    mapped, tg_errors = telegram_records(tg_rows, root)
+    errors += tg_errors
+    for where, t, r in mapped:
+        records[t].append((where, tg_dir, r))
+
+    # ---- per-row checks -----------------------------------------------------------------------------------------
+    seen, data_refs = {}, []  # data_refs: (where, id, path, value, ref kind)
+    for t in ORDER:
+        for where, f, r in records[t]:
+            rid = r.get("id")
+            if rid in seen:
+                errors.append(f"{where}: duplicate id {rid!r} (first at {seen[rid]})"); continue
+            seen[rid] = where
+            if t == "person":
+                if rid not in cfg["persons"]:
+                    errors.append(f"{where}: person {rid!r} is not a person namespace in records.yaml")
+                continue
+            missing = [k for k in REQUIRED[t] if r.get(k) is None]
+            if missing:
+                errors.append(f"{where}: {t} {rid} missing required {missing}"); continue
+            m = ID_RE.match(rid)
+            if not m:
+                errors.append(f"{where}: bad id {rid!r} (want <ns>:<src|fact>:<local> or ref:<drug|code|party>:<local>)")
+                continue
+            if t == "ref":
+                if m["refns"] != "ref" or r["ns"] != "ref" or m["refkind"] != r["kind"]:
+                    errors.append(f"{where}: ref {rid} must be ref:{r['kind']}:<local> with ns 'ref'")
+                if f.parent.name == "ref" and f.stem.split("-")[0] != r["kind"]:
+                    errors.append(f"{where}: ref kind {r['kind']!r} in {f.name}")
+            else:
+                if m["cls"] is None or CLASS_RT[m["cls"]] != t:
+                    errors.append(f"{where}: id {rid} has class {m['cls'] or 'ref'!r}, but row is {t}")
+                if r["ns"] not in cfg["namespaces"]:
+                    errors.append(f"{where}: ns {r['ns']!r} is not a namespace in records.yaml")
+                if m["ns"] != r["ns"]:
+                    errors.append(f"{where}: id ns {m['ns']!r} but field ns {r['ns']!r}")
+                # per-document files: data/<ns>/docs/<source-local>.ndjson
+                if f.parent.name == "docs" and f.parent.parent.parent == data_dir:
+                    dns, stem = f.parent.parent.name, f.stem
+                    if r["ns"] != dns:
+                        errors.append(f"{where}: ns {r['ns']!r} but file is under data/{dns}/")
+                    if t == "source" and rid != f"{dns}:src:{stem}":
+                        errors.append(f"{where}: source id {rid!r} must be {dns}:src:{stem}")
+                    if t == "fact" and r["source_id"] != f"{dns}:src:{stem}":
+                        warns.append(f"{where}: cites source {r['source_id']!r}, not this file's")
+            if t == "fact":
+                at, prec = r["at"], r["at_precision"]
+                if not AT_RE.match(at):
+                    errors.append(f"{where}: at {at!r} is not ISO-8601 (time needs +05:30)")
+                elif (prec == "minute") != ("T" in at) or (prec in PRECISION_LEN and len(at) != PRECISION_LEN[prec]):
+                    errors.append(f"{where}: at {at!r} does not match at_precision {prec!r}")
+            schema = schemas.get(r["kind"])
+            if schema is None:
+                if t != "source":
+                    errors.append(f"{where}: no schema/{r['kind']}.schema.json")
+            else:
+                refs = []
+                errors += [f"{where}: {e}" for e in validate(r["data"], schema, "data", refs)]
+                data_refs += [(where, rid, p, v, k) for p, v, k in refs]
+            if not isinstance(r.get("tags"), list):
+                errors.append(f"{where}: tags must be an array")
+
+    # ---- load -----------------------------------------------------------------------------------------------------
+    for t in ORDER:
+        for where, f, r in records[t]:
+            vals = [json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for v in r.values()]
+            try:
+                con.execute(f"INSERT INTO {t} ({','.join(r)}) VALUES ({','.join('?' * len(r))})", vals)
+            except sqlite3.IntegrityError as e:
+                if "UNIQUE" not in str(e):  # duplicates are reported above
+                    errors.append(f"{where}: {t} {r.get('id')}: {e}")
+
+    # ---- references (LINKS covers every FK in schema.sql; data.* refs come from the JSON Schemas' x-ref) -------------------------------------------------------------------------------------------------
+    kind_of = dict(con.execute("SELECT id, 'source' FROM source UNION ALL SELECT id, 'fact' FROM fact "
+                               "UNION ALL SELECT id, 'ref:' || kind FROM ref").fetchall())
+    for t, links in LINKS.items():
+        for col, want in links.items():
+            for rid, v in con.execute(f"SELECT id, {col} FROM {t} WHERE {col} IS NOT NULL"):
+                if not kind_of.get(v, "").startswith(want):
+                    errors.append(f"{t} {rid}: {col} {v!r} does not resolve to a {want}")
+    for where, rid, path, v, k in data_refs:
+        if kind_of.get(v) != f"ref:{k}":
+            errors.append(f"{where}: {rid} {path} {v!r} does not resolve to a ref:{k}")
+    q = """SELECT n.id, n.status, o.id, o.status, n.kind = o.kind FROM {t} n JOIN {t} o ON o.id = n.supersedes"""
+    for t in ("fact", "source", "ref"):
+        for nid, nst, oid, ost, same in con.execute(q.format(t=t)):
+            if ost != "superseded":
+                errors.append(f"{t} {nid} supersedes {oid}, which must have status 'superseded' (is {ost!r})")
+            if not same:
+                errors.append(f"{t} {nid} supersedes {oid} of another kind")
+
+    # ---- plausibility -------------------------------------------------------------------------------------------------
+    q = """SELECT f.id, json_extract(f.data,'$.value_num'), json_extract(f.data,'$.unit'), json_extract(c.data,'$.unit'),
+                  json_extract(c.data,'$.plausible_min'), json_extract(c.data,'$.plausible_max')
+           FROM fact f JOIN ref c ON c.id = json_extract(f.data,'$.code') WHERE f.kind = 'observation'"""
+    for fid, v, unit, cunit, lo, hi in con.execute(q):
+        if v is not None and ((lo is not None and v < lo) or (hi is not None and v > hi)):
+            errors.append(f"fact {fid}: value {v} outside plausible range {lo}-{hi}")
+        if unit and cunit and unit != cunit:
+            warns.append(f"fact {fid}: unit {unit!r} differs from canonical {cunit!r}")
+    # external = 1: the raw file is kept outside git on purpose (e.g. <media-dir>); the note must say so
+    for sid, p, ext, note in con.execute("SELECT id, path, external, note FROM source WHERE path IS NOT NULL AND path != ''"):
+        if ext:
+            if not (note or "").strip():
+                errors.append(f"source {sid}: external = true needs a note describing where the raw file lives")
+        elif not (root / p).exists():
+            warns.append(f"source {sid}: path {p} not found (set external: true + a note if it lives outside git)")
+
+    for w in warns:
+        print("warn:", w)
+    for e in errors:
+        print("error:", e)
+    if errors:
+        con.close(); tmp.unlink()
+        print(f"FAILED: {len(errors)} error(s); {show(db_path)} not changed")
+        return 1
+    con.commit()
+    one = lambda sql: con.execute(sql).fetchone()[0]
+    facts = ", ".join(f"{k} {n}" for k, n in con.execute("SELECT kind, count(*) FROM fact GROUP BY kind ORDER BY kind"))
+    refs = ", ".join(f"{k} {n}" for k, n in con.execute("SELECT kind, count(*) FROM ref GROUP BY kind ORDER BY kind"))
+    print(f"ok: person {one('SELECT count(*) FROM person')}; ref {one('SELECT count(*) FROM ref')} ({refs}); "
+          f"source {one('SELECT count(*) FROM source')}; fact {one('SELECT count(*) FROM fact')} ({facts}); "
+          f"needs_human {one('SELECT count(*) FROM v_needs_human')}; conflicts {one('SELECT count(*) FROM v_conflicts')}; "
+          f"internal_contradictions {one('SELECT count(*) FROM v_internal_contradictions')}; "
+          f"timeline {one('SELECT count(*) FROM v_timeline')}; warnings {len(warns)} -> {show(db_path)}")
+    con.close()
+    tmp.replace(db_path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

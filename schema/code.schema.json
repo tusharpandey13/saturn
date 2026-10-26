@@ -1,0 +1,43 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "ref.data for kind=code. ref.name = display; id local = the code with _ -> -",
+ "type": "object",
+ "properties": {
+  "category": {
+   "enum": [
+    "lab",
+    "vital",
+    "imaging",
+    "ecg",
+    "symptom",
+    "exam"
+   ]
+  },
+  "loinc": {
+   "type": "string"
+  },
+  "loinc_display": {
+   "type": "string"
+  },
+  "loinc_certainty": {
+   "enum": [
+    "high",
+    "medium",
+    "low"
+   ]
+  },
+  "unit": {
+   "type": "string"
+  },
+  "plausible_min": {
+   "type": "number"
+  },
+  "plausible_max": {
+   "type": "number"
+  }
+ },
+ "additionalProperties": false,
+ "required": [
+  "category"
+ ]
+}

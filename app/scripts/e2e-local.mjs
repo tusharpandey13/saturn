@@ -1,0 +1,206 @@
+#!/usr/bin/env node
+// Worker dry run in the real runtime: wrangler dev (workerd) + local D1/R2 + a stub Telegram API.
+// Then the real batch CLI (batch/run.ts pull|extract|finish, as deploy/batch.sh runs it) against the same local
+// D1/R2, through a fake Cloudflare REST API (wrangler getPlatformProxy) and a fake `claude` (scripts/fake-claude.mjs).
+// No accounts, no keys, no network. Design: docs/platform/e2e-testing.md (local tier).
+//
+// Flow: wrong secret -> 401; vitals text -> inbox row + "BP 120/80, pulse 72 ✓"; photo -> R2 + inbox media stored;
+//       redelivered update -> still one row, one ack; batch pull -> raw + media in a scratch repo; extract with
+//       Claude auth failing -> exit 3, "extraction delayed", rows stay new; extract again -> BP reading in NDJSON;
+//       KB build ok; finish -> rows done, digest sent to the group.
+//   npm run e2e:local
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getPlatformProxy } from "wrangler";
+
+const APP = join(import.meta.dirname, "..");
+const EXAMPLE = join(APP, "..", "fixtures", "records-example");
+// Resource names come from the rendered app/wrangler.toml (npm run render; deploy/env.example.yaml by default).
+const WRANGLER_TOML = readFileSync(join(APP, "wrangler.toml"), "utf8");
+const BUCKET = /bucket_name = "([^"]+)"/.exec(WRANGLER_TOML)[1];
+const STATE = join(APP, ".wrangler", "e2e");
+const STUB_PORT = 8790;
+const CF_PORT = 8791;
+const WORKER_PORT = 8797;
+const TOKEN = "e2e-bot-token";
+const SECRET = "e2e-webhook-secret";
+const GROUP = -1001234567890;
+const ALICE = 111;
+
+const telegramCalls = [];
+const stub = createServer(async (req, res) => {
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  const url = new URL(req.url, "http://stub");
+  const json = (obj, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+  if (url.pathname === `/file/bot${TOKEN}/photos/bp.jpg`) {
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+    res.writeHead(200, { "content-type": "image/jpeg", "content-length": String(jpeg.length) });
+    return res.end(jpeg);
+  }
+  const tg = url.pathname.match(new RegExp(`^/bot${TOKEN}/(\\w+)$`));
+  if (tg) {
+    const payload = body ? JSON.parse(body) : {};
+    telegramCalls.push({ method: tg[1], body: payload });
+    if (tg[1] === "getFile") return json({ ok: true, result: { file_id: payload.file_id, file_path: "photos/bp.jpg" } });
+    if (tg[1] === "getWebhookInfo") return json({ ok: true, result: { url: "", has_custom_certificate: false, pending_update_count: 0 } }); // before go-live
+    return json({ ok: true, result: { message_id: 1000 + telegramCalls.length } });
+  }
+  json({ ok: false }, 404);
+});
+
+const wrangler = (args, opts = {}) => execFileSync("npx", ["wrangler", ...args], { cwd: APP, stdio: "pipe", encoding: "utf8", ...opts });
+const d1 = (sql) => JSON.parse(wrangler(["d1", "execute", "DB", "--local", "--persist-to", STATE, "--json", "--command", sql]))[0].results;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(what, fn, timeoutMs = 60_000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const v = await fn();
+    if (v) return v;
+    await sleep(300);
+  }
+  throw new Error(`timed out waiting for: ${what}`);
+}
+const post = (update, secret = SECRET) =>
+  fetch(`http://127.0.0.1:${WORKER_PORT}/telegram/webhook`, {
+    method: "POST", headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": secret }, body: JSON.stringify(update),
+  });
+const sent = () => telegramCalls.filter((c) => c.method === "sendMessage");
+const now = () => Math.floor(Date.now() / 1000);
+const check = (ok, msg) => { if (!ok) throw new Error(msg); };
+
+let dev, cf, proxy, root;
+async function main() {
+  await new Promise((r) => stub.listen(STUB_PORT, "127.0.0.1", r));
+  rmSync(STATE, { recursive: true, force: true });
+  mkdirSync(STATE, { recursive: true });
+
+  console.log("1/9 local D1: migrations + seed");
+  wrangler(["d1", "migrations", "apply", "DB", "--local", "--persist-to", STATE], { input: "y\n" });
+  d1(`INSERT INTO chats (chat_id, channel, label) VALUES ('${GROUP}', 'telegram', 'family');
+      INSERT INTO persons (id, name, role, sender_id) VALUES ('alice', 'Alice', 'patient', '${ALICE}');`);
+
+  console.log("2/9 wrangler dev (local workerd, stub Telegram)");
+  const envFile = join(STATE, "e2e.env");
+  writeFileSync(envFile, [`TELEGRAM_BOT_TOKEN=${TOKEN}`, `TELEGRAM_WEBHOOK_SECRET=${SECRET}`, `TELEGRAM_API_BASE=http://127.0.0.1:${STUB_PORT}`].join("\n"));
+  dev = spawn("npx", ["wrangler", "dev", "--local", "--port", String(WORKER_PORT), "--ip", "127.0.0.1", "--persist-to", STATE, "--env-file", envFile, "--show-interactive-dev-session=false", "--log-level", "warn"], { cwd: APP, stdio: ["ignore", "inherit", "inherit"] });
+  await waitFor("worker /health", () => fetch(`http://127.0.0.1:${WORKER_PORT}/health`).then((r) => r.ok).catch(() => false));
+
+  console.log("3/9 wrong secret -> 401");
+  check((await post({ update_id: 1 }, "nope")).status === 401, "expected 401");
+
+  console.log("4/9 vitals text -> inbox + deterministic echo; redelivery is a no-op");
+  const text = { update_id: 900001, message: { message_id: 1, date: now(), chat: { id: GROUP }, from: { id: ALICE, is_bot: false }, text: "120/80 72" } };
+  check((await post(text)).status === 200, "webhook not 200");
+  check((await post(text)).status === 200, "redelivery not 200");
+  const ack = await waitFor("ack", () => sent()[0]);
+  check(ack.body.text === "BP 120/80, pulse 72 ✓", `unexpected ack: ${ack.body.text}`);
+
+  console.log("5/9 photo -> R2 copy at ingest");
+  const photo = { update_id: 900002, message: { message_id: 2, date: now(), chat: { id: GROUP }, from: { id: ALICE, is_bot: false },
+    photo: [{ file_id: "small", file_unique_id: "u-s", width: 90, height: 120, file_size: 1000 }, { file_id: "bp-large", file_unique_id: "u-bp", width: 960, height: 1280, file_size: 9000 }] } };
+  check((await post(photo)).status === 200, "photo webhook not 200");
+  check(telegramCalls.some((c) => c.method === "getFile" && c.body.file_id === "bp-large"), "largest photo not fetched");
+  const rows = d1("SELECT update_id, kind, media_key, media_status, ack, status FROM inbox ORDER BY update_id");
+  check(rows.length === 2, `expected 2 inbox rows, got ${rows.length}`);
+  check(rows[1].media_status === "stored" && rows[1].media_key === "telegram/u-bp", `media not stored: ${JSON.stringify(rows[1])}`);
+  check(sent().length === 2, `expected 2 acks, got ${sent().length}`);
+  const obj = wrangler(["r2", "object", "get", `${BUCKET}/telegram/u-bp`, "--local", "--persist-to", STATE, "--pipe"], { encoding: "buffer" });
+  check(obj.length === 10 && obj[0] === 0xff, "R2 object missing or wrong");
+
+  console.log("6/9 batch pull (fake Cloudflare REST over the same local D1/R2) -> raw + media in a scratch repo");
+  await new Promise((r) => { dev.once("exit", r); dev.kill("SIGTERM"); });
+  dev = null;
+  proxy = await getPlatformProxy({ persist: { path: join(STATE, "v3") } });
+  cf = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    try {
+      const q = req.url.match(/\/client\/v4\/accounts\/[^/]+\/d1\/database\/[^/]+\/query$/);
+      const o = req.url.match(/\/client\/v4\/accounts\/[^/]+\/r2\/buckets\/[^/]+\/objects\/(.+)$/);
+      if (q && req.method === "POST") {
+        const { sql, params = [] } = JSON.parse(body);
+        const r = await proxy.env.DB.prepare(sql).bind(...params).all();
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ success: true, result: [{ results: r.results, meta: { changes: r.meta.changes } }] }));
+      }
+      const obj = o && (await proxy.env.MEDIA.get(decodeURIComponent(o[1])));
+      if (obj) {
+        res.writeHead(200, { "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream" });
+        return res.end(Buffer.from(await obj.arrayBuffer()));
+      }
+      res.writeHead(404).end();
+    } catch {
+      res.writeHead(500).end();
+    }
+  });
+  await new Promise((r) => cf.listen(CF_PORT, "127.0.0.1", r));
+  root = mkdtempSync(join(tmpdir(), "saturn-e2e-records-"));
+  cpSync(join(EXAMPLE, "records.yaml"), join(root, "records.yaml"));
+  cpSync(join(EXAMPLE, "meta"), join(root, "meta"), { recursive: true });
+  const digest = join(root, "digest.txt");
+  const batchEnv = {
+    ...process.env, CLOUDFLARE_API_BASE: `http://127.0.0.1:${CF_PORT}/client/v4`, CLOUDFLARE_API_TOKEN: "e2e", CLOUDFLARE_ACCOUNT_ID: "e2e",
+    D1_DATABASE_ID: "e2e", R2_BUCKET: BUCKET, TELEGRAM_BOT_TOKEN: TOKEN, TELEGRAM_API_BASE: `http://127.0.0.1:${STUB_PORT}`,
+    CLAUDE_BIN: join(APP, "scripts", "fake-claude.mjs"), CLAUDE_CODE_OAUTH_TOKEN: "", ANTHROPIC_API_KEY: "", SARVAM_API_KEY: "", GITHUB_OUTPUT: "",
+  };
+  // Async on purpose: the fake Cloudflare API runs in this process and must keep serving while the batch runs.
+  const batch = (args, extra = {}) => new Promise((resolve) => {
+    execFile("npx", ["tsx", "batch/run.ts", ...args, "--records", root, "--digest", digest], { cwd: APP, encoding: "utf8", env: { ...batchEnv, ...extra } },
+      (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: `${stdout}${stderr}` }));
+  });
+  const pulled = await batch(["pull"]);
+  check(pulled.code === 0, `pull failed (${pulled.code}): ${pulled.out}`);
+  const rawDir = join(root, "data", "telegram", "raw");
+  const raw = readdirSync(rawDir).flatMap((f) => readFileSync(join(rawDir, f), "utf8").split("\n").filter(Boolean));
+  check(raw.length === 2, `expected 2 raw rows, got ${raw.length}`);
+  const media = readdirSync(join(root, "sources", "alice", "media", "telegram"));
+  check(media.length === 1, `expected 1 media file in git, got ${media}`);
+
+  console.log("7/9 extract with Claude auth failing -> exit 3, extraction delayed, rows stay new");
+  const delayed = await batch(["extract"], { FAKE_CLAUDE_MODE: "auth" });
+  check(delayed.code === 3, `expected exit 3, got ${delayed.code}: ${delayed.out}`);
+  check(readFileSync(digest, "utf8").includes("extraction delayed"), "digest lacks the delayed line");
+  const waiting = (await proxy.env.DB.prepare("SELECT status FROM inbox").all()).results;
+  check(waiting.every((r) => r.status === "new"), `rows not left new: ${JSON.stringify(waiting)}`);
+
+  console.log("8/9 extract (fake claude) -> NDJSON + KB build");
+  const ok = await batch(["extract"]);
+  check(ok.code === 0, `extract failed (${ok.code}): ${ok.out}`);
+  const kb = readdirSync(join(root, "data", "telegram")).filter((f) => f.endsWith(".ndjson") && f !== "directory.ndjson")
+    .flatMap((f) => readFileSync(join(root, "data", "telegram", f), "utf8").split("\n").filter(Boolean)).map((l) => JSON.parse(l));
+  check(kb.some((r) => JSON.stringify(r).includes('"value":120') && JSON.stringify(r).includes('"value2":80')), "BP 120/80 not in NDJSON");
+  const built = execFileSync("python3", ["-I", join(APP, "..", "tools", "kb", "build"), "--records", EXAMPLE, "--telegram", join(root, "data", "telegram"), "--db", join(root, "kb.sqlite")], { encoding: "utf8" });
+  check(built.startsWith("ok:"), `kb build: ${built}`);
+
+  console.log("9/9 finish -> inbox rows done, digest sent to the group");
+  const before = sent().length;
+  const fin = await batch(["finish"]);
+  check(fin.code === 0, `finish failed: ${fin.out}`);
+  check(fin.out.includes("webhook: ok (gate closed"), `webhook assertion: ${fin.out}`);
+  const done = (await proxy.env.DB.prepare("SELECT status FROM inbox").all()).results;
+  check(done.length === 2 && done.every((r) => r.status === "done"), `inbox not done: ${JSON.stringify(done)}`);
+  const digests = sent().slice(before);
+  check(digests.length >= 1 && digests.every((c) => String(c.body.chat_id) === String(GROUP)), "digest not sent to the group");
+
+  console.log("\nE2E PASS: secret check, idempotent inbox insert, deterministic ack, media to R2, batch pull/extract/KB/finish, delayed path");
+}
+
+main()
+  .then(() => (process.exitCode = 0))
+  .catch((err) => {
+    console.error("\nE2E FAIL:", err.message);
+    console.error("telegram calls:", JSON.stringify(telegramCalls.map((c) => c.method)));
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    dev?.kill("SIGTERM");
+    stub.close();
+    cf?.close();
+    proxy?.dispose();
+    if (root) rmSync(root, { recursive: true, force: true });
+    setTimeout(() => process.exit(), 1000);
+  });

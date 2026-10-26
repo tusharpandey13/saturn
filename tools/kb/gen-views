@@ -1,0 +1,525 @@
+#!/usr/bin/env -S python3 -I
+"""Render the GENERATED sections of the curated health pages from the KB (data/kb.sqlite).
+
+Usage: tools/kb/gen-views --records DIR [--env FILE] [--db PATH] [--check] [--today YYYY-MM-DD]
+  Run after tools/kb/build:  python3 -I tools/kb/build --records DIR && python3 -I tools/kb/gen-views --records DIR
+
+Every <records>/docs/health/<ns>/*.md (ns = the namespaces in <records>/records.yaml) is scanned for
+  <!-- gen:NAME start --> ... <!-- gen:NAME end -->
+and only the text between the markers is replaced. Text outside the markers is never touched. Blocks:
+  timeline (timeline.md), meds-current + meds-history (medications.md), labs (labs.md), quality (data-quality.md),
+  glance + asof (summary.md).
+A block whose content is unchanged apart from its "Generated ... on <date>" line is left as it is, so a second run (or
+a run on a later day with the same data) gives no diff. --check writes nothing and exits 1 if any page would change.
+Python stdlib + sqlite3 only. Record and flag only: the blocks show rows as stored, never a judgement.
+"""
+import argparse, datetime, json, pathlib, re, sqlite3, sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))  # python3 -I drops the script dir; the shared loader lives beside this file
+import records_config  # noqa: E402
+BLOCK = re.compile(r"(<!-- gen:([a-z-]+) start -->\n)(.*?)(<!-- gen:\2 end -->)", re.S)
+FAMILY_TAGS = ("family-reported", "patient-reported", "user-report", "secondhand")
+FLAG_TAGS = ("low-confidence", "internal-contradiction", "text-table-mismatch", "written-stopped", "owner-unconfirmed",
+             "identity-unconfirmed")
+MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+GLANCE_DAYS = 180
+
+# Per-person key series (labs.md) and glance codes (summary.md) live in data/meta/gen-views.json (person-specific
+# choices are clinical detail, so they stay in data/). A person not listed there gets every code they have.
+CONFIG = {"key_series": {}, "glance_codes": {}}
+
+
+# ---------------------------------------------------------------------------------------------------------- helpers
+def cell(v):
+    """One markdown table cell: no pipes or newlines."""
+    if v is None or v == "":
+        return ""
+    return str(v).replace("\r", " ").replace("\n", " ").replace("|", "\\|").strip()
+
+
+def code(v):
+    """A code span (ids, paths); backticks inside are dropped."""
+    return f"`{str(v).replace('`', '')}`" if v else ""
+
+
+def short(text, n=160):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def fdate(at, precision="day"):
+    """ISO (with optional time) -> DD-Mon-YYYY (AGENTS.md section 4); month/year precision kept."""
+    if not at:
+        return ""
+    y, m, d = at[0:4], at[5:7], at[8:10]
+    if precision == "year" or not m:
+        return y
+    mon = MON[int(m) - 1]
+    if precision == "month" or not d:
+        return f"{mon}-{y}"
+    s = f"{d}-{mon}-{y}"
+    if precision == "minute" and len(at) >= 16:
+        s += " " + at[11:16]
+    return s
+
+
+def table(head, rows):
+    out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    out += ["| " + " | ".join(cell(c) if not str(c).startswith("`") else str(c).replace("\n", " ") for c in r) + " |"
+            for r in rows]
+    return out
+
+
+def j(v):
+    return json.loads(v) if v else {}
+
+
+class KB:
+    def __init__(self, con):
+        con.row_factory = sqlite3.Row
+        self.con = con
+        self.refs = {r["id"]: r for r in con.execute("SELECT id, kind, name, data FROM ref")}
+        self.current = dict(con.execute("SELECT id, current_id FROM v_ref_current").fetchall())
+        self.sources = {r["id"]: r for r in con.execute("SELECT * FROM source")}
+        self.facts = {r["id"]: r for r in con.execute("SELECT * FROM fact")}
+        self.superseded_by = {r["supersedes"]: r["id"] for r in self.facts.values() if r["supersedes"]}
+        self.conflict_ids = set()
+        for r in con.execute("SELECT id_a, id_b FROM v_conflicts"):
+            self.conflict_ids.update(r)
+
+    def q(self, sql, *args):
+        return self.con.execute(sql, args).fetchall()
+
+    def name(self, ref_id):
+        r = self.refs.get(self.current.get(ref_id, ref_id)) or self.refs.get(ref_id)
+        return r["name"] if r else (ref_id or "")
+
+    def asof(self, ns):
+        n, latest = self.q("SELECT count(*), max(substr(at, 1, 10)) FROM fact WHERE ns = ?", ns)[0]
+        return n, latest
+
+    def cite(self, fid):
+        """Fact id + source path (+ page)."""
+        f = self.facts[fid]
+        s = self.sources.get(f["source_id"])
+        path = (s["path"] if s and s["path"] else f["source_id"])
+        page = f" p.{f['page']}" if f["page"] is not None else ""
+        return code(fid), f"{code(path)}{page}"
+
+    def party(self, fid):
+        """Who/where: the fact's own party refs, else its context event's, else its source's."""
+        f = self.facts[fid]
+        d = j(f["data"])
+        ids = [d.get("practitioner_id"), d.get("prescriber_id"), d.get("org_id")]
+        if not any(ids) and f["context_id"] in self.facts:
+            c = j(self.facts[f["context_id"]]["data"])
+            ids = [c.get("practitioner_id"), c.get("org_id")]
+        if not any(ids):
+            s = self.sources.get(f["source_id"])
+            if s:
+                ids = [s["practitioner_id"], s["org_id"]]
+        seen = []
+        for i in ids:
+            if i and self.name(i) not in seen:
+                seen.append(self.name(i))
+        return "; ".join(seen)
+
+    def marks(self, fid):
+        """Uncertain / family-reported / recollection / conflict flags for one fact (shown, never resolved)."""
+        f = self.facts[fid]
+        tags = json.loads(f["tags"] or "[]")
+        out = []
+        if f["uncertain_ref"]:
+            out.append(f"uncertain ({f['uncertain_ref']})")
+        out += [t for t in tags if t in FAMILY_TAGS]
+        s = self.sources.get(f["source_id"])
+        if s and s["rank"] in ("recollection", "ai_summary"):
+            out.append(s["rank"])
+        out += [t for t in tags if t in FLAG_TAGS]
+        if fid in self.conflict_ids:
+            out.append("conflict (see data-quality)")
+        if f["verification"] in ("unverified",):
+            out.append("unverified read")
+        return "; ".join(out)
+
+    def record_status(self, fid):
+        f = self.facts[fid]
+        if f["status"] == "superseded":
+            return f"superseded by {self.superseded_by.get(fid, '?')}"
+        return f["status"]
+
+    def obs_value(self, d):
+        comp = d.get("components") or {}
+        if isinstance(comp, dict) and "systolic" in comp and "diastolic" in comp:
+            return f"{comp['systolic']}/{comp['diastolic']}"
+        if d.get("value_num") is not None:
+            s = str(d["value_num"])
+            return s[:-2] if s.endswith(".0") else s
+        return d.get("value_text", "")
+
+    def obs_flag(self, d):
+        """Printed (or bold) flag as stored; else a computed H/L from the stored numeric range, labelled computed."""
+        if d.get("flag"):
+            return f"{d['flag']} ({d.get('flag_basis') or 'printed'})"
+        v, lo, hi = d.get("value_num"), d.get("ref_low"), d.get("ref_high")
+        if v is not None and (lo is not None or hi is not None):
+            if lo is not None and v < lo:
+                return "L (computed here)"
+            if hi is not None and v > hi:
+                return "H (computed here)"
+        return ""
+
+    @staticmethod
+    def ref_range(d):
+        if d.get("ref_text"):
+            return d["ref_text"]
+        lo, hi = d.get("ref_low"), d.get("ref_high")
+        if lo is not None and hi is not None:
+            return f"{lo}–{hi}"
+        if lo is not None:
+            return f"≥ {lo}"
+        if hi is not None:
+            return f"≤ {hi}"
+        return ""
+
+    def oneliner(self, fid):
+        f = self.facts[fid]
+        d = j(f["data"])
+        if f["kind"] == "event":
+            return short(d.get("label") or d.get("reason_text") or d.get("type"))
+        if f["kind"] == "medication":
+            generic = j(self.refs[d["drug_id"]]["data"]).get("generic") if d.get("drug_id") in self.refs else None
+            name = d.get("brand") or self.name(d.get("drug_id"))
+            bits = [name + (f" → {generic}" if generic else ""), d.get("strength"), d.get("schedule_raw"),
+                    d.get("duration_text")]
+            return short(" · ".join(b for b in bits if b))
+        if f["kind"] == "observation":
+            c = self.current.get(d.get("code"), d.get("code"))
+            unit = f" {d['unit']}" if d.get("unit") and d.get("value_num") is not None else ""
+            fl = self.obs_flag(d)
+            meth = f" [{d['method']}]" if d.get("method") else ""
+            return short(f"{self.name(c)}: {self.obs_value(d)}{unit}{meth}" + (f" ({fl})" if fl else ""))
+        return short(d.get("text_as_written") or d.get("label") or "")
+
+    def kind_type(self, fid):
+        f = self.facts[fid]
+        d = j(f["data"])
+        sub = {"event": d.get("type"), "medication": d.get("status"), "observation": d.get("category")}.get(f["kind"])
+        return f"{f['kind']}/{sub}" if sub else f["kind"]
+
+
+# ----------------------------------------------------------------------------------------------------------- blocks
+def no_rows(ns):
+    return [f"No KB facts for `{ns}` yet. Rows on this page cite source paths until they are added to `data/{ns}/`."]
+
+
+def b_timeline(kb, ns):
+    ids = [r[0] for r in kb.q("SELECT id FROM v_timeline WHERE ns = ?", ns)]
+    sup = [r[0] for r in kb.q("SELECT id FROM fact WHERE ns = ? AND status = 'superseded' AND kind != 'condition'", ns)]
+    rows = sorted({*ids, *sup}, key=lambda i: (kb.facts[i]["at"], kb.facts[i]["kind"], i))
+    if not rows:
+        return no_rows(ns)
+    out = [f"{len(rows)} rows, **oldest first** (events, every medicine statement, and observations that are flagged "
+           "or feed alerts; superseded rows included and marked). Marks: `uncertain (X-nn)` = open hard read; "
+           "family-reported / patient-reported / user-report / secondhand = told, not on a document; recollection = "
+           "a later account from memory; conflict = two sources disagree (see [data quality](data-quality.md)).", ""]
+    year = month = None
+    buf = []
+
+    def flush():
+        if buf:
+            out.extend(table(["Date", "Kind/type", "What (as stored)", "Where/who", "Marks", "Record", "Fact id",
+                              "Source"], buf))
+            out.append("")
+            buf.clear()
+
+    for fid in rows:
+        f = kb.facts[fid]
+        y, m = f["at"][:4], f["at"][5:7] if f["at_precision"] != "year" else ""
+        if y != year:
+            flush()
+            out += [f"### {y}", ""]
+            year, month = y, None
+        if m != month:
+            flush()
+            out += [f"#### {MON[int(m) - 1] + '-' + y if m else y + ' (month not recorded)'}", ""]
+            month = m
+        fact_id, src = kb.cite(fid)
+        buf.append([fdate(f["at"], f["at_precision"]), kb.kind_type(fid), kb.oneliner(fid), kb.party(fid),
+                    kb.marks(fid), kb.record_status(fid), fact_id, src])
+    flush()
+    return out[:-1]
+
+
+def med_cols(kb, fid):
+    f = kb.facts[fid]
+    d = j(f["data"])
+    ref = kb.refs.get(d.get("drug_id"))
+    generic = j(ref["data"]).get("generic") if ref else ""
+    drug = ref["name"] if ref else d.get("brand")
+    return f, d, drug, generic
+
+
+def b_meds_current(kb, ns):
+    rows = kb.q("SELECT id FROM v_meds_current WHERE ns = ? ORDER BY at DESC, drug", ns)
+    if not rows:
+        return no_rows(ns)
+    out = [f"{len(rows)} drugs: the **latest statement per drug** in the KB (`v_meds_current`), newest first. "
+           "Status is what that statement says (prescribed / dispensed / taking / stopped); verification is how well "
+           "it was read (unverified / agent / human / patient / clinician). A drug is listed here even when a later "
+           "prescription leaves it out; \"latest\" does not mean \"taken now\".", ""]
+    body = []
+    for (fid,) in rows:
+        f, d, drug, generic = med_cols(kb, fid)
+        fact_id, src = kb.cite(fid)
+        body.append([drug, d.get("brand"), generic, d.get("strength"), d.get("schedule_raw"), d.get("status"),
+                     f["verification"], fdate(f["at"], f["at_precision"]), kb.party(fid), kb.marks(fid),
+                     f"{fact_id} · {src}"])
+    return out + table(["Drug", "Brand (as written)", "Generic", "Strength", "Schedule (as written)", "Status",
+                        "Verification", "Latest date", "Prescriber", "Marks", "Fact id · source"], body)
+
+
+def b_meds_history(kb, ns):
+    rows = kb.q("SELECT id FROM fact WHERE ns = ? AND kind = 'medication' AND status != 'retracted' "
+                "ORDER BY at, id", ns)
+    if not rows:
+        return no_rows(ns)
+    out = [f"{len(rows)} medicine statements, oldest first, including superseded rows.", ""]
+    body = []
+    for (fid,) in rows:
+        f, d, drug, generic = med_cols(kb, fid)
+        fact_id, src = kb.cite(fid)
+        body.append([fdate(f["at"], f["at_precision"]), drug, d.get("brand"), d.get("strength"),
+                     d.get("schedule_raw"), d.get("duration_text"), d.get("status"), f["verification"],
+                     kb.party(fid), kb.marks(fid), kb.record_status(fid), f"{fact_id} · {src}"])
+    return out + table(["Date", "Drug", "Brand (as written)", "Strength", "Schedule", "Duration", "Status",
+                        "Verification", "Prescriber", "Marks", "Record", "Fact id · source"], body)
+
+
+def series_rows(kb, ns, codes):
+    full = [f"ref:code:{c}" for c in codes]
+    ph = ",".join("?" * len(full))
+    return kb.q(f"SELECT id, code FROM v_trend WHERE ns = ? AND code IN ({ph}) ORDER BY at, id", ns, *full)
+
+
+def obs_row(kb, fid, with_code):
+    f = kb.facts[fid]
+    d = j(f["data"])
+    fact_id, src = kb.cite(fid)
+    c = kb.current.get(d.get("code"), d.get("code"))
+    row = [fdate(f["at"], f["at_precision"])] + ([kb.name(c)] if with_code else []) + [
+        kb.obs_value(d), d.get("unit"), kb.obs_flag(d), kb.ref_range(d), d.get("method") or d.get("body_site"),
+        kb.marks(fid), f"{fact_id} · {src}"]
+    return row
+
+
+def b_labs(kb, ns):
+    if not kb.q("SELECT 1 FROM v_trend WHERE ns = ? LIMIT 1", ns):
+        return no_rows(ns)
+    series = [tuple(x) for x in CONFIG["key_series"].get(ns, [])] or [(kb.name(c), [c.removeprefix("ref:code:")]) for (c,) in
+                                    kb.q("SELECT DISTINCT code FROM v_trend WHERE ns = ? ORDER BY code", ns)]
+    out = ["Values as stored, oldest first. Flag: as printed (or bold) on the report; `computed here` = outside the "
+           "range stored with the value, not printed. Different methods and labs are not directly comparable. "
+           "Nothing here is a judgement; see [data quality](data-quality.md) for conflicts.", ""]
+    missing = []
+    for title, codes in series:
+        rows = series_rows(kb, ns, codes)
+        if not rows:
+            missing.append(title)
+            continue
+        multi = len(codes) > 1
+        head = ["Date"] + (["Test"] if multi else []) + ["Value", "Unit", "Flag", "Ref range", "Method/site", "Marks",
+                                                         "Fact id · source"]
+        out += [f"### {title}", ""] + table(head, [obs_row(kb, r[0], multi) for r in rows]) + [""]
+    if missing:
+        out += [f"No KB rows yet for: {', '.join(missing)}.", ""]
+    return out[:-1]
+
+
+def b_quality(kb, ns):
+    out = []
+    conf = kb.q("SELECT * FROM v_conflicts WHERE ns = ? ORDER BY day, code", ns)
+    out += [f"### Conflicts between sources ({len(conf)})", "",
+            "Two sources give different values for the same test on the same day (`v_conflicts`). Both are shown; "
+            "neither is chosen. **To resolve:** check both page images; if one is a misread, add a corrected fact with "
+            "`supersedes` (never edit the old row); if both are as printed, leave both and ask the doctor which applies.",
+            ""]
+    if conf:
+        rows = []
+        for r in conf:
+            a_id, a_src = kb.cite(r["id_a"])
+            b_id, b_src = kb.cite(r["id_b"])
+            rows.append([r["day"], kb.name(r["code"]), r["method"], r["value_a"], f"{a_id} · {a_src}", r["value_b"],
+                         f"{b_id} · {b_src}"])
+        out += table(["Day", "Test", "Method", "Value A", "Fact A · source", "Value B", "Fact B · source"], rows)
+    else:
+        out.append("None.")
+    ic = kb.q("SELECT * FROM v_internal_contradictions WHERE ns = ? ORDER BY day, id", ns)
+    out += ["", f"### Documents that contradict themselves ({len(ic)})", "",
+            "Tagged at extraction (`internal-contradiction` / `text-table-mismatch`). **To resolve:** only the issuing "
+            "doctor or lab can say which part is right; each is a question for that doctor, not something to pick here.",
+            ""]
+    if ic:
+        rows = []
+        for r in ic:
+            fid, src = kb.cite(r["id"])
+            what = kb.name(r["what"]) if str(r["what"]).startswith("ref:") else r["what"]
+            rows.append([r["day"], short(what, 60), short(r["value"], 60), r["tag"], short(r["quote"], 120),
+                         f"{fid} · {src}"])
+        out += table(["Day", "What", "Value", "Tag", "Quote", "Fact id · source"], rows)
+    else:
+        out.append("None.")
+    nh = kb.q("SELECT reason, count(*) FROM v_needs_human WHERE ns = ? GROUP BY reason ORDER BY reason", ns)
+    total = sum(n for _, n in nh)
+    how = {
+        "medicine": "a medicine statement not yet checked by a human against the page or strip. Check it and set "
+                    "`verification: human` in a superseding row.",
+        "uncertain": "an open hard read (`uncertain_ref`). Resolve it in `docs/log/hard-reads/`, then add a superseding "
+                     "row with the settled value and no `uncertain_ref`.",
+        "low-confidence": "a reading below 0.8 confidence from the migration. Re-read the page; supersede with the "
+                          "settled value, or open a hard read.",
+        "alert-input": "a value that feeds bot alerts (weight, BP, pulse, SpO2, K, Na, creatinine). Check it against "
+                       "the page and set `verification: human`.",
+    }
+    out += ["", f"### Needs a human ({total})", "",
+            "From `v_needs_human`. Query the rows with "
+            f"`sqlite3 data/kb.sqlite \"SELECT reason, id, what, uncertain_ref FROM v_needs_human WHERE ns = '{ns}'\"`.",
+            ""]
+    out += table(["Reason", "Rows", "What it means and how to clear it"], [[r, n, how.get(r, "")] for r, n in nh]) \
+        if nh else ["None."]
+    hr = kb.q("SELECT uncertain_ref, count(*) FROM fact WHERE ns = ? AND status = 'active' AND uncertain_ref IS NOT NULL "
+              "GROUP BY uncertain_ref ORDER BY uncertain_ref", ns)
+    if hr:
+        out += ["", "Open hard reads cited by active facts: " + ", ".join(f"{h} ({n})" for h, n in hr) + "."]
+    sup = kb.q("SELECT id, supersedes FROM fact WHERE ns = ? AND supersedes IS NOT NULL ORDER BY id", ns)
+    out += ["", f"### Corrections on record ({len(sup)})", ""]
+    out += ([f"- {code(s)} is superseded by {code(i)}." for i, s in sup] if sup else ["None."])
+    return out
+
+
+def b_glance(kb, ns):
+    n, latest = kb.asof(ns)
+    if not n:
+        return no_rows(ns)
+    cut = (datetime.date.fromisoformat((latest + "-01-01")[:10]) - datetime.timedelta(days=GLANCE_DAYS)).isoformat()
+    meds = kb.q("SELECT id FROM v_meds_current WHERE ns = ? AND substr(at, 1, 10) >= ? ORDER BY at DESC, drug", ns, cut)
+    older = kb.q("SELECT count(*) FROM v_meds_current WHERE ns = ? AND substr(at, 1, 10) < ?", ns, cut)[0][0]
+    out = [f"**Medicine statements in the {GLANCE_DAYS} days to {fdate(latest)}** (latest statement per drug; "
+           f"{older} older drugs are on [medications](medications.md)). None of these says what is taken now unless "
+           "its status is `taking`.", ""]
+    rows = []
+    for (fid,) in meds:
+        f, d, drug, generic = med_cols(kb, fid)
+        rows.append([drug + (f" → {generic}" if generic else ""), d.get("strength"), d.get("schedule_raw"),
+                     d.get("status"), f["verification"], fdate(f["at"], f["at_precision"]), kb.marks(fid), code(fid)])
+    out += table(["Drug", "Strength", "Schedule", "Status", "Verification", "Date", "Marks", "Fact id"], rows) \
+        if rows else ["None in that window."]
+    codes = CONFIG["glance_codes"].get(ns) or [c.removeprefix("ref:code:") for (c,) in
+                                     kb.q("SELECT DISTINCT code FROM v_trend WHERE ns = ? ORDER BY code", ns)]
+    out += ["", "**Latest key values** (`v_latest`; full series on [labs](labs.md)):", ""]
+    rows = []
+    for c in codes:
+        r = kb.q("SELECT id FROM v_latest WHERE ns = ? AND code = ?", ns, f"ref:code:{c}")
+        if r:
+            fid = r[0][0]
+            f = kb.facts[fid]
+            d = j(f["data"])
+            rows.append([kb.name(f"ref:code:{c}"), fdate(f["at"], f["at_precision"]), kb.obs_value(d), d.get("unit"),
+                         kb.obs_flag(d), d.get("method"), kb.marks(fid), code(fid)])
+    out += table(["Measure", "Date", "Value", "Unit", "Flag", "Method", "Marks", "Fact id"], rows) if rows else ["None."]
+    return out
+
+
+def b_asof(kb, ns):
+    n, latest = kb.asof(ns)
+    if not n:
+        return [f"**Data as of:** no KB facts for `{ns}` yet."]
+    return [f"**Data as of {fdate(latest)}** (latest dated KB fact for `{ns}`; {n} facts). Generated tables: "
+            "[timeline](timeline.md), [medications](medications.md), [labs](labs.md), [data quality](data-quality.md)."]
+
+
+RENDER = {"timeline": b_timeline, "meds-current": b_meds_current, "meds-history": b_meds_history, "labs": b_labs,
+          "quality": b_quality, "glance": b_glance, "asof": b_asof}
+
+
+# ------------------------------------------------------------------------------------------------------------- main
+def render_page(text, kb, ns, today):
+    n, latest = kb.asof(ns)
+    header = (f"_Generated from the KB on {today} (data as of {latest or 'no facts'}; {n} facts). "
+              "Don't edit inside this block; see AGENTS.md._")
+    unknown = []
+
+    def sub(m):
+        start, name, old, end = m.groups()
+        if name not in RENDER:
+            unknown.append(name)
+            return m.group(0)
+        body = "\n".join(RENDER[name](kb, ns)).rstrip() + "\n"
+        new = header + "\n\n" + body
+        old_body = old.split("\n", 1)[1] if old.startswith("_Generated from the KB on ") and "\n" in old else None
+        if old_body == "\n" + body:
+            return m.group(0)  # same data: keep the old date line (idempotent across days)
+        return start + new + end
+
+    out = BLOCK.sub(sub, text)
+    return out, unknown
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--db", default=None, help="KB sqlite (default data/kb.sqlite under --records)")
+    ap.add_argument("--records", "--root", dest="records", default=None,
+                    help="records repo root (records.yaml, docs/health/<ns>/); --root is the old name")
+    ap.add_argument("--env", default=None, help="env.yaml whose top-level records_dir: is used when --records is absent")
+    ap.add_argument("--check", action="store_true", help="write nothing; exit 1 if a page would change")
+    ap.add_argument("--today", default=datetime.date.today().isoformat())
+    a = ap.parse_args(argv)
+    records = a.records
+    if not records and a.env:
+        m = re.search(r"(?m)^records_dir:\s*['\"]?([^'\"#\n]+?)['\"]?\s*(#.*)?$", pathlib.Path(a.env).read_text())
+        records = m and str(pathlib.Path(a.env).parent / m.group(1))
+    if not records:
+        print("error: --records <dir> is required (the records repo root)", file=sys.stderr)
+        return 2
+    root = pathlib.Path(records).resolve()
+    try:
+        namespaces = records_config.load(root)["namespaces"]
+    except records_config.RecordsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    db = pathlib.Path(a.db) if a.db else root / "data" / "kb.sqlite"
+    if not db.exists():
+        print(f"error: {db} not found; run python3 -I tools/kb/build --records {root} first", file=sys.stderr)
+        return 1
+    cfg = root / "data" / "meta" / "gen-views.json"
+    if cfg.exists():
+        CONFIG.update(json.loads(cfg.read_text(encoding="utf-8")))
+    kb = KB(sqlite3.connect(f"file:{db}?mode=ro", uri=True))
+    changed, errors, blocks = [], [], 0
+    for ns in namespaces:
+        d = root / "docs" / "health" / ns
+        if not d.is_dir():
+            continue
+        for page in sorted(d.glob("*.md")):
+            text = page.read_text(encoding="utf-8")
+            if "<!-- gen:" not in text:
+                continue
+            blocks += len(BLOCK.findall(text))
+            new, unknown = render_page(text, kb, ns, a.today)
+            errors += [f"{page.relative_to(root)}: unknown block gen:{u}" for u in unknown]
+            if new != text:
+                changed.append(page)
+                if not a.check:
+                    page.write_text(new, encoding="utf-8")
+    for e in errors:
+        print("error:", e, file=sys.stderr)
+    verb = "stale" if a.check else "updated"
+    for p in changed:
+        print(f"{verb}: {p.relative_to(root)}")
+    print(f"ok: {blocks} blocks, {len(changed)} pages {verb}" if not errors else f"failed: {len(errors)} errors")
+    return 1 if errors or (a.check and changed) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

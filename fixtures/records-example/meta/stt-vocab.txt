@@ -1,0 +1,2 @@
+# Extra speech-to-text key terms, one per line (medicine names, device words).
+Examplezole

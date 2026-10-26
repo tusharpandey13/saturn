@@ -1,0 +1,42 @@
+# TEMPLATE for the env repo (copy to <env-repo>/.github/workflows/deploy.yml; S7). MANUAL ONLY: type the confirm
+# word. GitHub Free has no environment reviewers on private repos, so a typed confirmation on a manual dispatch is
+# the gate (docs/security.md). Calls the product's deploy/deploy.sh; no product logic here.
+name: deploy
+on:
+  workflow_dispatch:
+    inputs:
+      confirm: { description: "Type deploy-prod to deploy", type: string, required: true }
+concurrency: { group: deploy, cancel-in-progress: false }
+permissions: {}
+jobs:
+  deploy:
+    if: inputs.confirm == 'deploy-prod' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: env, persist-credentials: false }
+      - name: Read product pin
+        id: pins
+        run: echo "product_sha=$(tr -d '[:space:]' < env/product.lock)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.PRODUCT_REPO }}
+          ref: ${{ steps.pins.outputs.product_sha }}
+          ssh-key: ${{ secrets.PRODUCT_DEPLOY_KEY }}
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: "24", cache: npm, cache-dependency-path: product/app/package-lock.json }
+      - name: Install (no secrets)
+        run: cd product/app && npm ci --ignore-scripts --no-audit --no-fund
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          WORKER_URL: ${{ vars.WORKER_URL }}
+        run: product/deploy/deploy.sh --env env/env.yaml

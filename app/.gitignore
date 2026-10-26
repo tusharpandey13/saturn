@@ -1,0 +1,8 @@
+.wrangler/
+.vitest/
+*.sqlite
+.dev.vars
+.batch/
+node_modules/
+# rendered from deploy/wrangler.template.toml by scripts/render.ts
+wrangler.toml
