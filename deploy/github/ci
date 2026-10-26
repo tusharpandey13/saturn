@@ -73,7 +73,7 @@ case "$cmd" in
     [ "${1:-}" = "--" ] || die "usage: ci run FILE... -- CMD"; shift
     [ ${#files[@]} -gt 0 ] || exec "$@"
     [ -n "${CI_MASKED:-}" ] || { for f in "${files[@]}"; do dec "$f" | mask_json; done; export CI_MASKED=1; }
-    rest=$(printf '%q ' "${files[@]:1}")
+    rest=""; [ ${#files[@]} -lt 2 ] || rest=$(printf '%q ' "${files[@]:1}")
     exec sops exec-env "${files[0]}" "$(printf '%q' "$0") run $rest -- $(printf '%q ' "$@")" ;;
   *) sed -n '2,14p' "$0" >&2; exit 64 ;;
 esac
