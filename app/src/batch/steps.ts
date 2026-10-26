@@ -8,7 +8,7 @@
 
 import { PRODUCT_NAME } from "../product.js";
 import { parseUpdate, type ParsedMessage, type TelegramAdapter } from "../channel/telegram.js";
-import type { Thresholds } from "../config/thresholds.js";
+import type { ThresholdsConfig } from "../config/thresholds.js";
 import { type ExtractInput, type Extractor, ExtractorStopError } from "../extract/adapter.js";
 import { type Extraction, parseExtraction } from "../extract/schema.js";
 import { readingHi } from "../replies.js";
@@ -93,7 +93,8 @@ export interface ExtractDeps {
   extractor: Extractor;
   /** null: no STT key (Sarvam deferred). Voice notes are kept and marked stt_pending; a later run with STT transcribes them. */
   stt: SpeechToText | null;
-  thresholds: Thresholds;
+  /** From the records repo (config/thresholds.yaml); DISABLED_THRESHOLDS when absent. */
+  thresholds: ThresholdsConfig;
   persons: Map<string, Person>;
   now: string;
   timeZone?: string;

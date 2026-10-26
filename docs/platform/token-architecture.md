@@ -12,7 +12,7 @@ generated: false
 
 # Token architecture: storage, OAuth, TTLs, DPoP, branch protection, secret managers (2026-10-25)
 
-Status: **PROPOSAL**. This builds on the [security model](../security.md) and doesn't repeat its rotation runbook. Vendor claims were checked on 2026-10-25, with links inline. *Unverified* marks claims the official docs didn't settle. The concrete token inventory of a deployment (which tokens exist, where, and their state) is environment data: see [deploy-notes/token-inventory.md](../deploy-notes/token-inventory.md) until it moves to the env repo.
+Status: **PROPOSAL**. This builds on the [security model](../security.md) and doesn't repeat its rotation runbook. Vendor claims were checked on 2026-10-25, with links inline. *Unverified* marks claims the official docs didn't settle. Deployment specifics (the token inventory, plan tier and prices, rotation dates, environment and client names) live in the environment repo.
 
 **Bottom line.**
 - **Nothing Saturn owns mints OAuth tokens.** The only OAuth credentials are Anthropic's. Everything else is a static bearer.
@@ -60,7 +60,7 @@ Each deployment has the same kinds of store. The per-deployment inventory is in 
 | Our router: client secret → short-lived JWT | possible: `/v1/token` signs an HS256 or ES256 JWT with `jose` | see §3. **No** |
 
 ## 3. TTLs and rotation
-Static tokens carry no TTL unless one is set. The setup-token has a fixed one year, tracked by `CLAUDE_TOKEN_CREATED`. Proposal: one **rotation day each half-year** (Jan 15, Jul 15), plus annual items on the same day, so there is one calendar entry. Add a non-secret `credentials.yaml` (name, issuer, created, expires, consumers) to the env repo. The daily digest generalises the `CLAUDE_TOKEN_CREATED` warning: it warns at T−30 d and `/fail`s at T−7 d.
+Static tokens carry no TTL unless one is set. The setup-token has a fixed one year, tracked by `CLAUDE_TOKEN_CREATED`. Proposal: one **rotation day each half-year** (the dates are a deployment choice), plus annual items on the same day, so there is one calendar entry. Add a non-secret `credentials.yaml` (name, issuer, created, expires, consumers) to the env repo. The daily digest generalises the `CLAUDE_TOKEN_CREATED` warning: it warns at T−30 d and `/fail`s at T−7 d.
 
 **Router: AT/RT vs hashed bearers.** AT/RT only helps if the refresh token sits somewhere better protected than the access token. Here both would sit in the same 0600 file or GH secret. A short-lived AT does shrink the value of a token copied from logs or transcripts. The cost is a token endpoint, rotation of the signing key, refresh logic in two clients and two runners, and clock skew. **Recommendation: hashed bearers with `expires_at`, `last_used_at`, ≤2 live tokens per client (overlap) and the rotation day.** Revisit only if a third party or a browser becomes a client.
 
@@ -84,8 +84,8 @@ TTL and rotation per credential are in the table in §7.
 > **Amended 2026-10-26:** the plan tier is an env choice. Without Team, the fence is the env-repo split with access parity ([ADR 008](../decisions/008-product-environment-pii.md)); the analysis below stays as the option record.
 | Option | Prevents exfil? | Cost / ops | Notes |
 |---|---|---|---|
-| **GitHub Team, $4/user/mo** ([pricing](https://github.com/pricing): "$4 … for the first 12 months*"; the later price is *unverified*) | **yes.** Rulesets on private repos ([rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)), plus **environment secrets limited to `main`** and deployment branches ([envs](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)) | $48/yr, 10 min | keeps the org policies already set (read-only `GITHUB_TOKEN`, SHA-pin, require 2FA). Required reviewers still need Enterprise |
-| Move to a personal account + **Pro** (about $4/mo, *third-party price*) | mostly. Pro has protected branches and code owners on private repos ([plans](https://docs.github.com/en/get-started/learning-about-github/githubs-plans)), plus environment secrets and deployment branches | same $ plus a repo transfer | loses org-only "restrict who can push" ([protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)) and the org policies |
+| **GitHub Team**, paid per user ([pricing](https://github.com/pricing)) | **yes.** Rulesets on private repos ([rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)), plus **environment secrets limited to `main`** and deployment branches ([envs](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)) | per-user fee, 10 min | keeps org-level policies (read-only `GITHUB_TOKEN`, SHA-pin, require 2FA). Required reviewers still need Enterprise |
+| Move to a personal account + **Pro** (paid) | mostly. Pro has protected branches and code owners on private repos ([plans](https://docs.github.com/en/get-started/learning-about-github/githubs-plans)), plus environment secrets and deployment branches | similar fee plus a repo transfer | loses org-only "restrict who can push" ([protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)) and the org policies |
 | Personal account on Free | no | 0 | same limits as an org on Free |
 | Forgejo/Gitea self-hosted (primary or mirror) | only for pushes to Forgejo. Secrets in GitHub Actions stay unfenced if CI stays on GitHub. As the primary, it moves CI and PHI git onto the home box | a 24/7 home service, backups, upgrades; protection is approvals and force-push blocking ([forgejo](https://forgejo.org/docs/latest/user/protection/)) | complexity debt, and an availability risk for the PHI KB. **No** |
 | CI-side guard (`on: push`, alert on an unexpected author or a workflow diff) | **no, detect only.** The malicious workflow runs in parallel | 1 file | keep as a cheap tripwire |
@@ -94,7 +94,7 @@ TTL and rotation per credential are in the table in §7.
 | CODEOWNERS | no, without protection | trivial | add it once Team is on |
 | Allstar / Scorecard | monitors only. The hosted Allstar app has been retired, so you run it yourself as an Action ([allstar](https://github.com/ossf/allstar)) | low | Scorecard Action once a month is enough |
 
-**Recommendation (when a paid plan is chosen): GitHub Team.** It is the only option that *prevents* exfiltration rather than just detecting it, at $48/yr. Move every secret into a `main`-only environment. Add a ruleset on `main`: require a PR for the App, block force-push and deletion, require signed commits, and add a push-path restriction on `.github/workflows/**` for the App (the plan tier for push rulesets is *unverified*; the App's missing `workflows` permission already covers this).
+**Recommendation (when a paid plan is chosen): GitHub Team.** It is the only option that *prevents* exfiltration rather than just detecting it. Move every secret into a `main`-only environment. Add a ruleset on `main`: require a PR for the App, block force-push and deletion, require signed commits, and add a push-path restriction on `.github/workflows/**` for the App (the plan tier for push rulesets is *unverified*; the App's missing `workflows` permission already covers this).
 
 ## 6. Secret managers
 | Tool | Cost | Ops | Security model | GH Actions without static secrets? | Offline / home fit | Lock-in |
@@ -118,7 +118,7 @@ TTL and rotation per credential are in the table in §7.
   - **Add Claude Code `permissions.deny` for `Read(~/.config/<env>/**)`, `Read(~/.config/<agent-env>/**)`, `Read(~/.claude/.credentials.json)`** plus a Bash hook that blocks `cat`/`grep` on those paths. This is the cheapest control on the actual leak path.
 - **Home server.** Decrypt on the workstation, pipe over Tailscale SSH into `systemd-creds encrypt --with-key=host+tpm2`, and write the result to `/etc/credstore.encrypted/`. Units use `LoadCredentialEncrypted=`. Enable LUKS. Encryption is bound to the machine, so a copied disk image is useless.
 - **GitHub Actions.**
-  - Team environment `production` (main only) holds the CF, Telegram, R2, setup-token and router secrets. They are set from sops with `gh secret set --env production`.
+  - A Team environment limited to `main` holds the CF, Telegram, R2, setup-token and router secrets. They are set from sops with `gh secret set --env <environment>`.
   - **Anthropic API fallback via WIF**, not a key.
   - The App token comes from `actions/create-github-app-token`, if the batch ever needs it.
 - **Cloudflare.** Worker secrets pushed by `wrangler secret bulk` in deploy-worker. Skip Secrets Store until GA. Use a **separate CF account for agent-router**, which closes the D1 forging path in §1.
@@ -159,9 +159,9 @@ flowchart LR
     KC[Keychain: claude login AT/RT + age key] --> SOPS[sops exec-env]
     SOPS --> CTL[agentctl owner token]
   end
-  subgraph GH[GitHub Actions, Team env 'production' = main only]
+  subgraph GH[GitHub Actions, Team env = main only]
     OIDC[GitHub OIDC JWT] -->|jwt-bearer, sub=ref main| ANT[Anthropic WIF, 600 s token]
-    ENV[env secrets: CF deploy/D1, R2 S3, TG, setup-token, router hl-batch]
+    ENV[env secrets: CF deploy/D1, R2 S3, TG, setup-token, router batch client]
   end
   subgraph HS[Home server]
     TPM[systemd-creds host+tpm2] --> DH[dispatcher@hl: runner-hl, setup-token, App key]
@@ -172,7 +172,7 @@ flowchart LR
   ENV -->|secret bulk| W[Worker secrets]
   TG[Telegram] -->|X-Telegram-Bot-Api-Secret-Token| W
   W -->|bot token| TGAPI[Telegram API]
-  ENV -->|Bearer hl-batch| RT[agent-router, separate CF account; D1 hashed tokens]
+  ENV -->|Bearer batch client| RT[agent-router, separate CF account; D1 hashed tokens]
   CTL -->|Bearer admin| RT
   DH -->|Bearer runner + lease_token| RT
   DA -->|Bearer runner + lease_token| RT

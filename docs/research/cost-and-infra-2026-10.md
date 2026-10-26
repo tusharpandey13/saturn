@@ -61,7 +61,7 @@ Same text workload on other models (expected scenario, 578 calls): Haiku 5.5 $0.
 
 ## 4. The remote agent server option
 
-Account-specific findings (where the plan was found, which machines and plans the operator has, the org name) moved to [deploy-notes/cost-and-infra-account.md](../deploy-notes/cost-and-infra-account.md); the values are in the env repo.
+Account-specific findings (where the plan was found, which machines and plans the operator has, the org name) live in the environment repo.
 - **Today (typical)**: coding agents (the `claude` CLI, opencode with free models, pi with a DeepSeek key) run on the operator's laptop, reached from the phone via Paseo, with Tailscale + SSH as the fallback.
 - **Long-term plan (option D)**: an always-on VPS running opencode, pi, the `claude` CLI and the Paseo daemon. Git (a private GitHub org, `<org>`) is the source of truth; the laptop and phone become screens. Proposed cost: "0 (Oracle Always Free ARM, 4 cores/24 GB) or ~€4/mo (Hetzner)". Not started.
 - **Corrections from today's checks**:

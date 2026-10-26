@@ -49,7 +49,17 @@ Format: `<ns>:<class>:<local>`. `ns` is one of the `namespaces` in `records.yaml
 | Current health state (curated) | `docs/health/<ns>/` only: `summary`, `medications`, `problems`, `timeline`, `care-team`, `questions`, `briefs/` |
 | Household to-dos | `docs/health/family/actions.md` |
 | Extraction notes, hard-reads, chat triage, analyses | `docs/log/…` (dated, append-only) |
-| Records-local config | `records.yaml`, `meta/stt-vocab.txt` (optional STT vocabulary), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
+| Records-local config | `records.yaml`, `config/thresholds.yaml` (optional red-flag thresholds, below), `meta/stt-vocab.txt` (optional STT vocabulary), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
+
+### `config/thresholds.yaml` (red-flag thresholds)
+
+The product ships the rule engine but **no clinical values**. The values that turn readings and symptoms into digest annotations live in the records repo, in `config/thresholds.yaml`, because they are clinical choices for these people and belong with their doctor.
+
+- **Absent:** the rules are disabled. The digest shows no annotations and says thresholds are not configured.
+- **Present:** validated against the product schema (`app/src/config/thresholds.ts`: same camelCase keys, numbers where numbers are expected). Unknown keys, wrong types, duplicate keys or bad YAML stop the batch with an error naming the key (fail closed); nothing runs on half-read thresholds.
+- **Header fields:** `version`, `status` (`pending_clinician_signoff` or `signed_off`), `setBy`, `effectiveFrom` (`YYYY-MM-DD`). The digest prints the status next to every annotation.
+- **Changing values:** edit the file, bump `version`, set `setBy` and `effectiveFrom`, commit. Set `status: signed_off` only after the treating clinician has reviewed the values; until then keep `pending_clinician_signoff` and write "unverified; doctor sign-off pending" in the header comment. Cite the source of each value in a comment (guideline or doctor), and mark any value without a source `PLACEHOLDER`.
+- **Shape:** see the synthetic example `fixtures/records-example/config/thresholds.yaml` (example values for tests; not clinical guidance).
 
 Technical state, run history and deploy decisions belong in the env repo, not here. Product decisions belong in the product `docs/decisions/`.
 

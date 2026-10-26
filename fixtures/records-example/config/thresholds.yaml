@@ -1,0 +1,42 @@
+# EXAMPLE VALUES FOR TESTS; NOT CLINICAL GUIDANCE.
+# Synthetic records-example thresholds, used by the product's rules and batch tests and the local e2e.
+# The shape is documented in docs/records-guide.md ("config/thresholds.yaml") and validated by
+# app/src/config/thresholds.ts. A real records repo sets its own values with its doctor.
+
+version: "example-1"
+status: pending_clinician_signoff
+setBy: "example values for tests (not a doctor)"
+effectiveFrom: "2026-01-01"
+
+spo2:
+  tier1Below: 90
+  tier1WithBreathlessnessAtOrBelow: 92
+  tier2AtOrBelow: 94
+
+pulse:
+  tier1Below: 40
+  tier1BelowWithSymptoms: 50
+  tier1Above: 130
+  tier2Below: 50
+
+sbp:
+  tier1BelowWithSymptoms: 80
+  tier2BelowWithDizziness: 90
+  tier3Below: 95
+
+labs:
+  potassiumTier1AtOrAbove: 6.0
+  potassiumTier2Above: 5.5
+  sodiumTier2Below: 130
+  creatinineTier2AboveMgDl: 2.5
+
+weight:
+  gainTier2:
+    - { days: 1, kg: 1.5, source: "example rule A" }
+    - { days: 3, kg: 2.0, source: "example rule B" }
+    - { days: 7, kg: 2.3, source: "example rule C" }
+  sustainedGainTier2: { windowDays: 3, kg: 1.0, consecutiveDays: 3 }
+  lossWithDizzinessTier2: { days: 3, kg: 2.0 }
+
+chestPainTier1MinDurationMin: 15
+breathlessUnknownRestTier2Severity: 7

@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_THRESHOLDS as T } from "../src/config/thresholds.js";
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadRecords, loadThresholds } from "../src/batch/records.js";
+import { DISABLED_THRESHOLDS, parseThresholdsYaml, thresholdsEnabled } from "../src/config/thresholds.js";
 import { evaluate, evaluateSymptoms, highestTier, localDate } from "../src/rules/engine.js";
 import type { Reading, Symptom } from "../src/types.js";
 
 const TZ = "Asia/Kolkata";
+// Example values for tests; not clinical guidance (fixtures/records-example/config/thresholds.yaml).
+const EXAMPLE = join(import.meta.dirname, "..", "..", "fixtures", "records-example");
+const EXAMPLE_YAML = readFileSync(join(EXAMPLE, "config", "thresholds.yaml"), "utf8");
+const loaded = loadThresholds(EXAMPLE);
+if (!thresholdsEnabled(loaded)) throw new Error("example thresholds missing");
+const T = loaded;
 const r = (type: Reading["type"], value: number, measuredAt = "2026-10-24T08:00:00+05:30", value2: number | null = null, value3: number | null = null): Reading => ({ type, value, value2, value3, unit: "", measuredAt });
 const s = (symptomType: Symptom["symptomType"], extra: Partial<Symptom> = {}): Symptom => ({
   symptomType, location: null, side: "unknown", character: [], severity: null, durationMin: null, atRest: null, associated: [], triggers: [], freeText: "", observedAt: "2026-10-24T08:00:00+05:30", ...extra,
@@ -14,8 +24,41 @@ const codes = (a: { code: string }[]) => a.map((x) => x.code);
 const day = (d: number, time = "08:00") => `2026-10-${String(d).padStart(2, "0")}T${time}:00+05:30`;
 
 describe("thresholds config", () => {
-  it("is marked pending clinician sign-off", () => {
+  const withThresholds = (text: string | null) => {
+    const root = mkdtempSync(join(tmpdir(), "thresholds-"));
+    cpSync(join(EXAMPLE, "records.yaml"), join(root, "records.yaml"));
+    if (text !== null) {
+      mkdirSync(join(root, "config"));
+      writeFileSync(join(root, "config", "thresholds.yaml"), text);
+    }
+    try {
+      return loadRecords(root).thresholds;
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  it("loaded file is used: the example records carry pending-sign-off example values", () => {
     expect(T.status).toBe("pending_clinician_signoff");
+    expect(T.version).toBe("example-1");
+    expect(withThresholds(EXAMPLE_YAML)).toEqual(T);
+    expect(codes(run([r("pulse", 39)]))).toEqual(["PULSE_VERY_LOW"]);
+  });
+
+  it("missing file -> disabled: no annotations at all", () => {
+    const t = withThresholds(null);
+    expect(t).toEqual(DISABLED_THRESHOLDS);
+    expect(evaluate({ readings: [r("pulse", 30), r("spo2", 80)], symptoms: [s("chest_pain")], weightHistory: [], thresholds: t, timeZone: TZ })).toEqual([]);
+    expect(evaluateSymptoms([s("syncope")], t)).toEqual([]);
+  });
+
+  it("invalid file -> clear error (fail closed)", () => {
+    expect(() => withThresholds(EXAMPLE_YAML + "extraKey: 1\n")).toThrow(/config\/thresholds\.yaml: invalid thresholds; .*Unrecognized key: "extraKey"/);
+    expect(() => withThresholds(EXAMPLE_YAML.replace("tier1Below: 90", "tier1Below: low"))).toThrow(/spo2\.tier1Below/);
+    expect(() => withThresholds(EXAMPLE_YAML.replace("status: pending_clinician_signoff", "status: approved"))).toThrow(/status/);
+    expect(() => withThresholds(EXAMPLE_YAML.replace(/^labs:[\s\S]*?^weight:/m, "weight:"))).toThrow(/labs/);
+    expect(() => withThresholds("spo2: [unclosed")).toThrow(/not valid YAML/);
+    expect(() => parseThresholdsYaml(EXAMPLE_YAML + "version: again\n")).toThrow(/not valid YAML/); // duplicate key
   });
 });
 

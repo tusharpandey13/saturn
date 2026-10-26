@@ -1,6 +1,7 @@
 // Daily digest to the family group (ADR 005). Also the heartbeat: a day without a digest means the batch broke.
 // Values are rendered from the stored records with fixed templates (src/replies.ts), never LLM text.
-// Red-flag rules appear only as annotations, explicitly unverified (thresholds pending clinician sign-off).
+// Red-flag rules appear only as annotations, explicitly unverified, with the thresholds status. With no thresholds
+// configured in the records repo (status "disabled") the digest says so and shows no annotations.
 
 import { PRODUCT_NAME } from "../product.js";
 import { readingHi, symptomHi } from "../replies.js";
@@ -31,6 +32,8 @@ const DEEP_HI: Record<string, string> = {
   document: "दस्तावेज़", prescription: "पर्चा", report: "रिपोर्ट", medicine: "दवा की फ़ोटो",
 };
 
+export const THRESHOLDS_OFF_LINE = "ℹ Rule annotations off: thresholds not configured (records config/thresholds.yaml).";
+
 export function buildDigest(o: {
   entries: DigestEntry[];
   /** Not processed yet (media not copied, or delayed); retried next run. */
@@ -41,6 +44,7 @@ export function buildDigest(o: {
   warnings?: string[];
   now: string;
   timeZone: string;
+  /** Thresholds status: pending_clinician_signoff, signed_off or disabled (not configured). */
   thresholdsStatus: string;
 }): string {
   const day = new Intl.DateTimeFormat("en-IN", { timeZone: o.timeZone, day: "numeric", month: "short" }).format(new Date(o.now));
@@ -71,6 +75,8 @@ export function buildDigest(o: {
     out.push("", `⚠ Rule annotations (${ANNOTATION_NOTE}; thresholds: ${o.thresholdsStatus}). Not advice; call the doctor if worried:`);
     for (const e of flagged) for (const a of e.annotations) out.push(`- ${e.person} ${time(e.ts)}: T${a.tier} ${a.code}: ${a.detail}`);
   }
+
+  if (o.thresholdsStatus === "disabled") out.push("", THRESHOLDS_OFF_LINE);
 
   const delayed = o.delayed ?? 0;
   if (delayed) out.push("", DELAYED_LINE(delayed));

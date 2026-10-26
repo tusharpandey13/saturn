@@ -111,6 +111,6 @@ export interface Alert {
   code: string;
   /** Human-readable reason: reading + rule. English, for the digest annotation. */
   detail: string;
-  /** Where the threshold comes from (hf-red-flags.md source ids). */
+  /** Where the threshold comes from (source ids from the records' thresholds reference). */
   source: string;
 }

@@ -16,7 +16,8 @@ batch/run.ts              batch CLI used by deploy/batch.sh (workflow template d
 src/extract/              extraction schema (Zod 4), validation and plausibility checks
 ../adapters/llm/          LLM adapters: claude-cli, fake
 ../adapters/stt/          STT adapters: sarvam (REST <= 30 s, batch job for longer notes), none
-src/rules/, src/config/   red-flag rules + thresholds: digest annotations only, PENDING CLINICIAN SIGN-OFF
+src/rules/, src/config/   red-flag rules + thresholds schema: digest annotations only. Values come from the records
+                          repo's config/thresholds.yaml (validated); absent = rules disabled
 src/replies.ts            fixed Hindi labels for the digest
 migrations/               D1 schema (persons, chats, inbox)
 ```

@@ -1,70 +1,70 @@
-// Red-flag thresholds. DATA, not logic: the rules in src/rules read only from here.
+// Red-flag thresholds: the shape, the validator and the built-in default. DATA, not logic: the rules in src/rules
+// read only from here.
 //
-// STATUS: PENDING CLINICIAN SIGN-OFF.
-// Conservative generic defaults, transcribed from published guidelines (sources [Sn] below; the list lives with the
-// records, as a reference page). Per-person overrides belong to the records repo, not here.
-// Rows marked PLACEHOLDER there have no guideline number; the doctor must confirm or replace them.
-// When the treating clinician personalises values, bump `version`, set `setBy` and `effectiveFrom`.
+// The product ships NO clinical values. The values belong to the records repo, in config/thresholds.yaml
+// (docs/records-guide.md), loaded by src/batch/records.ts. Without that file the built-in default is DISABLED:
+// the rule engine emits no annotations and the digest says thresholds are not configured.
+// Keys in the YAML file are the same camelCase names as below; unknown keys and wrong types are rejected.
+// When the treating clinician personalises values, the records owner bumps `version`, sets `setBy` and `effectiveFrom`.
+import { parse } from "yaml";
+import { z } from "zod";
 
-export interface Thresholds {
-  version: string;
-  status: "pending_clinician_signoff" | "signed_off";
-  setBy: string;
-  effectiveFrom: string;
+const num = z.number().finite();
+const count = z.number().int().positive();
 
-  spo2: { tier1Below: number; tier1WithBreathlessnessAtOrBelow: number; tier2AtOrBelow: number };
-  pulse: { tier1Below: number; tier1BelowWithSymptoms: number; tier1Above: number; tier2Below: number };
-  sbp: { tier1BelowWithSymptoms: number; tier2BelowWithDizziness: number; tier3Below: number };
-  labs: {
-    potassiumTier1AtOrAbove: number;
-    potassiumTier2Above: number;
-    sodiumTier2Below: number;
-    creatinineTier2AboveMgDl: number;
-  };
-  weight: {
+export const ThresholdsSchema = z.strictObject({
+  version: z.string().min(1),
+  status: z.enum(["pending_clinician_signoff", "signed_off"]),
+  setBy: z.string().min(1),
+  effectiveFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "expected YYYY-MM-DD"),
+
+  spo2: z.strictObject({ tier1Below: num, tier1WithBreathlessnessAtOrBelow: num, tier2AtOrBelow: num }),
+  pulse: z.strictObject({ tier1Below: num, tier1BelowWithSymptoms: num, tier1Above: num, tier2Below: num }),
+  sbp: z.strictObject({ tier1BelowWithSymptoms: num, tier2BelowWithDizziness: num, tier3Below: num }),
+  labs: z.strictObject({
+    potassiumTier1AtOrAbove: num,
+    potassiumTier2Above: num,
+    sodiumTier2Below: num,
+    creatinineTier2AboveMgDl: num,
+  }),
+  weight: z.strictObject({
     /** gain (kg) vs the lowest reading in the window of N previous calendar days -> tier 2 */
-    gainTier2: { days: number; kg: number; source: string }[];
+    gainTier2: z.array(z.strictObject({ days: count, kg: num, source: z.string() })),
     /** gain > kg vs the lowest reading of the previous windowDays, on each of consecutiveDays days in a row -> tier 2 */
-    sustainedGainTier2: { windowDays: number; kg: number; consecutiveDays: number };
+    sustainedGainTier2: z.strictObject({ windowDays: count, kg: num, consecutiveDays: count }),
     /** loss (kg) over N days, tier 2 only together with dizziness */
-    lossWithDizzinessTier2: { days: number; kg: number };
-  };
-  chestPainTier1MinDurationMin: number;
+    lossWithDizzinessTier2: z.strictObject({ days: count, kg: num }),
+  }),
+  chestPainTier1MinDurationMin: num,
   /** Breathlessness with at_rest unknown and severity >= this -> tier 2 plus a follow-up question. */
-  breathlessUnknownRestTier2Severity: number;
+  breathlessUnknownRestTier2Severity: num,
+});
+
+/** Thresholds loaded from a records repo. */
+export type Thresholds = z.infer<typeof ThresholdsSchema>;
+
+/** No thresholds configured: the rules are off. */
+export interface DisabledThresholds {
+  status: "disabled";
 }
 
-export const DEFAULT_THRESHOLDS: Thresholds = {
-  version: "2026-10-24-defaults",
-  status: "pending_clinician_signoff",
-  setBy: "generic guideline defaults (not a doctor)",
-  effectiveFrom: "2026-10-24",
+export type ThresholdsConfig = Thresholds | DisabledThresholds;
 
-  // ESC 2021 <90 [S15]; NHS oximetry <=92 with symptoms / 93-94 contact GP [S14]
-  spo2: { tier1Below: 90, tier1WithBreathlessnessAtOrBelow: 92, tier2AtOrBelow: 94 },
-  // <40 PLACEHOLDER; <50 + symptoms [S8, S18]; >130 PLACEHOLDER (lower end of 130-150, conservative)
-  pulse: { tier1Below: 40, tier1BelowWithSymptoms: 50, tier1Above: 130, tier2Below: 50 },
-  // <80 symptomatic PLACEHOLDER [Island Health]; <90 with dizziness [S8, S19]; asymptomatic low BP logged
-  sbp: { tier1BelowWithSymptoms: 80, tier2BelowWithDizziness: 90, tier3Below: 95 },
-  // SIGN MRA / NHS SPS [S8, S9]; Na <130 PLACEHOLDER
-  labs: {
-    potassiumTier1AtOrAbove: 6.0,
-    potassiumTier2Above: 5.5,
-    sodiumTier2Below: 130,
-    creatinineTier2AboveMgDl: 2.5,
-  },
-  weight: {
-    gainTier2: [
-      { days: 1, kg: 1.5, source: "AHA >2-3 lb in 24 h [S11]" },
-      { days: 3, kg: 2.0, source: "HFA >2 kg in 3 days [S7, S10]" },
-      { days: 7, kg: 2.3, source: "AHA 5 lb in a week [S11]" },
-    ],
-    // SIGN/McMurray beta-blocker annex: >1 kg over 3 days persisting >2 days [S8 Annex 4]
-    sustainedGainTier2: { windowDays: 3, kg: 1.0, consecutiveDays: 3 },
-    lossWithDizzinessTier2: { days: 3, kg: 2.0 }, // PLACEHOLDER magnitude [S7]
-  },
-  // ACS public advice, PLACEHOLDER duration. Unknown duration is treated as tier 1.
-  chestPainTier1MinDurationMin: 15,
-  // PLACEHOLDER: unknown whether at rest; conservative escalation pending clarification
-  breathlessUnknownRestTier2Severity: 7,
-};
+/** Built-in default: neutral. No values, no annotations. */
+export const DISABLED_THRESHOLDS: DisabledThresholds = Object.freeze({ status: "disabled" as const });
+
+export const thresholdsEnabled = (t: ThresholdsConfig): t is Thresholds => t.status !== "disabled";
+
+/** Parse and validate config/thresholds.yaml text. Fails closed: any YAML or schema problem throws. */
+export function parseThresholdsYaml(text: string, where = "config/thresholds.yaml"): Thresholds {
+  let raw: unknown;
+  try {
+    raw = parse(text, { uniqueKeys: true });
+  } catch (err) {
+    throw new Error(`${where}: not valid YAML (${(err as Error).message.split("\n")[0]})`);
+  }
+  const r = ThresholdsSchema.safeParse(raw);
+  if (!r.success)
+    throw new Error(`${where}: invalid thresholds; ${r.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ")}`);
+  return r.data;
+}

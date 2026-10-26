@@ -18,12 +18,12 @@
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5",
-    "wrangler": "^4.152.0",
-    "yaml": "2.9.1"
+    "wrangler": "^4.152.0"
   },
   "description": "Saturn ingest Worker and daily batch",
   "license": "Apache-2.0",
   "dependencies": {
+    "yaml": "2.9.1",
     "zod": "4.6.7"
   }
 }

@@ -4,7 +4,7 @@
 //                                                  exit 3 when extraction was delayed (auth, usage limit, outage)
 //   npx tsx batch/run.ts finish [--no-digest]      mark inbox rows done, assert the webhook, send the digest, prune
 //                                                  exit 1 when the webhook assertion fails (⚠ lines in the digest)
-// Options: --records DIR (records repo root, holds records.yaml; --root is the old name), --digest FILE (default
+// Options: --records DIR (records repo root, holds records.yaml and optional config/thresholds.yaml; --root is the old name), --digest FILE (default
 //          $RUNNER_TEMP or app/.batch/digest.txt), --now ISO.
 // Env: pull/finish CLOUDFLARE_D1_TOKEN (fallback CLOUDFLARE_API_TOKEN), CLOUDFLARE_R2_TOKEN (optional), CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID, R2_BUCKET, TELEGRAM_BOT_TOKEN;
 //      extract CLAUDE_CODE_OAUTH_TOKEN (or a local `claude` login; ANTHROPIC_API_KEY, if set, takes precedence in the CLI),
@@ -18,7 +18,6 @@ import { Repo } from "../src/batch/repo.js";
 import { extract, finish, pull } from "../src/batch/steps.js";
 import { checkWebhook } from "../src/batch/webhook.js";
 import { TelegramAdapter } from "../src/channel/telegram.js";
-import { DEFAULT_THRESHOLDS } from "../src/config/thresholds.js";
 import { ClaudeCliExtractor, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
 import { Store } from "../src/store.js";
 import { parseVocab, SarvamSpeechToText } from "../../adapters/stt/sarvam.js";
@@ -61,7 +60,7 @@ async function main(cmd: string | undefined) {
     }
     if (!env.SARVAM_API_KEY) console.log("extract: no SARVAM_API_KEY; voice notes are stored as stt_pending");
     const r = await extract({
-      repo, persons, now, thresholds: DEFAULT_THRESHOLDS, warnings,
+      repo, persons, now, thresholds: records.thresholds, warnings,
       extractor: new ClaudeCliExtractor({ bin: env.CLAUDE_BIN || "claude", context: records.extractionContext }),
       stt: env.SARVAM_API_KEY ? new SarvamSpeechToText(env.SARVAM_API_KEY, undefined, undefined, parseVocab(records.sttVocab ?? "")) : null,
       retryFailed: args.includes("--retry-failed"),

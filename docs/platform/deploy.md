@@ -53,7 +53,7 @@ Which LLM credential to use (a subscription token or an API key) is an env choic
 3. [USER] Create the env repo from the env template: `env.yaml`, `product.lock`, `.sops.yaml` with the operator's age key, and the workflow files copied from `deploy/github/`. Fill `env.yaml` with names (or keep the defaults) and leave `d1.id` empty.
 4. [USER] LLM adapter credential: create it per the adapter's docs (for `claude-cli`, `claude setup-token` in a local terminal, never in a chat) and put it straight into the SOPS file. Record its creation date in `env.yaml` (`llm.token_created`); the digest warns 30 days before expiry. On a usage-limit or auth failure the digest says "extraction delayed", the inbox rows stay unprocessed and the next run retries.
 5. [USER] STT is optional. With the `none` adapter, voice notes are stored and the digest says "voice note saved; transcription pending". To enable `sarvam`, opt out of model training first, then add `SARVAM_API_KEY`. The next run transcribes the waiting notes.
-6. [USER] Thresholds: the digest shows rule annotations marked "unverified; doctor sign-off pending" until a clinician reviews `app/src/config/thresholds.ts` or the household accepts that label.
+6. [USER] Thresholds: the digest shows rule annotations marked "unverified; doctor sign-off pending" until a clinician reviews the records repo's `config/thresholds.yaml` or the household accepts that label. Without that file the rules are disabled and the digest says thresholds are not configured.
 7. [USER] Tell the household what to expect: the bot replies "✓" and echoes numbers ("BP 120/80, pulse 72 ✓"; resend or edit if wrong); a summary comes in the evening with questions; it never gives medical advice; in an emergency, phone the local emergency number.
 8. [USER] Telegram: create the bot with @BotFather (token straight into the SOPS file). Create the group, add the bot, **make it admin with every right off** (admins receive photos and voice notes; leave privacy mode at default). If a bot token was ever pasted into a chat or log, revoke and replace it first.
 9. [USER] Each member sends one group message. [AGENT] reads the ids with `getUpdates` (works only before a webhook is set) and records the group id and each sender id in the env repo's allowlist file (ids and role labels only, never names).
@@ -99,7 +99,7 @@ Rule: **create new → update the SOPS file → redeploy or re-run → verify �
 - Inbox rows are deleted 14 days after they are committed (`INBOX_RETENTION_DAYS`). R2 objects are kept (second copy of the media).
 - Re-running the batch is always safe. Inputs: `retry_failed` re-extracts messages that failed permanently; `send_digest: false` avoids a second digest the same day.
 - The LLM CLI version is pinned in the batch workflow; bump it deliberately and run once by hand.
-- Thresholds: edit `app/src/config/thresholds.ts`, bump `version`, set `setBy`/`effectiveFrom`, `npm test`, release (they only change digest annotations).
+- Thresholds: edit the records repo's `config/thresholds.yaml`, bump `version`, set `setBy`/`effectiveFrom`, commit to the records repo; the next batch run validates and uses it (no product release; they only change digest annotations). See [records guide](../records-guide.md).
 - Deep reads: the `needs_deep` queue in the records repo; runbook in ADR 005.
 - Telegram stops redelivering after 24 h: if the Worker is down, fix it the same day.
 

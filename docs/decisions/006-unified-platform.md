@@ -2,10 +2,10 @@
 
 Date: 2026-10-25 · Status: **SUPERSEDED IN PART** by the [HLD](../platform/hld.md) (2026-10-25); the remainder stays proposed · Superseded-by (in part): [hld.md](../platform/hld.md) · Builds on: 003, 004, 005 (ingest-only Worker + daily batch, in progress) · Research: [cost-and-infra-2026-10.md](../research/cost-and-infra-2026-10.md)
 
-Where this ADR and the HLD (or the [hl-service design](../platform/hl-service-design.md) / the agent-service design in the agent-server repo) differ, the HLD wins. Names below (`hl-ingest`, `agent-router`, D1 database names) are template defaults; concrete resource names live in the env repo. Wherever this ADR says "subscription", the subscription-vs-API choice (and its terms of service) is an env choice.
+Where this ADR and the HLD (or the [hl-service design](../platform/hl-service-design.md) / the agent-service design in the agent-server repo) differ, the HLD wins. Names below (`hl-ingest`, `agent-router`, D1 database names) are template defaults; concrete resource names live in the env repo. Wherever this ADR says "subscription", the subscription-vs-API choice (and its terms of service) is an env choice. Deployment specifics (hosts and providers chosen, costs, accounts, subscriptions) live in the environment repo.
 
 ## Context
-There are two plans with overlapping parts. **Saturn** (ADR 005) is a Telegram webhook into a CF Worker, then D1/R2, then a daily GitHub Actions batch, then git, with hard work sent to a `needs_deep` queue. The **agent server** (option D, not started) is an always-on VPS running the opencode, pi and `claude` CLIs and the Paseo daemon, with git as the source of truth and the Mac and phone as screens. Provider status: Oracle Always Free A1 is now 2 OCPU/12 GB and reclaims idle instances. Hetzner starts at €5.99 (CX23) and showed as unavailable on 2026-10-25. This ADR folds both into one design: the server becomes a general **agent router** for async agent jobs, and Saturn is its first tenant.
+There are two plans with overlapping parts. **Saturn** (ADR 005) is a Telegram webhook into a CF Worker, then D1/R2, then a daily GitHub Actions batch, then git, with hard work sent to a `needs_deep` queue. The **agent server** (option D, not started) is an always-on VPS running the opencode, pi and `claude` CLIs and the Paseo daemon, with git as the source of truth and the Mac and phone as screens. The server host (free tier with reclaim risk, or a small paid VPS) is a deployment choice. This ADR folds both into one design: the server becomes a general **agent router** for async agent jobs, and Saturn is its first tenant.
 
 ## Decision (summary)
 1. **Cloudflare (Free plan) is the only always-on, inbound-facing tier.** It runs two Workers: `hl-ingest` (ADR 005) and `agent-router` (new; owns the job queue in its own D1 database). Every other component only makes outbound calls.
@@ -90,7 +90,7 @@ If the router or a runner is down, steps 11–18 wait. Steps 1–10 never depend
 | Telegram ingest | CF Worker `hl-ingest` | inbound, always on, $0, no patching | Telegram retries ≤24 h; D1/R2 are durable |
 | Job queue + API | CF Worker `agent-router` + D1 | reachable by all clients; survives server loss | submit fails → batch keeps `needs_deep` in git and re-submits next run (idempotent) |
 | Daily batch, digest | GitHub Actions | free 2,000 min; independent of server and Mac; emails on failure | inbox grows; next run catches up |
-| Cheap extraction | Haiku 5.5 API + Sarvam, called from Actions | ~$0.20/mo; must run when the server is down | retry next run |
+| Cheap extraction | small-model API + STT, called from Actions | cheap; must run when the server is down | retry next run |
 | Opus / deep jobs | server runner `hl` (claude CLI, subscription) | $0 marginal; long-running | lease expires → re-queued; Mac runner may claim |
 | General agent jobs | server runner `agents` | any tier, never PHI | queued until a runner is up |
 | OCR, `<media-dir>` | Mac | Apple Vision is macOS-only; keeps the media folder (PHI) off the VPS | documents wait |
@@ -145,7 +145,7 @@ The `tier` field is the *minimum* capability. The router picks the cheapest allo
 
 - **PHI** goes only to the claude CLI or the Anthropic API. It never goes to DeepSeek, free hosted endpoints, or the Gemini/OpenAI free tiers. The claim query and the runner both enforce this, so even a misconfigured client can't route PHI elsewhere.
 - **Subscription guard.** Automated jobs may use at most N deep jobs per day (default 10) and at most one concurrent claude session per runner. This leaves the plan's own usage limits for interactive work. Reaching the cap means `not_before = tomorrow`; it is not an error.
-- **Concurrency.** `hl` runs 1 job and `agents` runs 2 (12 GB box). The Mac runs 1, and only while awake.
+- **Concurrency.** `hl` runs 1 job and `agents` runs a small number sized to the server's memory. The Mac runs 1, and only while awake.
 
 ## Comms and auth
 - **Outbound-only from the runners:** HTTPS to `agent-router` (poll every 60 s, backing off to 5 min after 1 h idle; about 1.5–3k requests/day against Free's 100k/day) and git over SSH to GitHub. There are no inbound ports, NAT is fine, and downtime only delays jobs.
@@ -170,22 +170,16 @@ The `tier` field is the *minimum* capability. The router picks the cheapest allo
 ## Data protection (PHI)
 - **`data_class` policy:** see the routing table. PHI `inputs` must be refs (git path at sha, or an R2 key). Results are never stored in D1, only `result_ref`. The router DB holds only short PHI prompts.
 - **Unix isolation:** user `hl` owns `/srv/hl` (0700), has its own deploy key (records repo only), its own `claude` login, and no opencode/pi binaries on its PATH. User `agents` cannot read `/srv/hl`. No `<media-dir>` on the VPS; jobs fetch only the R2 objects they need into tmp and wipe them afterwards.
-- **Secrets:** none in git. Per-user files at 0600 are loaded through systemd `LoadCredential`. Router tokens are hashed. The Anthropic API key has a console spend cap of ~$10/mo. Rotation = issue a new token, then delete the old row.
+- **Secrets:** none in git. Per-user files at 0600 are loaded through systemd `LoadCredential`. Router tokens are hashed. The Anthropic API key has a console spend cap (value: deployment). Rotation = issue a new token, then delete the old row.
 - **Provider terms caveat:** which terms PHI travels under (a consumer plan through the claude CLI or commercial API terms) is an env choice. Whatever is chosen, model training must be **off** (open question 2).
 
-## Cost delta vs ADR 005 (~$1/mo)
-| Item | Δ / month | Source |
-|---|---|---|
-| `agent-router` Worker + D1 (Free) | $0 | CF pricing pages above |
-| Opus/Sonnet via claude CLI | $0 marginal (flat-rate plan, an env choice) | — |
-| Anthropic API fallback (opt-in per job) | $0 to cap ($10) | research doc §2 |
-| VPS | $0 (Oracle Free, reclaim risk) or €5.99–10.99 + VAT (Hetzner) | research doc §4 |
-| **Saturn total** | **≈ $1, unchanged.** The server is paid for by the agent plan, not by Saturn. | |
+## Cost delta vs ADR 005
+The router adds no Cloudflare cost on the Free plan (pricing pages above). Model cost depends on the subscription-vs-API choice and the fallback cap; the server cost depends on the host. Saturn's own cost is unchanged: the server is paid for by the agent plan, not by Saturn. The concrete figures for a deployment live in the environment repo.
 
 ## Asymmetric risks
 - **PHI leaks to a provider that logs or trains:** irreversible. Prevented by three layers of enforcement plus Unix separation, at a cost of ~1 run.
 - **Automated jobs drain the plan's usage limits:** the downside is losing interactive Claude for days; the cap costs one config value.
-- **Server lost (Oracle reclaim, outage):** the downside is delay only. The queue lives in D1, truth in git, and the Mac drains. The rebuild is scripted.
+- **Server lost (free-tier reclaim, outage):** the downside is delay only. The queue lives in D1, truth in git, and the Mac drains. The rebuild is scripted.
 - **Router down:** the family is unaffected. The batch keeps `needs_deep` in git and re-submits.
 - **Duplicate execution (at-least-once):** at worst a duplicate PR or an empty commit. Fencing tokens stop stale writes.
 - **Building DOs/push now:** permanent complexity for latency nobody needs.
@@ -200,7 +194,7 @@ The `tier` field is the *minimum* capability. The router picks the cheapest allo
 | 4 | Only on demand: DO push dispatch, PaddleOCR on the server. | 1–2 each |
 
 ## Open questions
-1. VPS: Oracle Free (ARM, reclaim risk; is a PAYG upgrade enough to stop reclaim? unverified) or Hetzner €6–11 once available?
+1. VPS host: a free tier (reclaim risk) or a small paid VPS? (A deployment choice; recorded in the environment repo.)
 2. Is the Claude account's "help improve Claude" training setting off? If not, should PHI go over the API key only?
 3. What cap on automated deep jobs per day (default 10)?
 4. Should PHI results go straight to `main` or through a PR for review? (Recommended: PR for doctor briefs and medication facts, per ADR 004's human tier.)

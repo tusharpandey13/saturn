@@ -1,8 +1,9 @@
 // Deterministic red-flag rules. Pure functions: no I/O, no LLM, no clock.
-// Every threshold comes from Thresholds (src/config/thresholds.ts).
+// Every threshold comes from Thresholds (shape in src/config/thresholds.ts; values from the records repo's
+// config/thresholds.yaml). With thresholds disabled (no file) every rule returns nothing.
 // ADR 005: these only annotate the daily digest ("unverified; doctor sign-off pending"). Nothing alerts in real time.
 
-import type { Thresholds } from "../config/thresholds.js";
+import { thresholdsEnabled, type Thresholds, type ThresholdsConfig } from "../config/thresholds.js";
 import type { Alert, Reading, Symptom, SymptomType } from "../types.js";
 
 export interface RuleInput {
@@ -14,7 +15,7 @@ export interface RuleInput {
   contextSymptoms?: Symptom[];
   /** Earlier confirmed weight readings (any order). Needed for trend rules. */
   weightHistory: Reading[];
-  thresholds: Thresholds;
+  thresholds: ThresholdsConfig;
   timeZone: string;
 }
 
@@ -37,8 +38,9 @@ const alert = (tier: Alert["tier"], code: string, detail: string, source: string
 // ---------- symptoms ----------
 
 /** Symptom rules. */
-export function evaluateSymptoms(symptoms: Symptom[], t: Thresholds): Alert[] {
+export function evaluateSymptoms(symptoms: Symptom[], t: ThresholdsConfig): Alert[] {
   const out: Alert[] = [];
+  if (!thresholdsEnabled(t)) return out;
   for (const s of symptoms) {
     const has = (...a: string[]) => s.associated.some((x) => a.includes(x));
     switch (s.symptomType) {
@@ -47,12 +49,12 @@ export function evaluateSymptoms(symptoms: Symptom[], t: Thresholds): Alert[] {
         if (long || has("sweating", "breathlessness", "fainting", "syncope", "vomiting", "nausea")) {
           out.push(alert(1, "CHEST_PAIN", `Chest pain (duration ${s.durationMin ?? "unknown"} min, with: ${s.associated.join(", ") || "none"})`, "ACS public advice; PLACEHOLDER duration"));
         } else {
-          out.push(alert(2, "CHEST_PAIN_BRIEF", `Brief chest discomfort (${s.durationMin} min), settled`, "hf-red-flags.md tier 2, PLACEHOLDER"));
+          out.push(alert(2, "CHEST_PAIN_BRIEF", `Brief chest discomfort (${s.durationMin} min), settled`, "PLACEHOLDER"));
         }
         break;
       }
       case "breathlessness":
-        if (s.atRest) out.push(alert(1, "BREATHLESS_AT_REST", "Breathlessness at rest", "Acute HF features [S1, S7]"));
+        if (s.atRest) out.push(alert(1, "BREATHLESS_AT_REST", "Breathlessness at rest", "[S1, S7]"));
         else if (s.atRest === null && (s.severity ?? 0) >= t.breathlessUnknownRestTier2Severity)
           out.push(alert(2, "BREATHLESS_SEVERE_UNCLEAR", `Breathlessness severity ${s.severity}/10, unknown whether at rest`, "[S7], PLACEHOLDER"));
         else out.push(alert(3, "BREATHLESS_EXERTION", "Breathlessness on exertion (trend vs baseline not yet implemented)", "[S7]"));
@@ -75,7 +77,7 @@ export function evaluateSymptoms(symptoms: Symptom[], t: Thresholds): Alert[] {
         else out.push(alert(2, "PALPITATIONS", "Palpitations", "[S18, S22]"));
         break;
       case "orthopnea":
-        out.push(alert(2, "ORTHOPNEA", "Breathless lying flat / waking breathless", "HFA Table 2 [S7]"));
+        out.push(alert(2, "ORTHOPNEA", "Breathless lying flat / waking breathless", "[S7]"));
         break;
       case "vomiting_diarrhoea":
         out.push(alert(2, "SICK_DAY", "Vomiting or diarrhoea", "SIGN MRA [S8], SGLT2i [S25]"));
@@ -183,7 +185,7 @@ export function evaluateWeight(w: Reading, history: Reading[], sy: Symptom[], t:
   if (wl.length && present(sy, "dizziness")) {
     const lost = +(Math.max(...wl) - w.value).toFixed(2);
     if (lost > loss.kg)
-      out.push(alert(2, "WEIGHT_LOSS_DIZZY", `Weight ${w.value} kg: -${lost} kg in ${loss.days} days with dizziness`, "HFA [S7], PLACEHOLDER"));
+      out.push(alert(2, "WEIGHT_LOSS_DIZZY", `Weight ${w.value} kg: -${lost} kg in ${loss.days} days with dizziness`, "[S7], PLACEHOLDER"));
   }
   return out;
 }
@@ -192,6 +194,7 @@ export function evaluateReadings(input: RuleInput): Alert[] {
   const { readings, weightHistory, thresholds: t, timeZone } = input;
   const sy = [...input.symptoms, ...(input.contextSymptoms ?? [])];
   const out: Alert[] = [];
+  if (!thresholdsEnabled(t)) return out;
   const push = (a: Alert | null) => a && out.push(a);
   for (const r of readings) {
     switch (r.type) {

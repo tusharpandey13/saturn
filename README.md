@@ -84,7 +84,7 @@ tools/        kb/ (build, gen-views), ocr/, doc-scan/, docs-site/
 agent-tasks/  task pack for agent-server (PR target = the records repo, set by the env)
 deploy/       wrangler template, deploy.sh, batch.sh, thin workflow templates, env.example.yaml
 fixtures/     records-example/ (synthetic records), app/ (synthetic Telegram and extraction fixtures)
-docs/         platform/, decisions/, research/, meta/, security.md, records-guide.md, deploy-notes/
+docs/         platform/, decisions/, research/, meta/, security.md, records-guide.md
 ```
 
 ## Contributing and security

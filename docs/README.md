@@ -13,7 +13,7 @@ This repo is the **product**: code, schema, templates, generic runbooks and synt
 | Why it is built this way | [decisions/](decisions/README.md) |
 | The research behind the decisions | [research/](research/README.md) |
 | Page templates and doc governance | [meta/](meta/README.md) |
-| Deployment-specific notes awaiting the move to the env repo | [deploy-notes/](deploy-notes/README.md) |
+| Deployment-specific notes (hosts, accounts, costs, token inventory) | the environment repo, not the product |
 
 ## Picking up the work
 1. Read [records-guide.md](records-guide.md) for the standing rules (record and flag only, the go-live gate, no secrets, ids, provenance).

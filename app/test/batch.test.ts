@@ -6,10 +6,11 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ANNOTATION_NOTE, STT_PENDING_NOTE } from "../src/batch/digest.js";
+import { ANNOTATION_NOTE, STT_PENDING_NOTE, THRESHOLDS_OFF_LINE } from "../src/batch/digest.js";
+import { DISABLED_THRESHOLDS } from "../src/config/thresholds.js";
 import { Repo } from "../src/batch/repo.js";
 import { DIGEST_FAILED, extract, finish, isTransient, pull, splitMessage } from "../src/batch/steps.js";
-import { DEFAULT_THRESHOLDS } from "../src/config/thresholds.js";
+import { loadThresholds } from "../src/batch/records.js";
 import { ClaudeCliError, type ExtractInput, type Extractor, ExtractorStopError, oneByOne } from "../../adapters/llm/claude-cli.js";
 import { StubSpeechToText } from "../../adapters/stt/sarvam.js";
 import type { Person } from "../src/types.js";
@@ -17,6 +18,8 @@ import worker from "../src/worker.js";
 import { fakeTelegram, fixture, GROUP, memR2, SECRET, seededStore, textUpdate, webhook } from "./helpers.js";
 
 const NOW = "2026-10-25T15:30:00.000Z"; // 21:00 IST
+// Example thresholds from the synthetic records (example values for tests; not clinical guidance).
+const THRESHOLDS = loadThresholds(join(import.meta.dirname, "..", "..", "fixtures", "records-example"));
 const PERSONS = new Map<string, Person>([
   ["alice", { id: "alice", name: "Alice", role: "patient", senderId: "111" }],
   ["bob", { id: "bob", name: "Bob", role: "patient", senderId: "333" }],
@@ -101,7 +104,7 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
 
     // extract
     const llm = new MockExtractor();
-    const r = await extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: DEFAULT_THRESHOLDS, persons: PERSONS, now: NOW });
+    const r = await extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
     expect(r).toMatchObject({ extracted: 6, pending: 0, queued: 3 });
     expect(llm.calls).toHaveLength(5); // "120/80 72" is recorded by the deterministic parser
     expect(llm.batches).toBe(1); // the day's messages go to the extractor together
@@ -148,7 +151,7 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     // re-run: nothing new, no LLM calls, identical files
     const snapshot = readFileSync(join(root, "data/telegram/2026-10.ndjson"), "utf8");
     expect((await pull({ store, r2, tg: t.tg, repo })).pulled).toBe(0);
-    const r2nd = await extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: DEFAULT_THRESHOLDS, persons: PERSONS, now: NOW });
+    const r2nd = await extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
     expect(r2nd).toMatchObject({ extracted: 0, queued: 0, changed: [] });
     expect(llm.calls).toHaveLength(5);
     expect(readFileSync(join(root, "data/telegram/2026-10.ndjson"), "utf8")).toBe(snapshot);
@@ -160,7 +163,17 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
 });
 
 describe("batch details", () => {
-  const run = (repo: Repo, llm: Extractor) => extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: DEFAULT_THRESHOLDS, persons: PERSONS, now: NOW });
+  const run = (repo: Repo, llm: Extractor) => extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+
+  it("thresholds not configured: no rule annotations, the digest says so", async () => {
+    const { store, r2, t, repo } = await ingestAll([textUpdate("pulse 38")]);
+    await pull({ store, r2, tg: t.tg, repo });
+    const r = await extract({ repo, extractor: new MockExtractor(), stt: new StubSpeechToText(), thresholds: DISABLED_THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r.digest).toContain("पल्स 38"); // recorded
+    expect(r.digest).toContain(THRESHOLDS_OFF_LINE);
+    expect(r.digest).not.toContain(ANNOTATION_NOTE);
+    expect(r.digest).not.toContain("PULSE_VERY_LOW");
+  });
 
   it("an edited message replaces its earlier rows (same id)", async () => {
     const u = textUpdate("wajan 62");
@@ -209,7 +222,7 @@ describe("batch details", () => {
     const { db, store, r2, t, repo } = await ingestAll([voice], { voice1: new TextEncoder().encode("aaj seene mein dard hua 20 minute") });
     await pull({ store, r2, tg: t.tg, repo });
     const key = `${GROUP}:${(voice as any).message.message_id}`;
-    const noStt = (llm: Extractor) => extract({ repo, extractor: llm, stt: null, thresholds: DEFAULT_THRESHOLDS, persons: PERSONS, now: NOW });
+    const noStt = (llm: Extractor) => extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
 
     const llm = new MockExtractor();
     const r = await noStt(llm);

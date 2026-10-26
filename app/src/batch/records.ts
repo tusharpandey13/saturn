@@ -1,7 +1,9 @@
 // Records repo manifest for the batch (split plan section 5): records.yaml supplies the D1 person map and the
-// schema version; meta/ supplies per-records extras. Same YAML subset as tools/kb/records_config.py.
+// schema version; meta/ supplies per-records extras; config/thresholds.yaml supplies the red-flag thresholds
+// (validated; absent = rules disabled). Same YAML subset as tools/kb/records_config.py.
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { DISABLED_THRESHOLDS, parseThresholdsYaml, type ThresholdsConfig } from "../config/thresholds.js";
 
 export const SUPPORTED_SCHEMA_VERSIONS = [7];
 
@@ -13,6 +15,8 @@ export interface RecordsConfig {
   sttVocab: string | null;
   /** Who the senders are, for the extraction prompt (meta/extraction-context.md). */
   extractionContext: string | null;
+  /** config/thresholds.yaml, validated; DISABLED_THRESHOLDS when the file is absent. */
+  thresholds: ThresholdsConfig;
 }
 
 const scalar = (v: string): string => v.replace(/\s+#.*$/, "").trim().replace(/^(["'])(.*)\1$/, "$2");
@@ -49,5 +53,11 @@ export function loadRecords(root: string): RecordsConfig {
   for (const [k, v] of Object.entries(y.d1PersonMap))
     if (!y.namespaces.includes(v)) throw new Error(`records.yaml: d1_person_map ${k} -> ${v} is not a namespace`);
   const opt = (p: string) => (existsSync(join(root, p)) ? readFileSync(join(root, p), "utf8") : null);
-  return { ...y, sttVocab: opt("meta/stt-vocab.txt"), extractionContext: opt("meta/extraction-context.md") };
+  return { ...y, sttVocab: opt("meta/stt-vocab.txt"), extractionContext: opt("meta/extraction-context.md"), thresholds: loadThresholds(root) };
+}
+
+/** config/thresholds.yaml under a records root. Absent: disabled. Present but invalid: throws (fail closed). */
+export function loadThresholds(root: string): ThresholdsConfig {
+  const path = join(root, "config", "thresholds.yaml");
+  return existsSync(path) ? parseThresholdsYaml(readFileSync(path, "utf8")) : DISABLED_THRESHOLDS;
 }
