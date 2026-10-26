@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# CI helper for an env repo's thin workflows (copy to <env-repo>/scripts/ci with the deploy/github/*.yml templates).
+# Secrets model: the env repo keeps every secret in SOPS files (secrets/*.sops.env) and holds ONE standing GitHub
+# secret, SOPS_AGE_KEY (a CI-only age key that is a recipient of the files CI needs). Values are decrypted at runtime,
+# per step, straight into the environment of the command that needs them (`sops exec-env`); nothing is pushed to
+# GitHub secrets and nothing is written to disk.
+#   ci install                          install the pinned sops binary (sha256-checked) on the runner
+#   ci vars                             export env.yaml values (NOT secrets) to $GITHUB_ENV, lock to $GITHUB_OUTPUT
+#   ci verify-lock DIR                  fail unless the product checkout in DIR is exactly product.lock's commit
+#   ci records-schema RECORDS PRODUCT   fail unless records.yaml schema_version is one the product reads
+#   ci output FILE NAME...              decrypt NAMEs from FILE into step outputs (masked first; multi-line ok)
+#   ci mask FILE...                     register every non-empty value line of FILEs with the log masker
+#   ci run FILE... -- CMD [ARG...]      run CMD with the values of FILEs in its environment (masked first)
+# Needs: bash, jq, yq (preinstalled on GitHub's ubuntu images); SOPS_AGE_KEY for output/mask/run.
+set -euo pipefail
+
+SOPS_VERSION=3.13.3
+SOPS_SHA256=e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b # sops-v3.13.3.linux.amd64
+ENV_FILE="${ENV_FILE:-env.yaml}"
+LOCK_FILE="${LOCK_FILE:-product.lock}"
+
+die() { echo "::error::ci: $*" >&2; exit 1; }
+y() { yq -r "$1 // \"\"" "$2"; }
+dec() { sops decrypt --input-type dotenv --output-type json "$1"; }
+# Mask commands are only ever printed on an Actions runner (elsewhere they would echo values to a terminal).
+mask_json() { if [ "${GITHUB_ACTIONS:-}" = true ]; then jq -r '.[] | select(. != "") | split("\n")[] | select(. != "") | "::add-mask::" + .'; else cat > /dev/null; fi; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  install)
+    bin="${RUNNER_TEMP:?}/bin"; mkdir -p "$bin"
+    curl -fsSL -o "$bin/sops" "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64"
+    echo "${SOPS_SHA256}  $bin/sops" | sha256sum -c --quiet - || die "sops checksum mismatch"
+    chmod +x "$bin/sops"; echo "$bin" >> "$GITHUB_PATH" ;;
+  vars)
+    sha=$(y .commit "$LOCK_FILE"); ver=$(y .version "$LOCK_FILE"); repo=$(y .repo "$LOCK_FILE")
+    case "$sha" in [0-9a-f]*) [ ${#sha} = 40 ] && [ "$sha" != 0000000000000000000000000000000000000000 ] || die "product.lock commit is a placeholder" ;; *) die "product.lock commit missing" ;; esac
+    [ -n "$ver" ] || die "product.lock version missing"
+    { echo "product_repo=${repo#github.com/}"; echo "product_ref=v${ver#v}"; echo "product_sha=$sha"; } >> "${GITHUB_OUTPUT:-/dev/stdout}"
+    records=$(y .records.repo "$ENV_FILE")
+    {
+      echo "RECORDS_REPO=$records"; echo "RECORDS_OWNER=${records%%/*}"; echo "RECORDS_NAME=${records#*/}"
+      echo "TARGET_BRANCH=$(y .records.branch "$ENV_FILE")"
+      echo "RECORDS_APP_ID=$(y .github.records_app.id "$ENV_FILE")"
+      echo "CLOUDFLARE_ACCOUNT_ID=$(y .cloudflare.account_id "$ENV_FILE")"
+      echo "D1_DATABASE_ID=$(y .cloudflare.d1.id "$ENV_FILE")"
+      echo "R2_BUCKET=$(y .cloudflare.r2_bucket "$ENV_FILE")"
+      echo "WORKER_URL=$(y .worker_url "$ENV_FILE")"
+      echo "GO_LIVE=$(yq -r '.go_live' "$ENV_FILE")"
+      echo "INBOX_RETENTION_DAYS=$(y .batch.inbox_retention_days "$ENV_FILE")"
+      echo "CLAUDE_CODE_VERSION=$(y .batch.claude_code_version "$ENV_FILE")"
+      echo "CLAUDE_TOKEN_CREATED=$(y .batch.claude_token_created "$ENV_FILE")"
+    } >> "${GITHUB_ENV:-/dev/stdout}" ;;
+  verify-lock)
+    want=$(y .commit "$LOCK_FILE"); got=$(git -C "${1:?dir}" rev-parse HEAD)
+    [ "$want" = "$got" ] || die "product tag resolves to $got, product.lock pins $want"
+    echo "product at lock: ${got:0:12}" ;;
+  records-schema)
+    have=$(y .schema_version "${1:?records}/records.yaml")
+    yq -e ".records_schema_versions | contains([${have:-0}])" "${2:?product}/env.manifest.yaml" > /dev/null \
+      || die "records schema_version '${have}' is not in the product's records_schema_versions"
+    echo "records schema_version $have: supported" ;;
+  output)
+    f="${1:?file}"; shift; json=$(dec "$f"); mask_json <<<"$json"
+    for n in "$@"; do
+      d="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+      { echo "$n<<$d"; jq -r --arg n "$n" '.[$n] // ""' <<<"$json"; echo "$d"; } >> "$GITHUB_OUTPUT"
+    done ;;
+  mask)
+    for f in "$@"; do dec "$f" | mask_json; done ;;
+  run)
+    files=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do files+=("$1"); shift; done
+    [ "${1:-}" = "--" ] || die "usage: ci run FILE... -- CMD"; shift
+    [ ${#files[@]} -gt 0 ] || exec "$@"
+    [ -n "${CI_MASKED:-}" ] || { for f in "${files[@]}"; do dec "$f" | mask_json; done; export CI_MASKED=1; }
+    rest=$(printf '%q ' "${files[@]:1}")
+    exec sops exec-env "${files[0]}" "$(printf '%q' "$0") run $rest -- $(printf '%q ' "$@")" ;;
+  *) sed -n '2,14p' "$0" >&2; exit 64 ;;
+esac

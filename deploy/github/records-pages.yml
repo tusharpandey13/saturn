@@ -1,0 +1,82 @@
+# Weekly regeneration of the generated record pages, after hand edits on the records repo.
+# TEMPLATE for an env repo (see batch.yml). Thin: product KB build + gen-views, committed with the App token.
+name: records-pages
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 08:47 IST
+  workflow_dispatch:
+
+concurrency:
+  group: records-write
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      # ---- secrets: records-pages (SOPS files; key = secrets.SOPS_AGE_KEY; Team upgrade: environment "production") ----
+      SECRETS_KEYS: secrets/github.sops.env # PRODUCT_DEPLOY_KEY, RECORDS_APP_PRIVATE_KEY
+      # ---- end secrets: records-pages ----
+    steps:
+      - name: Checkout env
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install sops (pinned, sha256-checked)
+        run: scripts/ci install
+
+      - name: Read env.yaml and product.lock
+        id: lock
+        run: scripts/ci vars
+
+      - name: Decrypt job keys (masked step outputs)
+        id: keys
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+        run: scripts/ci output "$SECRETS_KEYS" PRODUCT_DEPLOY_KEY RECORDS_APP_PRIVATE_KEY
+
+      - name: Checkout product at lock
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.lock.outputs.product_repo }}
+          ref: ${{ steps.lock.outputs.product_ref }}
+          ssh-key: ${{ steps.keys.outputs.PRODUCT_DEPLOY_KEY }}
+          path: product
+          persist-credentials: false
+
+      - name: Verify product tag = product.lock commit
+        run: scripts/ci verify-lock product
+
+      - name: Mint records token (1 h, contents write, the records repo only)
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ env.RECORDS_APP_ID }}
+          private-key: ${{ steps.keys.outputs.RECORDS_APP_PRIVATE_KEY }}
+          owner: ${{ env.RECORDS_OWNER }}
+          repositories: ${{ env.RECORDS_NAME }}
+          permission-contents: write
+
+      - name: Checkout records (job-scoped App token kept for the push; no artifacts are uploaded)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
+        with:
+          repository: ${{ env.RECORDS_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ steps.app.outputs.token }}
+          path: records
+
+      - name: Records schema_version supported by this product
+        run: scripts/ci records-schema records product
+
+      - name: Regenerate pages and commit
+        run: |
+          python3 -I product/tools/kb/build --records records
+          python3 -I product/tools/kb/gen-views --records records
+          product/deploy/scripts/commit-push.sh records "docs: regenerate pages $(date -u +%Y-%m-%d) [skip ci]" docs/health

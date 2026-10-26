@@ -4,12 +4,13 @@
 # 1. checks env.yaml against env.manifest.yaml; 2. renders app/wrangler.toml from deploy/wrangler.template.toml;
 # 3. wrangler deploy (auto-provisions D1 and R2 on the first run when env.yaml pins no D1 id: pin it afterwards);
 # 4. applies app/migrations to the remote D1; 5. pushes the Worker secrets that are set; 6. smoke-tests WORKER_URL.
-# Env: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID (required); TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET,
+# Env: CLOUDFLARE_API_TOKEN (or CLOUDFLARE_DEPLOY_TOKEN, the manifest name), CLOUDFLARE_ACCOUNT_ID (required); TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET,
 # WORKER_URL (optional). Install deps beforehand without secrets: (cd app && npm ci --ignore-scripts).
 set -euo pipefail
 PRODUCT="$(cd "$(dirname "$0")/.." && pwd)"
 [ "${1:-}" = "--env" ] && [ -n "${2:-}" ] || { echo "usage: deploy.sh --env <env.yaml>" >&2; exit 2; }
 envfile="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-${CLOUDFLARE_DEPLOY_TOKEN:-}}"
 : "${CLOUDFLARE_API_TOKEN:?not set}" "${CLOUDFLARE_ACCOUNT_ID:?not set}"
 cd "$PRODUCT/app"
 npx tsx scripts/render.ts check --env "$envfile"

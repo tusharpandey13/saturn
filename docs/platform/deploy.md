@@ -26,7 +26,7 @@ How to stand up one Saturn environment. The product holds **templates and script
 | Version | env `product.lock` | product tag + commit SHA the env runs |
 | Deploy | product `deploy/deploy.sh` | renders `deploy/wrangler.template.toml` from `env.yaml`, applies `app/migrations`, deploys the Worker, pushes the Worker secrets |
 | Batch | product `deploy/batch.sh` | the daily pull → extract → finish run (`app/batch/run.ts … --records <records-dir>`) |
-| Workflows | product `deploy/github/{deploy,batch}.yml` | thin templates the env repo copies into its `.github/workflows/`; they check out the product at `product.lock`, decrypt secrets and call the scripts |
+| Workflows | product `deploy/github/{batch,deploy,records-pages,records-validate}.yml` + `deploy/github/ci` | thin templates the env repo copies into `.github/workflows/` and `scripts/ci`; every value comes from `env.yaml`/`product.lock`; they check out the product at the lock tag (verified against the pinned commit), mint a per-job records App token, decrypt each step's SOPS files at runtime (`ci run`, one standing secret `SOPS_AGE_KEY`) and call the scripts |
 
 Nothing secret goes into any git repo in plain text. Local copies of secrets, if any, live outside every repo in files of mode 0600 and are passed by stdin, never argv or the terminal.
 

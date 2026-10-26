@@ -1,102 +1,159 @@
-# TEMPLATE for the env repo (copy to <env-repo>/.github/workflows/batch.yml; S7). Thin: checkout, tokens, call the
-# product's deploy/batch.sh. Product logic never lives here. Triggers: schedule + workflow_dispatch only (plan 6a).
-# The env repo holds: env.yaml, product.lock (product commit SHA), secrets (env.manifest.yaml names).
-# Secrets stay in the step that uses them (never at job level, never in `npm ci`). Records are written with a
-# per-job GitHub App token (records repo only, contents write, no workflows), revoked at the end.
+# Daily batch (ADR 005): D1 inbox -> records repo -> extraction -> KB -> pages -> digest.
+# TEMPLATE for an env repo (copy deploy/github/*.yml to .github/workflows/ and deploy/github/ci to scripts/ci).
+# Thin: every value comes from env.yaml / product.lock; all logic is the product's deploy/batch.sh.
+# Triggers: schedule + workflow_dispatch only (never push / pull_request / pull_request_target).
+# Secrets: ONE standing GitHub secret, SOPS_AGE_KEY. Each step decrypts only the SOPS files it needs (scripts/ci run).
+# Records are written with a per-job GitHub App token (records repo only, contents write, no workflows); the token
+# action revokes it in its post step.
 name: batch
+
 on:
   schedule:
     - cron: "37 15 * * *" # keep equal to env.yaml batch.cron
   workflow_dispatch:
     inputs:
-      retry_failed: { description: "Re-extract messages that failed permanently before", type: boolean, default: false }
-      send_digest: { description: "Send the digest", type: boolean, default: true }
-concurrency: { group: batch, cancel-in-progress: false }
+      retry_failed:
+        description: "Re-extract messages whose extraction failed permanently before"
+        type: boolean
+        default: false
+      send_digest:
+        description: "Send the digest"
+        type: boolean
+        default: true
+
+concurrency:
+  group: records-write # batch and records-pages both write the records repo
+  cancel-in-progress: false
+
 permissions: {}
+
 jobs:
   batch:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
-      contents: read
+      contents: read # this env repo only; records writes use the App token
+      actions: write # dispatch records-validate after the batch
+    env:
+      # ---- secrets: batch (SOPS files per step; key = secrets.SOPS_AGE_KEY. On a GitHub Team upgrade, move
+      #      SOPS_AGE_KEY to environment "production" and add `environment:` to this job) ----
+      SECRETS_KEYS: secrets/github.sops.env # PRODUCT_DEPLOY_KEY, RECORDS_APP_PRIVATE_KEY
+      SECRETS_PULL: secrets/cloudflare-d1.sops.env secrets/cloudflare-r2-read.sops.env secrets/telegram-bot.sops.env
+      SECRETS_EXTRACT: secrets/claude-ci.sops.env
+      SECRETS_FINISH: secrets/cloudflare-d1.sops.env secrets/telegram-bot.sops.env
+      # ---- end secrets: batch ----
     steps:
       - name: Checkout env
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: { path: env, persist-credentials: false }
-      - name: Read pins
-        id: pins
+        with:
+          persist-credentials: false
+
+      - name: Install sops (pinned, sha256-checked)
+        run: scripts/ci install
+
+      - name: Read env.yaml and product.lock
+        id: lock
+        run: scripts/ci vars
+
+      - name: Go-live gate (scheduled runs wait for go_live true)
+        if: github.event_name == 'schedule' && env.GO_LIVE != 'true'
         run: |
-          echo "product_sha=$(tr -d '[:space:]' < env/product.lock)" >> "$GITHUB_OUTPUT"
-          echo "records_repo=$(sed -n 's/^  repo: *//p' env/env.yaml | head -1)" >> "$GITHUB_OUTPUT"
-      - name: Checkout product (read-only deploy key while the product is private)
+          echo "::notice::go_live is false in env.yaml: scheduled batch skipped (dispatch runs manually)"
+          echo "SKIP=1" >> "$GITHUB_ENV"
+
+      - name: Decrypt job keys (masked step outputs)
+        if: env.SKIP != '1'
+        id: keys
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+        run: scripts/ci output "$SECRETS_KEYS" PRODUCT_DEPLOY_KEY RECORDS_APP_PRIVATE_KEY
+
+      - name: Checkout product at lock (read-only deploy key while the product is private)
+        if: env.SKIP != '1'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ vars.PRODUCT_REPO }}
-          ref: ${{ steps.pins.outputs.product_sha }}
-          ssh-key: ${{ secrets.PRODUCT_DEPLOY_KEY }}
+          repository: ${{ steps.lock.outputs.product_repo }}
+          ref: ${{ steps.lock.outputs.product_ref }}
+          ssh-key: ${{ steps.keys.outputs.PRODUCT_DEPLOY_KEY }}
           path: product
           persist-credentials: false
-      - name: Records token (one repo, contents write)
+
+      - name: Verify product tag = product.lock commit
+        if: env.SKIP != '1'
+        run: scripts/ci verify-lock product
+
+      - name: Mint records token (1 h, contents write, the records repo only)
+        if: env.SKIP != '1'
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ vars.RECORDS_WRITER_APP_ID }}
-          private-key: ${{ secrets.RECORDS_WRITER_APP_KEY }}
-          owner: ${{ vars.RECORDS_OWNER }}
-          repositories: ${{ vars.RECORDS_REPO_NAME }}
+          app-id: ${{ env.RECORDS_APP_ID }}
+          private-key: ${{ steps.keys.outputs.RECORDS_APP_PRIVATE_KEY }}
+          owner: ${{ env.RECORDS_OWNER }}
+          repositories: ${{ env.RECORDS_NAME }}
           permission-contents: write
-      - name: Checkout records (keeps the job-scoped App token for the push; no artifacts are uploaded)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout records (job-scoped App token kept for the push; no artifacts are uploaded)
+        if: env.SKIP != '1'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
         with:
-          repository: ${{ steps.pins.outputs.records_repo }}
+          repository: ${{ env.RECORDS_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
           token: ${{ steps.app.outputs.token }}
           path: records
+
+      - name: Records schema_version supported by this product
+        if: env.SKIP != '1'
+        run: scripts/ci records-schema records product
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with: { node-version: "24", cache: npm, cache-dependency-path: product/app/package-lock.json }
+        if: env.SKIP != '1'
+        with:
+          node-version: "24"
+
       - name: Install (no secrets)
-        env:
-          CLAUDE_CODE_VERSION: ${{ vars.CLAUDE_CODE_VERSION }}
+        if: env.SKIP != '1'
         run: |
           (cd product/app && npm ci --ignore-scripts --no-audit --no-fund)
-          # exact version pin from env vars (not a lockfile); bump deliberately
           if [ -n "$CLAUDE_CODE_VERSION" ]; then npm install -g --ignore-scripts --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; fi
+
       - name: Pull (raw first)
+        if: env.SKIP != '1'
         env:
-          CLOUDFLARE_D1_TOKEN: ${{ secrets.CLOUDFLARE_D1_TOKEN }}
-          CLOUDFLARE_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: product/deploy/batch.sh pull --records records
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+        run: |
+          # shellcheck disable=SC2086 # file lists split on spaces by design
+          scripts/ci run $SECRETS_PULL -- product/deploy/batch.sh pull --records records
+
       - name: Extract + KB + pages
+        if: env.SKIP != '1'
         id: extract
         continue-on-error: true
         env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          CLAUDE_TOKEN_CREATED: ${{ vars.CLAUDE_TOKEN_CREATED }}
-          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           DISABLE_AUTOUPDATER: "1"
           RETRY: ${{ inputs.retry_failed && '--retry-failed' || '' }}
-        run: product/deploy/batch.sh extract --records records ${RETRY:+"$RETRY"}
+        run: |
+          # shellcheck disable=SC2086
+          scripts/ci run $SECRETS_EXTRACT -- product/deploy/batch.sh extract --records records ${RETRY:+"$RETRY"}
+
       - name: Finish
-        if: always()
+        if: always() && env.SKIP != '1' && steps.lock.outcome == 'success'
         env:
-          CLOUDFLARE_D1_TOKEN: ${{ secrets.CLOUDFLARE_D1_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GO_LIVE: ${{ vars.GO_LIVE }}
-          WORKER_URL: ${{ vars.WORKER_URL }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           NO_DIGEST: ${{ (github.event_name == 'workflow_dispatch' && !inputs.send_digest) && '--no-digest' || '' }}
-        run: product/deploy/batch.sh finish --records records ${NO_DIGEST:+"$NO_DIGEST"}
+        run: |
+          # shellcheck disable=SC2086
+          scripts/ci run $SECRETS_FINISH -- product/deploy/batch.sh finish --records records ${NO_DIGEST:+"$NO_DIGEST"}
+
+      - name: Validate records after the batch
+        if: always() && env.SKIP != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run records-validate.yml --ref "$GITHUB_REF_NAME"
+
       - name: Fail loudly
         if: steps.extract.outcome == 'failure'
         run: |
           echo "extract failed or was delayed; raw data is committed. See the step logs." >&2
           exit 1
-      - name: Revoke the records token
-        if: always() && steps.app.outputs.token != ''
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: gh api --method DELETE /installation/token || true
