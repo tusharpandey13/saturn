@@ -20,6 +20,18 @@ done
 run() { (cd "$PRODUCT/app" && npx tsx batch/run.ts "$@" --records "$records"); }
 commit() { "$PRODUCT/deploy/scripts/commit-push.sh" "$records" "$@"; }
 stamp() { date -u +%Y-%m-%dT%H:%MZ; }
+# `npm install -g --ignore-scripts @anthropic-ai/claude-code` leaves bin/claude.exe as a stub that only prints
+# "claude native binary not installed" and exits 1 (its postinstall, install.cjs, links the platform binary from the
+# optional dependency npm already installed). Run that one postinstall here; every other install script stays off.
+ensure_claude() {
+  local bin pkg
+  bin="$(command -v "${CLAUDE_BIN:-claude}" 2>/dev/null)" || return 0
+  grep -q "claude native binary not installed" "$bin" 2>/dev/null || return 0
+  pkg="$(cd "$(dirname "$(readlink -f "$bin")")/.." && pwd)"
+  [ -f "$pkg/install.cjs" ] || { echo "batch.sh: claude CLI is the npm stub and install.cjs is missing" >&2; return 0; }
+  (cd "$pkg" && node install.cjs >/dev/null) && echo "batch.sh: claude CLI native binary linked (postinstall)" \
+    || echo "batch.sh: claude CLI postinstall failed" >&2
+}
 
 case "$step" in
   pull)
@@ -28,6 +40,7 @@ case "$step" in
     if [ "$code" != 0 ]; then exit "$code"; fi
     commit "data: telegram raw $(stamp)" data/telegram sources ;;
   extract)
+    ensure_claude
     code=0; run extract ${extra[@]+"${extra[@]}"} || code=$?
     if [ "$code" != 0 ] && [ "$code" != 3 ]; then exit "$code"; fi
     # The extracted rows are committed even when the KB build fails (as before the split); the job still fails.
