@@ -3,6 +3,8 @@
 Build: `cd tools/docs-site && npm ci && node build.mjs` writes `site/dist/` (gitignored) and `site/sanitisation-report.md`.
 The build fails, and deletes `site/dist`, if the denylist gate matches anything (token prefixes, ids, the literal value of
 any secret in the local env files under `~/.config/<app>/`, and whatever the sanitiser adds).
+Before that, the sharing gate (`private-gate.mjs`) fails the build, writing nothing, if any input path contains
+`/research/private/` or an input is marked `visibility: private` (front matter or JSON key). Tests: `npm test`.
 
 Sanitiser: `node build.mjs --sanitiser <file>` loads an optional plugin with the deployment's own rules (names, doctors,
 hospitals, drug names, ids). It lives in the records repo, never in the product; without it only the generic gate runs.

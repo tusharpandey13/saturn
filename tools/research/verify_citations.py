@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """Citation verifier for a research cross-reference (docs/methods/research-crossref.md).
 
-    python3 -I tools/research/verify_citations.py <crossref.json> [--offline] [--check-quotes] [--json]
+    python3 -I tools/research/verify_citations.py <crossref.json> [--sources <list.yaml>] [--offline] [--check-quotes] [--json]
 
 Input: the JSON sidecar of a cross-reference (agent-tasks/saturn.research_crossref.output.schema.json).
 Checks every citation on every item:
@@ -17,6 +17,15 @@ Checks every citation on every item:
     path comes from the command line). Licence `private-research` (tier `restricted`) only in such a file. In private
     mode a copyright-only link-only host (not NO_AI_HOSTS) may be quoted under `private-research`; NO_AI_HOSTS stay
     link-only in both modes (no quote, no private-research licence, no statement saying what they recommend);
+    (NO_AI_HOSTS includes the Endocrine Society and its JCEM guideline path, academic.oup.com/jcem);
+  - private source list (--sources, the records repo's config/research-private-sources.yaml): in a private file every
+    private-research citation's URL must match a `hosts` entry (exact host, or host + path prefix such as
+    academic.oup.com/jcem); a private file with private-research citations and no list = error; a list naming a
+    NO_AI_HOSTS host = error. Only --sources needs PyYAML (`pip install -r tools/research/requirements.txt`);
+  - pointer items (method 5a): an item citing a link-only body directly, with no secondary source, is
+    `kind: pointer`, has that one citation (with body, title, version, locator), a read_checklist entry for its URL,
+    and a statement exactly equal to POINTER_TEMPLATE rendered from the citation. The SUMMARY word list stays as a
+    backstop on the statement and on the free-text fields;
   - read_checklist[] ("you read it" items for link-only guidelines): a link-only URL, a locator, KB ids, a
     recheck_after date after run_date, an empty own_words_note, and no other field (no quote, no recommendation);
   - online (default): each PMID resolves (NCBI E-utilities esummary; the stated title, if any, must match),
@@ -24,7 +33,7 @@ Checks every citation on every item:
     each URL answers (HEAD; 403/405/429 = warning "blocked", not proof either way);
   - --check-quotes: the quote must appear in the PubMed abstract (PMID) or the fetched HTML/XML/JSON text (URL);
     not found = warning for the human reviewer (abstracts and pages are not the full text).
-Exit 0 = no errors (warnings allowed), 1 = errors, 2 = bad input. Stdlib only; no PHI is sent anywhere: only
+Exit 0 = no errors (warnings allowed), 1 = errors, 2 = bad input. Stdlib only (PyYAML for --sources); no PHI is sent anywhere: only
 public identifiers (PMIDs, DOIs, URLs) leave the machine.
 
 NCBI policy: <= 3 requests/s without a key, <= 10/s with one. Set NCBI_API_KEY, NCBI_TOOL and NCBI_EMAIL in the
@@ -105,16 +114,22 @@ class Net:
 
 # Guideline bodies whose terms forbid use of their text in AI tools (method, "Source priority"): cite and link only.
 # A citation to one of these hosts must carry a locator (recommendation number) and must NOT carry a quote.
-LINK_ONLY_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk",
-                   "diabetesjournals.org", "diabetes.org", "icmr.gov.in", "icmr.org.in", "endocrine.org")
+# An entry is a domain (subdomains match) or a domain + path prefix ("academic.oup.com/jcem").
+LINK_ONLY_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk", "diabetesjournals.org", "diabetes.org",
+                   "icmr.gov.in", "icmr.org.in", "endocrine.org", "academic.oup.com/jcem")
 # The subset whose terms ban AI, text-and-data-mining or upload use outright (method, "group B"): link-only in BOTH
 # visibility modes. The other link-only hosts are restricted by copyright only and may be quoted in private mode.
-NO_AI_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk", "diabetesjournals.org", "diabetes.org")
+# Endocrine Society: site terms bar capturing, harvesting, scraping or collecting Site Materials (method, terms table).
+NO_AI_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk", "diabetesjournals.org", "diabetes.org",
+               "endocrine.org", "academic.oup.com/jcem")
 PRIVATE_LICENSE = "private-research"  # personal research use (method 4a); never in a public file
 PRIVATE_TIER = "restricted"
 PRIVATE_DIR = "research/private/"
 # Wording that says what a link-only guideline recommends (a summary), in an item that cites it directly.
 SUMMARY = re.compile(r"\b(recommend\w*|advis\w*|suggest\w*|endorse\w*)\b", re.I)
+# The only statement a pointer item may carry (method 5a; the task prompt quotes it). Fields come from its citation.
+POINTER_TEMPLATE = "{body}, {title} ({version}), {locator}: see read checklist."
+POINTER_FIELDS = ("body", "title", "version", "locator")
 CHECKLIST_KEYS = {"body", "title", "version", "url", "locator", "kb_ids", "recheck_after", "own_words_note"}
 # Source tiers (method, section 4). Quoted citations must name one and a licence that permits quoting.
 TIERS = ("label", "guideline_open", "guideline_link_only", "oa_article", "bookshelf", "abstract", PRIVATE_TIER)
@@ -129,9 +144,77 @@ SECONDARY_LABEL = "secondary: reports"
 TAG = re.compile(r"</?[A-Za-z][^<>]*>|<[!?][^<>]*>")
 
 
+def _match(url, entries, subdomains):
+    """'host' entries match the URL host (and its subdomains if asked); 'host/path' entries add a path prefix."""
+    u = urllib.parse.urlparse(url or "")
+    host, path = (u.hostname or "").lower(), u.path or "/"
+    for e in entries:
+        h, _, pre = str(e).strip().lower().partition("/")
+        pre = pre.rstrip("/")
+        if (host == h or (subdomains and host.endswith("." + h))) and (
+                not pre or path == "/" + pre or path.startswith("/" + pre + "/")):
+            return True
+    return False
+
+
 def host_in(url, hosts):
-    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
-    return any(host == h or host.endswith("." + h) for h in hosts)
+    return _match(url, hosts, subdomains=True)
+
+
+def on_list(url, entries):
+    """Host match against private source list entries: 'host' exact, or 'host/path' = same host and path prefix."""
+    return _match(url, entries, subdomains=False)
+
+
+def load_sources(path):
+    """Parse the private source list (YAML). PyYAML is imported here only, so the rest stays stdlib."""
+    import yaml  # noqa: PLC0415 (lazy on purpose)
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def source_hosts(sources, out):
+    """The `hosts` entries of a parsed private source list; a no-AI (group B) host on the list is an error."""
+    hosts = []
+    for n, s in enumerate((sources or {}).get("sources") or [] if isinstance(sources, dict) else []):
+        for h in (s.get("hosts") or []) if isinstance(s, dict) else []:
+            e = str(h).strip()  # banned if it names a no-AI host, or covers one ("academic.oup.com" covers /jcem)
+            if host_in("https://" + e, NO_AI_HOSTS) or any(on_list("https://" + b, [e]) for b in NO_AI_HOSTS):
+                out.append(("error", f"sources {n + 1}", f"no-AI body on the private source list: {h!r} "
+                                                         "(AUA, EAU, NICE, ESC, ADA, Endocrine Society are never listed)"))
+            else:
+                hosts.append(h)
+    if not hosts:
+        out.append(("error", "sources", "private source list has no sources[].hosts entries"))
+    return hosts
+
+
+def check_pointer(it, cs, doc, out):
+    """An item citing a link-only body directly (no secondary source): a pointer with the template statement."""
+    where = f"item {it.get('id', '?')}"
+    if it.get("kind") != "pointer":
+        out.append(("error", where, "link-only body cited directly: the item must be kind: pointer"))
+    if len(cs) != 1:
+        out.append(("error", where, "pointer: exactly one citation (the link-only body)"))
+    c = cs[0]
+    missing = [k for k in POINTER_FIELDS if not (c.get(k) or "").strip()]
+    for k in missing:
+        out.append(("error", where, f"pointer: citation {k} required"))
+    st = it.get("statement") or ""
+    if not missing:
+        want = POINTER_TEMPLATE.format(**{k: c[k].strip() for k in POINTER_FIELDS})
+        if st != want:
+            out.append(("error", where, f"pointer: statement must be exactly {want!r}"))
+            m = SUMMARY.search(st)  # backstop: name the summary wording too
+            if m:
+                out.append(("error", where, f"link-only body: the statement must not say what it recommends: "
+                                            f"'{m.group(0)}'"))
+    for k in ("body", "version", "locator"):  # free text that lands in the statement; the noun alone is a name
+        m = SUMMARY.search(re.sub(r"\brecommendations?\b", "", c.get(k) or "", flags=re.I))
+        if m:
+            out.append(("error", where, f"pointer: {k} must not say what the body recommends: '{m.group(0)}'"))
+    if c.get("url") and c["url"] not in {r.get("url") for r in doc.get("read_checklist") or []}:
+        out.append(("error", where, "pointer: add a read_checklist entry for this URL"))
 
 
 def link_only(url, c=None, private=False):
@@ -218,9 +301,10 @@ def check_checklist(doc, out):
             out.append(("error", where, "own_words_note stays blank in the agent's output (the human writes it)"))
 
 
-def verify(doc, net=None, check_quotes=False, path=None):
+def verify(doc, net=None, check_quotes=False, path=None, sources=None):
     """Return a list of (level, where, message); level is 'error' or 'warn'.
-    path: the sidecar's file path (needed for visibility: private)."""
+    path: the sidecar's file path (needed for visibility: private).
+    sources: the parsed private source list (load_sources); needed for private-research citations."""
     out = []
     items = doc.get("items")
     if not isinstance(items, list):
@@ -234,6 +318,7 @@ def verify(doc, net=None, check_quotes=False, path=None):
         private = False  # nothing private is accepted outside research/private/
         out.append(("error", "visibility", f"visibility: private file must sit under a {PRIVATE_DIR} directory"))
     check_checklist(doc, out)
+    hosts = source_hosts(sources, out) if sources is not None else None
     phrasing(doc.get("summary", ""), "summary", out)
     for q in doc.get("questions", []):
         phrasing(q.get("text", ""), f"question {q.get('id', '?')}", out)
@@ -244,10 +329,10 @@ def verify(doc, net=None, check_quotes=False, path=None):
         cs = it.get("citations") or []
         direct = [c for c in cs if link_only(c.get("url"), c, private)]
         if direct and not any(c.get("reports_guideline") for c in cs):
-            m = SUMMARY.search(it.get("statement") or "")
-            if m:
-                out.append(("error", f"item {iid}", f"link-only body: the statement must not say what it recommends: "
-                                                    f"'{m.group(0)}'"))
+            check_pointer(it, cs, doc, out)
+        elif it.get("kind") == "pointer":
+            out.append(("error", f"item {iid}", "kind: pointer only on an item citing a link-only body directly, "
+                                                "with no secondary source"))
         if not cs:
             out.append(("error", f"item {iid}", "no citations"))
         for n, c in enumerate(cs):
@@ -265,6 +350,12 @@ def verify(doc, net=None, check_quotes=False, path=None):
             elif len(q) > QUOTE_MAX:
                 out.append(("error", where, f"quote longer than {QUOTE_MAX} chars"))
             check_tier(it, c, where, q, out, private)
+            if private and norm_license(c.get("license")) == PRIVATE_LICENSE:
+                if hosts is None:
+                    if not any(m == "private mode needs --sources" for _, _, m in out):
+                        out.append(("error", "sources", "private mode needs --sources"))
+                elif not on_list(c.get("url"), hosts):
+                    out.append(("error", where, "private-research: URL host is not on the private source list"))
             if c.get("pmid") and not re.fullmatch(r"[1-9][0-9]{0,8}", str(c["pmid"])):
                 out.append(("error", where, f"malformed PMID {c['pmid']!r}"))
             if c.get("doi") and not re.fullmatch(r"10\.\d{4,9}/\S+", c["doi"]):
@@ -338,6 +429,15 @@ def verify(doc, net=None, check_quotes=False, path=None):
 
 
 def main(argv):
+    argv = list(argv)
+    src = None
+    if "--sources" in argv:
+        i = argv.index("--sources")
+        if i + 1 >= len(argv):
+            print(__doc__, file=sys.stderr)
+            return 2
+        src = argv.pop(i + 1)
+        argv.pop(i)
     args = [a for a in argv if not a.startswith("--")]
     if len(args) != 1:
         print(__doc__, file=sys.stderr)
@@ -348,7 +448,17 @@ def main(argv):
     except (OSError, ValueError) as e:
         print(f"cannot read {args[0]}: {e}", file=sys.stderr)
         return 2
-    res = verify(doc, None if "--offline" in argv else Net(), "--check-quotes" in argv, path=args[0])
+    sources = None
+    if src is not None:
+        try:
+            sources = load_sources(src)
+        except ImportError:
+            print("--sources needs PyYAML: pip install -r tools/research/requirements.txt", file=sys.stderr)
+            return 2
+        except Exception as e:  # OSError or a YAML error
+            print(f"cannot read {src}: {e}", file=sys.stderr)
+            return 2
+    res = verify(doc, None if "--offline" in argv else Net(), "--check-quotes" in argv, path=args[0], sources=sources)
     errors = sum(1 for lv, _, _ in res if lv == "error")
     if "--json" in argv:
         print(json.dumps({"errors": errors, "warnings": len(res) - errors,

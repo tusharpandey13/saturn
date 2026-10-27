@@ -104,6 +104,17 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
    evidence block describing the secondary source itself (its design and certainty, not the guideline's);
    (c) never present the secondary statement as the guideline's own text, and never infer the guideline's wording or
    grade from it. If no such source exists, keep the link-only item and say nothing about what it recommends.
+   **Pointer items.** An item that cites a link-only body directly, with no secondary source, is a pointer:
+   `kind: pointer`, exactly one citation (the link-only body, with `body`, `title`, `version` and `locator`), a
+   `read_checklist[]` entry for the same URL, and a statement that is exactly this template rendered from the
+   citation (verifier `POINTER_TEMPLATE`):
+
+   `<body>, <title> (<version>), <locator>: see read checklist.`
+
+   For example: "AUA, Management of Lower Urinary Tract Symptoms Attributed to Benign Prostatic Hyperplasia: AUA
+   Guideline (2026), Diagnostic evaluation section: see read checklist." Nothing else goes in the statement, so it
+   cannot say what the body recommends. The verifier also keeps its word list ("recommends", "advises",
+   "suggests", "endorses") as a backstop on the statement and on the `body`, `version` and `locator` fields.
    **5b. "You read it" checklist.** For each relevant link-only guideline, also write one `read_checklist[]` entry
    for the owner: `body`, guideline `title`, `version` (edition or year), `url`, the `locator` to read (section or
    recommendation number), the `kb_ids` of the person's facts to compare against, `recheck_after` (table below)
@@ -113,11 +124,11 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
 
    | Body | Update cadence (approximate; verify on the body's site when writing) | `recheck_after` |
    |---|---|---|
-   | EAU | annually, around March | the next 31-Mar after the run |
-   | ADA Standards of Care | annually (published December/January), plus living updates | the next 31-Jan after the run |
-   | ESC | new and updated guidelines each year at the late-August congress; a given topic every few years | the next 30-Sep after the run |
-   | AUA | topic guidelines amended every few years | run date + 12 months |
-   | NICE | ad hoc, after surveillance reviews | run date + 6 months |
+   | EAU | "annual assessment of newly published literature" (uroweb.org); the month of release is unverified | run date + 12 months |
+   | ADA Standards of Care | released early December, dated January (Diabetes Care Suppl 1), plus "living" online updates (https://professional.diabetes.org/standards-of-care, checked 27-Oct-2026) | the next 15-Dec after the run |
+   | ESC | released at the late-August ESC Congress; a topic's full revision about every 4 to 6 years, focused updates 2 to 3 years after (unverified: secondary source, the ESC site blocked our fetcher) | the next 30-Sep after the run |
+   | AUA | review cycle 24 to 36 months or ad hoc, with amendments in between (https://www.auanet.org/about-us/aua-statements/definition-statement, checked 27-Oct-2026) | run date + 12 months (amendments can land inside the cycle) |
+   | NICE | surveillance-triggered, no fixed cycle (PMG49, https://www.nice.org.uk/process/pmg49; partly verified) | run date + 6 months |
    | other link-only bodies | not set here | run date + 12 months |
 
 6. **Literature pass (only for topics the label and guideline passes leave open).** Search PubMed/Europe PMC
@@ -132,7 +143,8 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
     new dated file.
 11. **Verify.** Run
     `python3 -I tools/research/verify_citations.py <sidecar.json> --check-quotes` (the path matters: private
-    mode is accepted only under `research/private/`). Fix every error. If an
+    mode is accepted only under `research/private/`; private mode also needs
+    `--sources config/research-private-sources.yaml`, section 4a). Fix every error. If an
     identifier does not resolve or a quote cannot be found, drop the item; never "repair" a citation from memory.
     Record the result in `verifier`.
 12. **PR.** Add the page, the sidecar and the new `questions.md` rows. Mark briefs whose inputs changed
@@ -156,13 +168,13 @@ and so is label text over interaction databases.
 
 | Body | Verdict | Basis |
 |---|---|---|
-| AUA | link-only | page notice: "You are prohibited from using or uploading content you accessed through this website into external applications ... including those using artificial intelligence ..." (https://www.auanet.org/guidelines-and-quality/guidelines) |
+| AUA | link-only | page notice: "You are prohibited from using or uploading content you accessed through this website into external applications ... including those using artificial intelligence ..." (https://www.auanet.org/guidelines-and-quality/guidelines). Guideline page: "Access to AUA guidelines is provided free for individuals' clinical use only. Anyone accessing AUA guidelines for any other purpose must obtain a license in advance. Licenses for academic, research and educational purposes can be requested through the AUA by contacting permissions@AUAnet.org." (https://www.auanet.org/guidelines-and-quality/guidelines/benign-prostatic-hyperplasia-(bph)-guideline) |
 | EAU | link-only | copyright page: use or upload of the Guidelines "and any material derived from these texts (whether in full or in part) on external websites, bots ... software, or external applications" is prohibited without written permission; the EAU/AUA joint position covers AI tools (https://uroweb.org/guidelines/prostate-cancer/chapter/copyright-and-terms-of-use ; https://uroweb.org/eau-guidelines/citing-usage-republication) |
 | NICE | link-only | content may not be used in a retrieval system without prior written agreement; AI use is outside the open content licence and needs approval, licence and fee; scraping and training not permitted (https://www.nice.org.uk/terms-and-conditions ; https://www.nice.org.uk/reusing-our-content/nice-uk-open-content-licence) |
 | ESC | link-only | licence needed for software or AI use (already link-only) |
 | ADA | link-only (stricter than asked) | 2026 Standards notice: no text or data mining, machine learning or similar without prior written permission; separate AI Content Licensing Policy (https://diabetesjournals.org/journals/pages/ada-journal-policies) |
-| ICMR STW | link-only (precaution) | STW PDFs: "all rights reserved", no reproduction without permission; site policy is looser but excludes this (https://www.icmr.gov.in/copyright-policy ; https://stw.icmr.org.in/) |
-| Endocrine Society | link-only until verified | no AI or reuse terms for the guidelines found; journal reuse via OUP/CCC (https://www.endocrine.org/journals/permissions) |
+| ICMR STW | link-only in public mode (precaution); group A | site terms allow free reproduction if reproduced accurately with prominent acknowledgement, excluding third-party material (https://www.icmr.gov.in/terms-conditions); an "all rights reserved" notice on the STW PDFs is unconfirmed (https://www.icmr.gov.in/copyright-policy ; https://stw.icmr.org.in/) |
+| Endocrine Society | link-only in both modes (group B) | site terms prohibit "framing, capturing, harvesting, scraping, or collection of ... Site Materials ... without advance written consent", and derivative works (https://www.endocrine.org/about-us/terms-of-use). Verifier hosts: endocrine.org and the guideline journal path academic.oup.com/jcem |
 | KDIGO | quotable, per edition | 2024 CKD, 2025 IgAN, 2026 anaemia: CC BY-NC-ND, noncommercial text and data mining of the unaltered text allowed; 2012 and 2017 editions: all rights reserved, so treat as link-only. Confirm the edition's notice (PDF front matter, https://kdigo.org/guidelines/) |
 | USPSTF | quotable | AHRQ notice (Sep-2017): unaltered reuse with attribution; some JAMA-published pages carry an AMA copyright, so check the page (https://www.uspreventiveservicestaskforce.org/uspstf/recommendation-topics/copyright-notice) |
 
@@ -170,22 +182,30 @@ Not fetchable from an agent (HTTP 403/404) on 27-Oct-2026: the NICE and ADA term
 page were read through search excerpts, not the pages themselves; the owner should open them once.
 A journal or PubMed version of a link-only body's guideline is still link-only.
 
-**Two groups of restricted bodies.** Group B (**no-AI**: AUA, EAU, NICE, ESC, ADA) bans AI, text-and-data-mining or
-upload use outright; they are link-only in **both** visibility modes (verifier `NO_AI_HOSTS`). Group A
-(**copyright-only**: bodies restricted by copyright with no AI/TDM/upload ban, e.g. the ICMR STW, Endocrine Society
-and KDIGO 2012/2017 verdicts above, and paywalled papers the owner can lawfully access) is link-only in public mode
+**Two groups of restricted bodies.** Group B (**no-AI**: AUA, EAU, NICE, ESC, ADA, Endocrine Society) bans AI,
+text-and-data-mining, scraping or upload use outright; they are link-only in **both** visibility modes (verifier
+`NO_AI_HOSTS`). Group A (**copyright-only**: bodies restricted by copyright with no AI/TDM/upload ban, e.g. the ICMR
+STW and KDIGO 2012/2017 verdicts above, and paywalled papers the owner can lawfully access) is link-only in public mode
 and readable in private mode (section 4a).
 
 ### 4a. Private mode (`visibility: private`)
 
 A run with `visibility: private` may fetch, read, summarise and quote group A sources, into private outputs only.
 Legal basis: India, Copyright Act 1957, s.52(1)(a)(i): fair dealing with a work (not a computer programme) for
-private or personal use, including research [L1]. The basis covers the family's own research use, not
+private or personal use, including research [L1]. The section reads: "a fair dealing with any work, not being a
+computer programme, for the purposes of— (i) private or personal use, including research"; its Explanation adds
+that storing a work in an electronic medium for these purposes is not infringement. Indian law has no explicit
+text-and-data-mining exception (Act text searched 27-Oct-2026). The basis covers the family's own research use, not
 publication, so:
 
 - **Which sources.** Only those the records repo lists in `config/research-private-sources.yaml` (body, hosts,
   editions, how the owner has access, date checked). The product names none. Group B bodies are never listed; the
-  verifier rejects their hosts in private mode as in public mode.
+  verifier rejects their hosts in private mode as in public mode. Run the verifier with
+  `--sources config/research-private-sources.yaml`: every `private-research` citation's URL must match a `hosts`
+  entry (an exact host such as `www.example.org`, or a host and path prefix such as `publisher.example.org/journal`,
+  which matches that host and paths under `/journal`). A private file with `private-research` citations and no
+  list is an error, and so is a list that names a group B host. Reading the list needs PyYAML
+  (`pip install -r tools/research/requirements.txt`); the rest of the verifier is stdlib only.
 - **Where.** Outputs go to `docs/health/<ns>/research/private/YYYY-MM-DD-crossref.{md,json}` with top-level
   `"visibility": "private"`. The verifier rejects a private sidecar anywhere else, and rejects the
   `private-research` licence in a public file.
@@ -198,6 +218,9 @@ publication, so:
   git.
 - **Never shared.** Nothing from a private output goes into a public page, a doctor brief, a docs site, a search
   query or a PR outside the records repo. A question raised by a private item is phrased without the quoted text.
+  The docs-site build refuses, fail-closed, any input whose path contains `/research/private/` or that carries
+  `visibility: private` (Markdown front matter or a JSON key); the doctor-brief task refuses the same inputs in its
+  parameters and prompt.
 
 ### Quotable secondary sources and licences (checked 27-Oct-2026)
 
@@ -304,8 +327,8 @@ Two files in the records repo, plus question rows:
 - New rows in `docs/health/<ns>/questions.md`, with the next free ids. The cross-reference never keeps its own
   question list.
 
-Item fields (schema): `id` (rx-NNN), `type`, `statement`, `kb_ids`, `evidence {design, certainty, grade_as_printed,
-ocebm}`, `applicability`, `citations[] {source_type, source_tier, license, reports_guideline (secondary sources only), pmid|doi|url, title, version, locator, quote (omitted for link-only bodies), accessed}`,
+Item fields (schema): `id` (rx-NNN), `type`, `kind` (`finding`, or `pointer`: step 5a), `statement`, `kb_ids`, `evidence {design, certainty, grade_as_printed,
+ocebm}`, `applicability`, `citations[] {source_type, source_tier, license, reports_guideline (secondary sources only), pmid|doi|url, body (pointer citations), title, version, locator, quote (omitted for link-only bodies), accessed}`,
 `for_clinician`, `question_ids`, `status` (revisit), `verification`.
 
 ## 9. Phrasing rules
@@ -442,16 +465,15 @@ The run records `revisit.next_due` (the run date plus 6 months) and the triggers
 - [S13c] KDIGO 2024 CKD guideline, doi 10.1016/j.kint.2023.10.018:
   https://kdigo.org/guidelines/ckd-evaluation-and-management/
 - [S13d] ADA Standards of Care in Diabetes 2026: https://diabetesjournals.org/care/issue/49/Supplement_1
-- [S13e] AUA BPH guideline (2023 amendment):
-  https://www.auanet.org/guidelines/guidelines/benign-prostatic-hyperplasia-(bph)-guideline
+- [S13e] AUA BPH guideline (2026):
+  https://www.auanet.org/guidelines-and-quality/guidelines/benign-prostatic-hyperplasia-(bph)-guideline
 - [S13f] EAU non-neurogenic male LUTS (2026): https://uroweb.org/guidelines/management-of-non-neurogenic-male-luts
 - [S13g] Endocrine Society: https://www.endocrine.org/clinical-practice-guidelines ; NICE:
   https://www.nice.org.uk/guidance ; ICMR Standard Treatment Workflows: https://stw.icmr.org.in/
 - [S13h] USPSTF prostate cancer screening (2018; update in progress):
   https://www.uspreventiveservicestaskforce.org/uspstf/recommendation/prostate-cancer-screening
-- [L1] Copyright Act 1957 (India), s.52(1)(a)(i), as amended 2012; DPIIT text:
-  https://copyright.gov.in/Copyright_Act_1957/chapter_xi.html (read through search excerpts on 27-Oct-2026; owner
-  to open once)
+- [L1] Copyright Act 1957 (India), s.52(1)(a)(i), as amended 2012; official text:
+  https://www.copyright.gov.in/Documents/Copyright_Act_1957.pdf (accessed 27-Oct-2026)
 - [W1] WHO, Ethics and governance of AI for health: guidance on large multi-modal models (2024):
   https://www.who.int/publications/i/item/9789240084759
 - [W2] FDA, Clinical Decision Support Software guidance (2022, reissued Jan-2026; automation bias):

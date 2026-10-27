@@ -17,7 +17,8 @@ params_schema:
   additionalProperties: false
   properties:
     queue_id: { type: string, maxLength: 200 }
-    paths: { type: array, maxItems: 50, items: { type: string, maxLength: 300 } }
+    # sharing gate (research method 4a): never a private research input
+    paths: { type: array, maxItems: 50, items: { type: string, maxLength: 300, not: { pattern: "(^|/)research/private/" } } }
 output_schema:
   type: object
   required: [summary]
@@ -25,5 +26,8 @@ output_schema:
     summary: { type: string }
 prompt: |
   TODO(phase 2): hl.doctor_brief prompt. Inputs are git refs only: {{paths}}
+  Sharing gate (fail closed): refuse, and stop with an error, if any input path contains /research/private/ or any
+  input is marked visibility: private (front matter or JSON key); never read or quote a private research output.
+  A phase-2 brief builder calls the same check as tools/docs-site/private-gate.mjs.
   Life-context facts (event, data.type context; ADR 010): include one only when it carries the tag brief-relevant;
   never shadow or low-confidence rows. Association wording only ("around the same dates"), never a cause.

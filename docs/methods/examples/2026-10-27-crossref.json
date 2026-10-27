@@ -7,7 +7,7 @@
   "focus": [],
   "previous": null,
   "disclaimer": "Facts as written; not advice; doctors decide.",
-  "summary": "Synthetic example (fictional person). Four items: a label note on how dutasteride affects PSA readings, a label warning on tamsulosin and orthostasis next to a family-reported dizziness, and a guideline practice point on kidney testing next to a single recorded eGFR with no urine albumin result. Three questions for the treating doctors. No red flags in the recorded window.",
+  "summary": "Synthetic example (fictional person). Five items: a label note on how dutasteride affects PSA readings, a label warning on tamsulosin and orthostasis next to a family-reported dizziness, a guideline practice point on kidney testing next to a single recorded eGFR with no urine albumin result, a secondary source reporting an AUA recommendation, and a pointer to the AUA BPH guideline for the owner to read. Three questions for the treating doctors. No red flags in the recorded window.",
   "inputs": [
     {
       "view": "v_meds_current",
@@ -185,9 +185,9 @@
         {
           "source_type": "guideline",
           "source_tier": "guideline_link_only",
-          "url": "https://www.auanet.org/guidelines/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
-          "title": "AUA guideline on management of BPH",
-          "version": "2023 amendment",
+          "url": "https://www.auanet.org/guidelines-and-quality/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
+          "title": "Management of Lower Urinary Tract Symptoms Attributed to Benign Prostatic Hyperplasia: AUA Guideline",
+          "version": "2026",
           "locator": "Diagnostic evaluation section (recommendation number to be read by the clinician)",
           "accessed": "2026-10-27"
         },
@@ -195,11 +195,46 @@
           "source_type": "reference_text",
           "source_tier": "bookshelf",
           "license": "CC BY-NC-ND",
-          "reports_guideline": "https://www.auanet.org/guidelines/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
+          "reports_guideline": "https://www.auanet.org/guidelines-and-quality/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
           "url": "https://www.ncbi.nlm.nih.gov/books/NBK558920/",
           "title": "Benign Prostatic Hyperplasia (StatPearls)",
           "locator": "Evaluation",
           "quote": "Synthetic placeholder sentence standing in for a verbatim StatPearls quote on PSA testing in men with lower urinary tract symptoms.",
+          "accessed": "2026-10-27"
+        }
+      ],
+      "for_clinician": "treating urologist",
+      "question_ids": [],
+      "status": "new",
+      "verification": "agent"
+    },
+    {
+      "id": "rx-005",
+      "kind": "pointer",
+      "type": "monitoring_gap",
+      "statement": "AUA, Management of Lower Urinary Tract Symptoms Attributed to Benign Prostatic Hyperplasia: AUA Guideline (2026), Diagnostic evaluation section: see read checklist.",
+      "kb_ids": [
+        "bob:fact:2024-06-01-example-clinic-note.bph",
+        "bob:fact:2026-09-10-example-lab-psa.psa"
+      ],
+      "evidence": {
+        "design": "guideline",
+        "certainty": "not_graded",
+        "ocebm": "n/a"
+      },
+      "applicability": {
+        "match": "unknown",
+        "notes": "Link-only guideline: not read by the agent, so applicability is for the clinician and the owner to judge."
+      },
+      "citations": [
+        {
+          "source_type": "guideline",
+          "source_tier": "guideline_link_only",
+          "url": "https://www.auanet.org/guidelines-and-quality/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
+          "body": "AUA",
+          "title": "Management of Lower Urinary Tract Symptoms Attributed to Benign Prostatic Hyperplasia: AUA Guideline",
+          "version": "2026",
+          "locator": "Diagnostic evaluation section",
           "accessed": "2026-10-27"
         }
       ],
@@ -283,9 +318,9 @@
   "read_checklist": [
     {
       "body": "AUA",
-      "title": "Management of Lower Urinary Tract Symptoms Attributed to Benign Prostatic Hyperplasia (BPH)",
-      "version": "2023 amendment",
-      "url": "https://www.auanet.org/guidelines/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
+      "title": "Management of Lower Urinary Tract Symptoms Attributed to Benign Prostatic Hyperplasia: AUA Guideline",
+      "version": "2026",
+      "url": "https://www.auanet.org/guidelines-and-quality/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
       "locator": "Diagnostic evaluation section",
       "kb_ids": [
         "bob:fact:2024-06-01-example-clinic-note.bph",

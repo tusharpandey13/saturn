@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Product docs static site: markdown -> (optional sanitiser) -> HTML -> (optional denylist gate).
+// Every input first passes the sharing gate (private-gate.mjs): no /research/private/ path, no visibility: private.
 // Usage: node tools/docs-site/build.mjs [--sanitiser <file.mjs>]   (env AGENT_SERVER_DIR: include its README/RUNBOOK)
 // The product docs are PHI-free, so the default build has no sanitiser. A sanitiser plugin (kept privately, e.g. in a
 // records repo) exports sanitise(key, text) -> { text, log }, checkPerFileKeys(keys), buildDenylist(repo) and
@@ -10,6 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import MarkdownIt from 'markdown-it';
 import { pathToFileURL } from 'node:url';
+import { assertShareable } from './private-gate.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../..');
@@ -40,6 +42,13 @@ for (const f of fs.readdirSync(path.join(REPO, 'docs/research')).filter((f) => /
 if (AGENT) {
   addPage('agent-server', path.join(AGENT, 'README.md'), 'agent-server/readme');
   addPage('agent-server', path.join(AGENT, 'RUNBOOK.md'), 'agent-server/runbook');
+}
+// Sharing gate before anything is written: no private research input, whatever the sanitiser says.
+try {
+  for (const p of pages) assertShareable(path.resolve(p.src), fs.readFileSync(p.src, 'utf8'));
+} catch (e) {
+  console.error(e.message);
+  process.exit(1);
 }
 checkPerFileKeys(pages.map((p) => p.key));
 const bySrc = new Map(pages.map((p) => [path.resolve(p.src), p]));

@@ -44,6 +44,7 @@
         "properties": {
           "id": { "type": "string", "pattern": "^rx-[0-9]{3}$", "description": "local to this run" },
           "type": { "enum": ["association", "interaction", "label_fact", "lab_interference", "monitoring_gap", "signal"] },
+          "kind": { "enum": ["finding", "pointer"], "default": "finding", "description": "pointer (method 5a): the item cites one link-only body directly, with no secondary source; its statement is exactly '<body>, <title> (<version>), <locator>: see read checklist.' rendered from that citation, and read_checklist has an entry for its URL" },
           "statement": { "type": "string", "maxLength": 600, "description": "neutral, sourced; 'is associated with', 'the label states'" },
           "kb_ids": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/kb_id" }, "description": "the person's facts this item is about" },
           "evidence": {
@@ -145,13 +146,14 @@
         "pmid": { "type": "string", "pattern": "^[1-9][0-9]{0,8}$" },
         "doi": { "type": "string", "pattern": "^10\\.[0-9]{4,9}/\\S+$" },
         "url": { "type": "string", "format": "uri" },
+        "body": { "type": "string", "maxLength": 60, "description": "issuing body, e.g. 'EAU'; required on the citation of a pointer item" },
         "title": { "type": "string" },
         "version": { "type": "string", "description": "guideline year/edition or label revision date" },
         "locator": { "type": "string", "description": "section, recommendation number, table, page" },
-        "quote": { "type": "string", "minLength": 1, "maxLength": 400, "description": "verbatim from the cited text; REQUIRED except for link-only bodies (AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society), where it must be omitted and locator is required (visibility private: a copyright-only source, method 4a, may be quoted under licence private-research; AUA, EAU, NICE, ESC and ADA never)" },
+        "quote": { "type": "string", "minLength": 1, "maxLength": 400, "description": "verbatim from the cited text; REQUIRED except for link-only bodies (AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society), where it must be omitted and locator is required (visibility private: a copyright-only source, method 4a, may be quoted under licence private-research; AUA, EAU, NICE, ESC, ADA and Endocrine Society never)" },
         "accessed": { "type": "string", "format": "date" },
         "source_tier": { "enum": ["label", "guideline_open", "guideline_link_only", "oa_article", "bookshelf", "abstract", "restricted"], "description": "method section 4. Required for every citation. restricted = copyright-only source read under licence private-research (visibility private only)" },
-        "license": { "type": "string", "maxLength": 60, "description": "licence under which the quote is made, e.g. public-domain, CC BY, CC BY-NC, CC BY-NC-ND, CC BY-NC-SA, ahrq-unaltered, publisher-abstract; private-research (tier restricted, visibility private only, never for AUA, EAU, NICE, ESC or ADA). Required when quote is present; must be on the verifier allow-list" },
+        "license": { "type": "string", "maxLength": 60, "description": "licence under which the quote is made, e.g. public-domain, CC BY, CC BY-NC, CC BY-NC-ND, CC BY-NC-SA, ahrq-unaltered, publisher-abstract; private-research (tier restricted, visibility private only, never for AUA, EAU, NICE, ESC, ADA or Endocrine Society). Required when quote is present; must be on the verifier allow-list" },
         "reports_guideline": { "type": "string", "maxLength": 300, "description": "id or URL of the link-only guideline (AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society) that this SECONDARY source reports. The item statement must say 'secondary: reports <guideline> recommendation'; the quote is the secondary source's own text, never the guideline's" }
       }
     }

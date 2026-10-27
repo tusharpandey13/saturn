@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """verify_citations tests: python3 -I tools/research/test_verify_citations.py
 Synthetic cross-reference (fictional person, made-up PMIDs and DOIs) and a fake network: nothing leaves the machine."""
-import json, pathlib, subprocess, sys, tempfile, unittest
+import importlib.util, json, pathlib, subprocess, sys, tempfile, unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -142,13 +142,67 @@ def restricted(iid, url="https://stw.icmr.org.in/x", **kw):
     return item(iid, url=url, locator="p. 2", source_tier="restricted", license="private-research", **kw)
 
 
+# Synthetic private source list (the shape of a records repo's config/research-private-sources.yaml).
+SOURCES = {"sources": [{"body": "Example Society", "hosts": ["stw.icmr.org.in", "publisher.example.org/journal"]},
+                       {"body": "Example publisher", "hosts": ["publisher.example.org/p"]}]}
+SOURCES_YAML = """sources:
+  - body: Example Society
+    hosts: [stw.icmr.org.in, publisher.example.org/journal]
+"""
+
+
 class PrivateMode(unittest.TestCase):
-    def errs(self, d, path=None):
-        return [m for lv, _, m in vc.verify(d, path=path) if lv == "error"]
+    def errs(self, d, path=None, sources=SOURCES):
+        return [m for lv, _, m in vc.verify(d, path=path, sources=sources) if lv == "error"]
 
     def test_private_research_accepted_in_private_dir(self):
         self.assertEqual(self.errs(pdoc(restricted("a"), restricted("b", url="https://publisher.example.org/p")),
                                    PRIV), [])
+
+    def test_private_needs_source_list(self):
+        e = self.errs(pdoc(restricted("a"), restricted("b")), PRIV, sources=None)
+        self.assertEqual(e, ["private mode needs --sources"])
+        # no private-research citation: no list needed
+        self.assertEqual(self.errs(pdoc(item("a", pmid="1000001")), PRIV, sources=None), [])
+
+    def test_host_must_be_on_list(self):
+        ok = ("https://stw.icmr.org.in/x", "https://publisher.example.org/journal/article/1",
+              "https://publisher.example.org/journal")
+        bad = ("https://www.stw.icmr.org.in/x", "https://evil.example/stw.icmr.org.in",
+               "https://publisher.example.org/journalx/1", "https://publisher.example.org/other", None)
+        for u in ok:
+            self.assertEqual(self.errs(pdoc(restricted("a", url=u)), PRIV), [], u)
+        for u in bad:
+            c = restricted("a", url=u)
+            if u is None:
+                del c["citations"][0]["url"]
+                c["citations"][0]["pmid"] = "1000001"
+            self.assertIn("private-research: URL host is not on the private source list", self.errs(pdoc(c), PRIV), u)
+
+    def test_no_ai_body_on_list_is_error(self):
+        for h in ("www.auanet.org", "uroweb.org/guidelines", "www.nice.org.uk", "www.escardio.org",
+                  "diabetesjournals.org", "www.endocrine.org", "academic.oup.com/jcem", "academic.oup.com"):
+            lst = {"sources": [{"body": "x", "hosts": ["stw.icmr.org.in", h]}]}
+            self.assertTrue(any("no-AI body on the private source list" in m
+                                for m in self.errs(pdoc(restricted("a")), PRIV, sources=lst)), h)
+        self.assertIn("private source list has no sources[].hosts entries",
+                      self.errs(pdoc(restricted("a")), PRIV, sources={"sources": []}))
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not installed (pip install -r requirements.txt)")
+    def test_cli_sources(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = pathlib.Path(t, "research/private"); d.mkdir(parents=True)
+            f = d / "2026-10-27-crossref.json"
+            f.write_text(json.dumps(pdoc(restricted("a"))))
+            lst = pathlib.Path(t, "list.yaml")
+            run = lambda *a: subprocess.run([sys.executable, "-I", str(HERE / "verify_citations.py"), str(f),
+                                             "--offline", *a], capture_output=True, text=True)
+            self.assertEqual(run().returncode, 1)
+            lst.write_text(SOURCES_YAML)
+            self.assertEqual(run("--sources", str(lst)).returncode, 0, run("--sources", str(lst)).stdout)
+            lst.write_text(SOURCES_YAML + "  - body: AUA\n    hosts: [www.auanet.org]\n")
+            self.assertEqual(run("--sources", str(lst)).returncode, 1)
+            self.assertEqual(run("--sources", str(pathlib.Path(t, "missing.yaml"))).returncode, 2)
 
     def test_private_file_outside_private_dir(self):
         for path in (PUB, None, "/r/docs/health/zed/notresearch/private/x.json"):
@@ -171,7 +225,8 @@ class PrivateMode(unittest.TestCase):
 
     def test_no_ai_bodies_link_only_in_both_modes(self):
         for host in ("https://uroweb.org/g", "https://www.auanet.org/g", "https://www.nice.org.uk/g",
-                     "https://www.escardio.org/g", "https://diabetesjournals.org/care/g"):
+                     "https://www.escardio.org/g", "https://diabetesjournals.org/care/g",
+                     "https://www.endocrine.org/g", "https://academic.oup.com/jcem/article/1"):
             e = self.errs(pdoc(restricted("a", url=host)), PRIV)
             self.assertTrue(any("link-only source: no quote" in m for m in e), host)
             self.assertTrue(any("link-only in both modes" in m for m in e), host)
@@ -180,16 +235,18 @@ class PrivateMode(unittest.TestCase):
             self.assertTrue(any("link-only in both modes" in m for m in self.errs(pdoc(c), PRIV)), host)
 
     def test_link_only_statement_says_no_recommendation(self):
-        link = {"url": "https://uroweb.org/g", "locator": "4.2", "accessed": "2026-10-27"}
-        bad = {"id": "a", "statement": "EAU recommends an example-marker test.", "citations": [link]}
-        ok = {"id": "b", "statement": "EAU addresses example-marker testing (section 4.2).", "citations": [link]}
-        for d, path in ((doc(bad, ok), PUB), (pdoc(bad, ok), PRIV)):
-            res = vc.verify(d, path=path)
-            self.assertEqual([w for lv, w, m in res if lv == "error"], ["item a"], path)
+        bad = pointer("a", statement="EAU recommends an example-marker test.")
+        free = pointer("b", statement="EAU addresses example-marker testing (section 4.2).")
+        for d, path in ((doc(bad, free, pointer("c")), PUB), (pdoc(bad, free, pointer("c")), PRIV)):
+            d["read_checklist"] = [check()]
+            d["run_date"] = "2026-10-27"
+            res = [(w, m) for lv, w, m in vc.verify(d, path=path) if lv == "error"]
+            self.assertEqual([w for w, _ in res], ["item a", "item a", "item b"], path)
+            self.assertTrue(any("must not say what it recommends: 'recommends'" in m for _, m in res))
 
     def test_copyright_only_host_still_link_only_in_public(self):
         e = self.errs(doc(item("a", url="https://stw.icmr.org.in/x", locator="p. 2", source_tier="oa_article",
-                               license="CC BY")), PUB)
+                               license="publisher-abstract")), PUB)
         self.assertTrue(any("link-only source: no quote" in m for m in e))
 
     def test_cli_derives_path(self):
@@ -197,10 +254,52 @@ class PrivateMode(unittest.TestCase):
             for sub, rc in (("research/private", 0), ("research", 1)):
                 d = pathlib.Path(t, sub); d.mkdir(parents=True, exist_ok=True)
                 f = d / "2026-10-27-crossref.json"
-                f.write_text(json.dumps(pdoc(restricted("a"))))
+                f.write_text(json.dumps(pdoc(item("a", pmid="1000001"))))
                 r = subprocess.run([sys.executable, "-I", str(HERE / "verify_citations.py"), str(f), "--offline"],
                                    capture_output=True, text=True)
                 self.assertEqual(r.returncode, rc, r.stdout)
+
+
+def pointer(iid, statement=None, **cite):
+    c = {"url": "https://uroweb.org/guidelines/x", "body": "EAU", "title": "Example guideline", "version": "2026",
+         "locator": "Section 5.3", "accessed": "2026-10-27", "source_tier": "guideline_link_only"}
+    c.update(cite)
+    st = vc.POINTER_TEMPLATE.format(**c) if statement is None else statement
+    return {"id": iid, "kind": "pointer", "type": "monitoring_gap", "statement": st, "citations": [c]}
+
+
+class Pointer(unittest.TestCase):
+    def errs(self, *items, checklist=True):
+        d = doc(*items)
+        d.update(run_date="2026-10-27", read_checklist=[check()] if checklist else [])
+        return [m for lv, _, m in vc.verify(d) if lv == "error"]
+
+    def test_clean(self):
+        self.assertEqual(self.errs(pointer("a")), [])
+        self.assertEqual(pointer("a")["statement"], "EAU, Example guideline (2026), Section 5.3: see read checklist.")
+
+    def test_needs_kind_and_template(self):
+        a = pointer("a"); del a["kind"]
+        self.assertIn("link-only body cited directly: the item must be kind: pointer", self.errs(a))
+        e = self.errs(pointer("b", statement="EAU, Example guideline (2026), Section 5.3: see read checklist"))
+        self.assertTrue(any(m.startswith("pointer: statement must be exactly") for m in e))
+
+    def test_fields_one_citation_and_checklist(self):
+        e = self.errs(pointer("a", body="", version=""))
+        self.assertIn("pointer: citation body required", e)
+        self.assertIn("pointer: citation version required", e)
+        two = pointer("b"); two["citations"].append(item("x", pmid="1000001")["citations"][0])
+        self.assertIn("pointer: exactly one citation (the link-only body)", self.errs(two))
+        self.assertIn("pointer: add a read_checklist entry for this URL", self.errs(pointer("c"), checklist=False))
+
+    def test_backstop_on_fields(self):
+        self.assertEqual(self.errs(pointer("a", locator="Recommendation 5.3")), [])
+        e = self.errs(pointer("b", locator="Section 5.3, which recommends a scan"))
+        self.assertIn("pointer: locator must not say what the body recommends: 'recommends'", e)
+
+    def test_pointer_kind_only_on_direct_link_only(self):
+        a = item("a", pmid="1000001"); a["kind"] = "pointer"
+        self.assertTrue(any("kind: pointer only on" in m for m in self.errs(a)))
 
 
 def check(**kw):
@@ -278,12 +377,22 @@ class Online(unittest.TestCase):
         self.assertIn("135", vc.norm("<135 ... >12%"))
 
     def test_link_only_sources(self):
-        ok = item("a", url="https://uroweb.org/guidelines/x", quote="", locator="Rec 3.1")
-        quoted = item("b", url="https://www.nice.org.uk/guidance/ng1", locator="1.2.3")
-        nolocator = item("c", url="https://uroweb.org/guidelines/x", quote="")
-        res = vc.verify(doc(ok, quoted, nolocator), None)
-        self.assertEqual([(lv, w) for lv, w, _ in res], [("error", "item b citation 1"), ("error", "item c citation 1")])
+        ok = pointer("a", locator="Rec 3.1")
+        quoted = pointer("b", url="https://www.nice.org.uk/guidance/ng1", locator="1.2.3", quote="text", source_tier="abstract",
+                         license="publisher-abstract")
+        nolocator = pointer("c", locator="")
+        d = doc(ok, quoted, nolocator)
+        d.update(run_date="2026-10-27", read_checklist=[check(url=u) for u in
+                                                        ("https://uroweb.org/guidelines/x",
+                                                         "https://www.nice.org.uk/guidance/ng1")])
+        res = [(lv, w, m) for lv, w, m in vc.verify(d, None)]
+        self.assertEqual([(lv, w) for lv, w, m in res if "citation" in w],
+                         [("error", "item b citation 1"), ("error", "item c citation 1")])
+        self.assertIn(("error", "item c", "pointer: citation locator required"), res)
         self.assertTrue(vc.link_only("https://www.auanet.org/g"))
+        self.assertTrue(vc.link_only("https://academic.oup.com/jcem/article/1", private=True))
+        self.assertFalse(vc.link_only("https://academic.oup.com/other/article/1"))
+        self.assertFalse(vc.link_only("https://academic.oup.com/jcemx/1"))
         self.assertFalse(vc.link_only("https://notauanet.org/g"))
 
     def test_network_failure_is_error(self):

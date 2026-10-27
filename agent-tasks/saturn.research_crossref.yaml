@@ -57,7 +57,9 @@ prompt: |
      from memory: fetch it, then quote it. LINK-ONLY bodies (AUA, EAU, NICE, ESC, ADA,
      ICMR, Endocrine Society; method, "Source priority"): never fetch, quote or summarise their recommendations;
      cite the body, version, recommendation number (locator) and URL, with no quote, and point the clinician to it
-     by name. The item's statement then says only that the body addresses the topic, not what it recommends.
+     by name. Such an item (no secondary source) is kind: pointer with that one citation (body, title, version,
+     locator) and a read_checklist entry for its URL, and its statement is exactly this template, nothing else:
+     "<body>, <title> (<version>), <locator>: see read checklist."
      Then search for a legitimately quotable open-access SECONDARY source that reports the recommendation
      (method step 5a; tiers and licences in section 4). Quote only that, set source_tier, license and
      reports_guideline, and open the statement "secondary: reports <guideline> recommendation". Never present
@@ -68,12 +70,13 @@ prompt: |
   4a. Visibility private only (method 4a): sources listed in the records repo's config/research-private-sources.yaml
      (copyright-only, no AI/TDM/upload ban) may be read, summarised and quoted briefly with attribution, under
      source_tier restricted and license private-research. Read restricted PDFs from
-     docs/health/{{ns}}/research/private/.cache/ (gitignored); never commit a PDF or long text. AUA, EAU, NICE, ESC
-     and ADA stay link-only in this mode too. Write the outputs under docs/health/{{ns}}/research/private/ and set
+     docs/health/{{ns}}/research/private/.cache/ (gitignored); never commit a PDF or long text. AUA, EAU, NICE, ESC,
+     ADA and Endocrine Society stay link-only in this mode too. Write the outputs under docs/health/{{ns}}/research/private/ and set
      "visibility": "private" in the sidecar. Nothing from a private output goes into a public page, brief or query.
   5. Write docs/health/{{ns}}/research/<today>-crossref.md (private: research/private/<today>-crossref.md) (the template in the method) and its JSON sidecar
      (saturn.research_crossref.output.schema.json); add new questions to docs/health/{{ns}}/questions.md with
      the next free {{ns}}:q:NNNN ids. Edit nothing else; never touch data/ or generated blocks.
-  6. Run python3 -I "$SATURN_PRODUCT_DIR/tools/research/verify_citations.py" <sidecar> --check-quotes and fix
+  6. Run python3 -I "$SATURN_PRODUCT_DIR/tools/research/verify_citations.py" <sidecar> --check-quotes (private:
+     add --sources config/research-private-sources.yaml) and fix
      every error (drop the item if its citation cannot be verified). Record the verifier result in the sidecar.
   Return the output_schema JSON only.
