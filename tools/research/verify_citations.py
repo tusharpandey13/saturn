@@ -17,7 +17,7 @@ Checks every citation on every item:
     path comes from the command line). Licence `private-research` (tier `restricted`) only in such a file. In private
     mode a copyright-only link-only host (not NO_AI_HOSTS) may be quoted under `private-research`; NO_AI_HOSTS stay
     link-only in both modes (no quote, no private-research licence, no statement saying what they recommend);
-    (NO_AI_HOSTS includes the Endocrine Society and its JCEM guideline path, academic.oup.com/jcem);
+    (the Endocrine Society and its JCEM guideline path, academic.oup.com/jcem, are copyright-only: group A);
   - private source list (--sources, the records repo's config/research-private-sources.yaml): in a private file every
     private-research citation's URL must match a `hosts` entry (exact host, or host + path prefix such as
     academic.oup.com/jcem); a private file with private-research citations and no list = error; a list naming a
@@ -119,9 +119,9 @@ LINK_ONLY_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk", "d
                    "icmr.gov.in", "icmr.org.in", "endocrine.org", "academic.oup.com/jcem")
 # The subset whose terms ban AI, text-and-data-mining or upload use outright (method, "group B"): link-only in BOTH
 # visibility modes. The other link-only hosts are restricted by copyright only and may be quoted in private mode.
-# Endocrine Society: site terms bar capturing, harvesting, scraping or collecting Site Materials (method, terms table).
-NO_AI_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk", "diabetesjournals.org", "diabetes.org",
-               "endocrine.org", "academic.oup.com/jcem")
+# Endocrine Society is group A by owner decision (27-Oct-2026): its terms bar harvesting/scraping but say nothing on
+# AI; read only an owner-downloaded copy, never crawl (method, terms table).
+NO_AI_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk", "diabetesjournals.org", "diabetes.org")
 PRIVATE_LICENSE = "private-research"  # personal research use (method 4a); never in a public file
 PRIVATE_TIER = "restricted"
 PRIVATE_DIR = "research/private/"
@@ -178,10 +178,10 @@ def source_hosts(sources, out):
     hosts = []
     for n, s in enumerate((sources or {}).get("sources") or [] if isinstance(sources, dict) else []):
         for h in (s.get("hosts") or []) if isinstance(s, dict) else []:
-            e = str(h).strip()  # banned if it names a no-AI host, or covers one ("academic.oup.com" covers /jcem)
+            e = str(h).strip()  # banned if it names a no-AI host, or covers one
             if host_in("https://" + e, NO_AI_HOSTS) or any(on_list("https://" + b, [e]) for b in NO_AI_HOSTS):
                 out.append(("error", f"sources {n + 1}", f"no-AI body on the private source list: {h!r} "
-                                                         "(AUA, EAU, NICE, ESC, ADA, Endocrine Society are never listed)"))
+                                                         "(AUA, EAU, NICE, ESC, ADA are never listed)"))
             else:
                 hosts.append(h)
     if not hosts:

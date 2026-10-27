@@ -179,9 +179,15 @@ class PrivateMode(unittest.TestCase):
                 c["citations"][0]["pmid"] = "1000001"
             self.assertIn("private-research: URL host is not on the private source list", self.errs(pdoc(c), PRIV), u)
 
+    def test_endocrine_society_group_a(self):
+        lst = {"sources": [{"body": "x", "hosts": ["www.endocrine.org", "academic.oup.com/jcem"]}]}
+        for u in ("https://www.endocrine.org/g", "https://academic.oup.com/jcem/article/1"):
+            self.assertEqual(self.errs(pdoc(restricted("a", url=u)), PRIV, sources=lst), [], u)
+            self.assertTrue(any("link-only source: no quote" in m for m in self.errs(doc(restricted("a", url=u)), PUB)), u)
+
     def test_no_ai_body_on_list_is_error(self):
         for h in ("www.auanet.org", "uroweb.org/guidelines", "www.nice.org.uk", "www.escardio.org",
-                  "diabetesjournals.org", "www.endocrine.org", "academic.oup.com/jcem", "academic.oup.com"):
+                  "diabetesjournals.org", "diabetes.org"):
             lst = {"sources": [{"body": "x", "hosts": ["stw.icmr.org.in", h]}]}
             self.assertTrue(any("no-AI body on the private source list" in m
                                 for m in self.errs(pdoc(restricted("a")), PRIV, sources=lst)), h)
@@ -225,8 +231,7 @@ class PrivateMode(unittest.TestCase):
 
     def test_no_ai_bodies_link_only_in_both_modes(self):
         for host in ("https://uroweb.org/g", "https://www.auanet.org/g", "https://www.nice.org.uk/g",
-                     "https://www.escardio.org/g", "https://diabetesjournals.org/care/g",
-                     "https://www.endocrine.org/g", "https://academic.oup.com/jcem/article/1"):
+                     "https://www.escardio.org/g", "https://diabetesjournals.org/care/g"):
             e = self.errs(pdoc(restricted("a", url=host)), PRIV)
             self.assertTrue(any("link-only source: no quote" in m for m in e), host)
             self.assertTrue(any("link-only in both modes" in m for m in e), host)

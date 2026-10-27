@@ -174,7 +174,7 @@ and so is label text over interaction databases.
 | ESC | link-only | licence needed for software or AI use (already link-only) |
 | ADA | link-only (stricter than asked) | 2026 Standards notice: no text or data mining, machine learning or similar without prior written permission; separate AI Content Licensing Policy (https://diabetesjournals.org/journals/pages/ada-journal-policies) |
 | ICMR STW | link-only in public mode (precaution); group A | site terms allow free reproduction if reproduced accurately with prominent acknowledgement, excluding third-party material (https://www.icmr.gov.in/terms-conditions); an "all rights reserved" notice on the STW PDFs is unconfirmed (https://www.icmr.gov.in/copyright-policy ; https://stw.icmr.org.in/) |
-| Endocrine Society | link-only in both modes (group B) | site terms prohibit "framing, capturing, harvesting, scraping, or collection of ... Site Materials ... without advance written consent", and derivative works (https://www.endocrine.org/about-us/terms-of-use). Verifier hosts: endocrine.org and the guideline journal path academic.oup.com/jcem |
+| Endocrine Society | link-only in public; quotable in private mode (group A, owner decision 27-Oct-2026: the terms are ambiguous on AI use) | read only a copy the owner downloaded by hand into `.cache/`; never crawl or fetch its pages in bulk. Site terms prohibit "framing, capturing, harvesting, scraping, or collection of ... Site Materials ... without advance written consent", and derivative works (https://www.endocrine.org/about-us/terms-of-use). Verifier hosts: endocrine.org and the guideline journal path academic.oup.com/jcem |
 | KDIGO | quotable, per edition | 2024 CKD, 2025 IgAN, 2026 anaemia: CC BY-NC-ND, noncommercial text and data mining of the unaltered text allowed; 2012 and 2017 editions: all rights reserved, so treat as link-only. Confirm the edition's notice (PDF front matter, https://kdigo.org/guidelines/) |
 | USPSTF | quotable | AHRQ notice (Sep-2017): unaltered reuse with attribution; some JAMA-published pages carry an AMA copyright, so check the page (https://www.uspreventiveservicestaskforce.org/uspstf/recommendation-topics/copyright-notice) |
 
@@ -182,8 +182,8 @@ Not fetchable from an agent (HTTP 403/404) on 27-Oct-2026: the NICE and ADA term
 page were read through search excerpts, not the pages themselves; the owner should open them once.
 A journal or PubMed version of a link-only body's guideline is still link-only.
 
-**Two groups of restricted bodies.** Group B (**no-AI**: AUA, EAU, NICE, ESC, ADA, Endocrine Society) bans AI,
-text-and-data-mining, scraping or upload use outright; they are link-only in **both** visibility modes (verifier
+**Two groups of restricted bodies.** Group B (**no-AI**: AUA, EAU, NICE, ESC, ADA) bans AI,
+text-and-data-mining or upload use outright; they are link-only in **both** visibility modes (verifier
 `NO_AI_HOSTS`). Group A (**copyright-only**: bodies restricted by copyright with no AI/TDM/upload ban, e.g. the ICMR
 STW and KDIGO 2012/2017 verdicts above, and paywalled papers the owner can lawfully access) is link-only in public mode
 and readable in private mode (section 4a).

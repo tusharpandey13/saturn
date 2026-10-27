@@ -70,8 +70,8 @@ prompt: |
   4a. Visibility private only (method 4a): sources listed in the records repo's config/research-private-sources.yaml
      (copyright-only, no AI/TDM/upload ban) may be read, summarised and quoted briefly with attribution, under
      source_tier restricted and license private-research. Read restricted PDFs from
-     docs/health/{{ns}}/research/private/.cache/ (gitignored); never commit a PDF or long text. AUA, EAU, NICE, ESC,
-     ADA and Endocrine Society stay link-only in this mode too. Write the outputs under docs/health/{{ns}}/research/private/ and set
+     docs/health/{{ns}}/research/private/.cache/ (gitignored); never commit a PDF or long text. AUA, EAU, NICE, ESC
+     and ADA stay link-only in this mode too. Endocrine Society: use only an owner-downloaded copy in .cache/; never crawl. Write the outputs under docs/health/{{ns}}/research/private/ and set
      "visibility": "private" in the sidecar. Nothing from a private output goes into a public page, brief or query.
   5. Write docs/health/{{ns}}/research/<today>-crossref.md (private: research/private/<today>-crossref.md) (the template in the method) and its JSON sidecar
      (saturn.research_crossref.output.schema.json); add new questions to docs/health/{{ns}}/questions.md with
