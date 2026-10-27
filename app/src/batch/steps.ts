@@ -232,7 +232,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   const nameOf = (id: string) => d.persons.get(id)?.name ?? displayOf(id, aliases) ?? id;
   for (const { raw, msg, subject } of todo) {
     const entry: DigestEntry = {
-      person: nameOf(subject.id), ts: msg.ts, snippet: snippet(msg.text), kind: msg.kind, questions: [], annotations: [], deep: null, readings: [], symptoms: [], pending: [],
+      key: msg.key, person: nameOf(subject.id), ts: msg.ts, snippet: snippet(msg.text), kind: msg.kind, questions: [], annotations: [], deep: null, readings: [], symptoms: [], pending: [],
       ...(subject.id !== raw.person_id && { via: nameOf(raw.person_id) }),
     };
     const base: Base = {
@@ -380,7 +380,14 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
 
   const changed = out.length ? d.repo.writeKb(out, replaced) : [];
   const queued = d.repo.enqueueDeep(deep);
-  const digest = buildDigest({ entries, pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status });
+  // Log this run's entries (and an empty one for each processed message with nothing to show), then build the digest
+  // from everything recorded since the last delivered digest: a skipped or failed run's items are not lost.
+  const seenKeys = new Set(entries.map((e) => e.key));
+  d.repo.logDigestEntries([
+    ...entries.map((e) => ({ key: e.key!, recorded_at: d.now, entry: e })),
+    ...[...replaced].filter((k) => !seenKeys.has(k)).map((k) => ({ key: k, recorded_at: d.now, entry: null })),
+  ]);
+  const digest = buildDigest({ entries: d.repo.undeliveredDigestEntries(), pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status });
   const ops = [...(d.warnings ?? []), ...(delayed ? [DELAYED_OPS(delayed)] : [])];
   return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, ops };
 }
@@ -504,7 +511,7 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
       const r = await dm(d.digest);
       sentTo = r.n;
       // Logged even after a partial send, so a re-run does not send a second digest the same day.
-      if (r.n || r.ids.length) d.repo.logDigest({ date: day, message_ids: r.ids, sent_at: d.now, forced: !!d.force });
+      if (r.n || r.ids.length) d.repo.logDigest({ date: day, message_ids: r.ids, sent_at: d.now, forced: !!d.force, through: d.now });
       else console.log("::warning::no admin reachable by DM; the digest was not delivered");
     }
   }

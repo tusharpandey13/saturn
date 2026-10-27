@@ -9,6 +9,8 @@ import { readingEn, symptomEn } from "../replies.js";
 import type { Alert, Reading, Symptom } from "../types.js";
 
 export interface DigestEntry {
+  /** Message key; the later entry for a key replaces an earlier one (a voice note transcribed after being pending). */
+  key?: string;
   person: string;
   ts: string;
   kind: string;
@@ -50,16 +52,25 @@ export function buildDigest(o: {
   thresholdsStatus: string;
 }): string {
   const day = new Intl.DateTimeFormat("en-IN", { timeZone: o.timeZone, day: "numeric", month: "short" }).format(new Date(o.now));
-  const time = (iso: string) => new Intl.DateTimeFormat("en-GB", { timeZone: o.timeZone, hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
+  const dayFmt = (iso: string) => new Intl.DateTimeFormat("en-IN", { timeZone: o.timeZone, day: "numeric", month: "short" }).format(new Date(iso));
+  const hm = (iso: string) => new Intl.DateTimeFormat("en-GB", { timeZone: o.timeZone, hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
   const out: string[] = [`${PRODUCT_NAME} digest, ${day}`];
   const entries = [...o.entries].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  // A digest that catches up on earlier days (a skipped or failed run) groups by day and dates every time.
+  const days = [...new Set(entries.map((e) => dayFmt(e.ts)))];
+  const multi = days.length > 1;
+  const time = (iso: string) => (multi ? `${dayFmt(iso)} ${hm(iso)}` : hm(iso));
 
   const recorded = entries.filter((e) => e.readings.length || e.symptoms.length);
   if (!entries.length && !o.pending) out.push("", EMPTY_LINE);
-  for (const p of [...new Set(recorded.map((e) => e.person))]) {
-    out.push("", p);
-    for (const e of recorded.filter((x) => x.person === p))
-      for (const l of [...e.readings.map(readingEn), ...e.symptoms.map(symptomEn)]) out.push(`• ${time(e.ts)} ${l}${e.via ? VIA(e.via, e.person) : ""}`);
+  for (const dy of multi ? days : [null]) {
+    const inDay = recorded.filter((e) => dy === null || dayFmt(e.ts) === dy);
+    if (dy !== null && inDay.length) out.push("", `== ${dy} ==`);
+    for (const p of [...new Set(inDay.map((e) => e.person))]) {
+      out.push("", p);
+      for (const e of inDay.filter((x) => x.person === p))
+        for (const l of [...e.readings.map(readingEn), ...e.symptoms.map(symptomEn)]) out.push(`• ${time(e.ts)} ${l}${e.via ? VIA(e.via, e.person) : ""}`);
+    }
   }
 
   const pending = [

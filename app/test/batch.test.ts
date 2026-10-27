@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ANNOTATION_NOTE, EMPTY_LINE, QUESTIONS_HEAD, STT_PENDING_NOTE } from "../src/batch/digest.js";
+import { buildDigest, ANNOTATION_NOTE, EMPTY_LINE, QUESTIONS_HEAD, STT_PENDING_NOTE } from "../src/batch/digest.js";
 import { DISABLED_THRESHOLDS } from "../src/config/thresholds.js";
 import { Repo } from "../src/batch/repo.js";
 import { DELAYED_OPS, DIGEST_FAILED, extract, finish, isTransient, pull, splitMessage } from "../src/batch/steps.js";
@@ -282,6 +282,35 @@ describe("batch details", () => {
     expect(readFileSync(join(root, "sources/alice/media/telegram/u-voice1.ogg"), "utf8")).toBe("wajan 60");
   });
 
+  it("catch-up: items recorded while no digest was delivered appear in the next one, grouped by day, once", async () => {
+    const voice = fixture("voice");
+    const { store, r2, t, repo } = await ingestAll([voice, textUpdate("120/80 72", 111, {}, 1792814000)], { voice1: new TextEncoder().encode("aaj seene mein dard hua 20 minute") });
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new MockExtractor();
+    // day 1: no STT key; the run's digest never reaches the admins (failed / skipped run)
+    const r1 = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r1.digest).toContain(STT_PENDING_NOTE);
+    expect(r1.digest).toContain("BP 120/80, pulse 72");
+    // day 3: STT arrives; the digest carries day 1's reading too, the voice note once (transcribed, not pending)
+    const r3 = await extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: THRESHOLDS, persons: PERSONS, now: "2026-10-27T15:30:00.000Z" });
+    expect(r3.digest).toContain("BP 120/80, pulse 72");
+    expect(r3.digest).not.toContain(STT_PENDING_NOTE);
+    expect(r3.digest).toMatch(/chest|dard|pain/i);
+    // delivered: the watermark moves, the next run has nothing to repeat
+    await finish({ store, tg: t.tg, repo, now: "2026-10-27T15:31:00.000Z", digest: r3.digest, retentionDays: 14 });
+    expect(repo.digestsSent().at(-1)).toMatchObject({ through: "2026-10-27T15:31:00.000Z" });
+    const r4 = await extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: THRESHOLDS, persons: PERSONS, now: "2026-10-28T15:30:00.000Z" });
+    expect(r4.digest).toContain(EMPTY_LINE);
+  });
+
+  it("a catch-up digest spanning several days groups by day and dates each time", () => {
+    const e = (ts: string, v: number) => ({ person: "Alice", ts, kind: "text", snippet: "", readings: [{ type: "pulse", value: v, value2: null, value3: null, unit: "bpm", measuredAt: ts } as any], symptoms: [], questions: [], annotations: [], deep: null });
+    const out = buildDigest({ entries: [e("2026-10-26T05:00:00.000Z", 70), e("2026-10-24T05:00:00.000Z", 72)], pending: 0, now: NOW, timeZone: "Asia/Kolkata", thresholdsStatus: "disabled" });
+    expect(out.indexOf("== 24 Oct ==")).toBeGreaterThan(-1);
+    expect(out.indexOf("== 24 Oct ==")).toBeLessThan(out.indexOf("== 26 Oct =="));
+    expect(out).toMatch(/• 24 Oct 10:30 pulse 72/);
+  });
+
   it("no digest file (extract failed): the failure notice goes to the admins by private DM, not the group", async () => {
     const { store, t, repo } = await ingestAll([]);
     expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 })).toMatchObject({ sentTo: 0, opsTo: 1 });
@@ -316,7 +345,7 @@ describe("batch details", () => {
     const { store, t, repo } = await ingestAll([]);
     const group = () => t.sent().filter((c) => c.ok && String(c.body.chat_id) === "222").length;
     expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: "d1", retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
-    expect(repo.digestsSent()).toEqual([{ date: "2026-10-25", message_ids: [1], sent_at: NOW, forced: false }]);
+    expect(repo.digestsSent()).toEqual([{ date: "2026-10-25", message_ids: [1], sent_at: NOW, forced: false, through: NOW }]);
     // 23:59 IST the same day (18:29Z): skipped, admins not bothered, no new log row
     expect(await finish({ store, tg: t.tg, repo, now: "2026-10-25T18:29:00.000Z", digest: "d2", retentionDays: 14 })).toMatchObject({ sentTo: 0, opsTo: 0, skipped: true });
     expect(group()).toBe(1);

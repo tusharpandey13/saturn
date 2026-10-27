@@ -9,6 +9,7 @@
 // Months are Asia/Kolkata calendar months of the message's send time. Output is sorted and stable: re-running on
 // the same input writes identical bytes.
 
+import type { DigestEntry } from "./digest.js";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { TgUpdate } from "../channel/telegram.js";
@@ -73,6 +74,17 @@ export interface DigestSent {
   message_ids: number[];
   sent_at: string;
   forced: boolean;
+  /** Watermark: every digest entry recorded at or before this instant was delivered (older rows: sent_at). */
+  through?: string;
+}
+
+/** data/telegram/digest-entries.jsonl: what each extract run recorded for the digest (append-only). The next delivered
+ *  digest carries every entry recorded after the last delivered digest's `through`, so a skipped digest loses nothing. */
+export interface DigestLogged {
+  key: string;
+  recorded_at: string;
+  /** null: the message was processed but has nothing to show (clears an earlier pending line for the same key). */
+  entry: DigestEntry | null;
 }
 
 export function monthOf(iso: string): string {
@@ -243,6 +255,25 @@ export class Repo {
 
   digestsSent(): DigestSent[] {
     return readLines(this.p("data/telegram/digests.jsonl"));
+  }
+
+  /** Append the entries of one extract run (append-only). */
+  logDigestEntries(rows: DigestLogged[]): void {
+    if (!rows.length) return;
+    const path = this.p("data/telegram/digest-entries.jsonl");
+    const prev = existsSync(path) ? readFileSync(path, "utf8") : "";
+    writeIfChanged(path, prev + rows.map((r) => line(r as unknown as Record<string, unknown>) + "\n").join(""));
+  }
+
+  /** Entries recorded after the last delivered digest, the latest per message key, empty ones dropped. */
+  undeliveredDigestEntries(): DigestEntry[] {
+    const through = this.digestsSent().map((r) => r.through ?? r.sent_at).sort().pop() ?? "";
+    const latest = new Map<string, DigestLogged>();
+    for (const r of readLines<DigestLogged>(this.p("data/telegram/digest-entries.jsonl"))) {
+      if (r.recorded_at <= through) continue;
+      latest.set(r.key, r);
+    }
+    return [...latest.values()].map((r) => r.entry).filter((e): e is DigestEntry => e !== null);
   }
 
   /** Append one sent digest (append-only). */
