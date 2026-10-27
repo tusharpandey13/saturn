@@ -114,6 +114,26 @@ class Online(unittest.TestCase):
         res = vc.verify(doc(good, page, wrong), FakeNet(), check_quotes=True)
         self.assertEqual([(lv, w) for lv, w, _ in res], [("warn", "item c citation 1")])
 
+    def test_angle_brackets_in_plain_text_quote(self):
+        # regression: "<135 ... >12%" was stripped as an HTML tag, so the quote never matched
+        class Abs(FakeNet):
+            def abstract(self, pmid):
+                return "Results: systolic <135 mmHg and HbA1c >12% were recorded. <b>Bold</b> text."
+        q = item("a", pmid="1000001", quote="systolic <135 mmHg and HbA1c >12% were recorded")
+        self.assertEqual(vc.verify(doc(q), Abs(), check_quotes=True), [])
+        self.assertEqual(vc.norm("a <b>x</b> &lt;5 and >7"), "a x 5 and 7")
+        self.assertIn("5", vc.norm("<135 ... >12%"))
+        self.assertIn("135", vc.norm("<135 ... >12%"))
+
+    def test_link_only_sources(self):
+        ok = item("a", url="https://uroweb.org/guidelines/x", quote="", locator="Rec 3.1")
+        quoted = item("b", url="https://www.nice.org.uk/guidance/ng1", locator="1.2.3")
+        nolocator = item("c", url="https://uroweb.org/guidelines/x", quote="")
+        res = vc.verify(doc(ok, quoted, nolocator), None)
+        self.assertEqual([(lv, w) for lv, w, _ in res], [("error", "item b citation 1"), ("error", "item c citation 1")])
+        self.assertTrue(vc.link_only("https://www.auanet.org/g"))
+        self.assertFalse(vc.link_only("https://notauanet.org/g"))
+
     def test_network_failure_is_error(self):
         class Down(FakeNet):
             def esummary(self, pmids):

@@ -120,7 +120,7 @@
     "kb_id": { "type": "string", "pattern": "^([a-z][a-z0-9-]*:(src|fact)|ref:(drug|code|party)):[a-z0-9.-]+$" },
     "dim": { "enum": ["match", "differs", "not_reported", "unknown"] },
     "citation": {
-      "type": "object", "required": ["source_type", "quote", "accessed"], "anyOf": [{ "required": ["pmid"] }, { "required": ["doi"] }, { "required": ["url"] }],
+      "type": "object", "required": ["source_type", "accessed"], "anyOf": [{ "required": ["pmid"] }, { "required": ["doi"] }, { "required": ["url"] }],
       "additionalProperties": false,
       "properties": {
         "source_type": { "enum": ["guideline", "systematic_review", "primary_study", "label", "trial_registry", "reference_text"] },
@@ -130,7 +130,7 @@
         "title": { "type": "string" },
         "version": { "type": "string", "description": "guideline year/edition or label revision date" },
         "locator": { "type": "string", "description": "section, recommendation number, table, page" },
-        "quote": { "type": "string", "minLength": 1, "maxLength": 400, "description": "verbatim from the cited text" },
+        "quote": { "type": "string", "minLength": 1, "maxLength": 400, "description": "verbatim from the cited text; REQUIRED except for link-only bodies (AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society), where it must be omitted and locator is required" },
         "accessed": { "type": "string", "format": "date" }
       }
     }

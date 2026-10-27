@@ -5,7 +5,8 @@
 
 Input: the JSON sidecar of a cross-reference (agent-tasks/saturn.research_crossref.output.schema.json).
 Checks every citation on every item:
-  - it carries an identifier (pmid, doi or url) and a verbatim quote (missing quote = error);
+  - it carries an identifier (pmid, doi or url) and a verbatim quote (missing quote = error); for link-only
+    hosts (LINK_ONLY_HOSTS) the reverse: a locator and no quote (a quote = error);
   - phrasing: statements and questions carry no dose advice, no diagnosis, no "you should" (error);
   - online (default): each PMID resolves (NCBI E-utilities esummary; the stated title, if any, must match),
     each DOI resolves (HEAD https://doi.org/<doi>, redirects not followed: 3xx = ok, 404 = unresolved),
@@ -91,8 +92,21 @@ class Net:
             return r.read(5_000_000).decode("utf-8", "replace")
 
 
+# Guideline bodies whose terms forbid use of their text in AI tools (method, "Source priority"): cite and link only.
+# A citation to one of these hosts must carry a locator (recommendation number) and must NOT carry a quote.
+LINK_ONLY_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk",
+                   "diabetesjournals.org", "diabetes.org", "icmr.gov.in", "icmr.org.in", "endocrine.org")
+# Real markup only: a tag starts with a letter, "/", "!" or "?". Plain-text "<135" or ">12%" is left alone.
+TAG = re.compile(r"</?[A-Za-z][^<>]*>|<[!?][^<>]*>")
+
+
+def link_only(url):
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in LINK_ONLY_HOSTS)
+
+
 def norm(s):
-    s = html.unescape(re.sub(r"<[^>]+>", " ", s or ""))
+    s = html.unescape(TAG.sub(" ", s or ""))
     s = s.replace("‑", "-").replace("‐", "-").replace("–", "-").replace("—", "-")
     return re.sub(r"[^a-z0-9%.]+", " ", s.lower()).strip()
 
@@ -125,7 +139,12 @@ def verify(doc, net=None, check_quotes=False):
             if not any(c.get(k) for k in ("pmid", "doi", "url")):
                 out.append(("error", where, "no pmid, doi or url"))
             q = (c.get("quote") or "").strip()
-            if not q:
+            if link_only(c.get("url")):
+                if q:
+                    out.append(("error", where, "link-only source: no quote allowed (cite and link only)"))
+                if not (c.get("locator") or "").strip():
+                    out.append(("error", where, "link-only source: locator (recommendation number) required"))
+            elif not q:
                 out.append(("error", where, "missing quote"))
             elif len(q) > QUOTE_MAX:
                 out.append(("error", where, f"quote longer than {QUOTE_MAX} chars"))
@@ -189,7 +208,7 @@ def verify(doc, net=None, check_quotes=False):
                 out.append(("warn", where, f"URL blocked a HEAD check ({st}); human check"))
             elif not (isinstance(st, int) and st < 400):
                 out.append(("error", where, f"URL does not resolve ({st}): {c['url']}"))
-            elif check_quotes and c.get("quote") and not c.get("pmid"):
+            elif check_quotes and c.get("quote") and not c.get("pmid") and not link_only(c["url"]):
                 try:
                     text = net.get_text(c["url"])
                     if text is None:

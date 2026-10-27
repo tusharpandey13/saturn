@@ -92,9 +92,8 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
    Quote it verbatim and record the section, label revision date and set id. **Leave out dosing text entirely.**
 5. **Guideline pass (per condition).** Find the current guideline from the bodies in section 4, tier 2. Check the
    version is the latest (step 10 triggers). Extract the recommendation on monitoring, targets or tests, with its
-   number and printed grade. Where the publisher restricts reuse (e.g. ESC, which needs a licence for use in
-   software or generative AI [S13a]), cite the recommendation number and URL with at most a one-sentence quote,
-   and do not paste or bulk-fetch the text.
+   number and printed grade, **except for link-only bodies** (section 4): never fetch, quote or summarise their
+   recommendations. Cite body, version, recommendation number and URL, and point the clinician to it by name.
 6. **Literature pass (only for topics the label and guideline passes leave open).** Search PubMed/Europe PMC
    (section 5). Prefer systematic reviews and meta-analyses, then RCTs, then cohorts. Screen titles and abstracts,
    then fetch the record you cite and quote from it. Log every query (section 9).
@@ -123,7 +122,27 @@ and so is label text over interaction databases.
 | 1 | **openFDA** `https://api.fda.gov/drug/label.json` [S4] | free; 240/min, 1,000/day per IP without a key; 120,000/day with a key | CC0 unless marked. The API itself says "Do not rely on openFDA to make decisions regarding medical care" |
 | 1 | **EMA** EPAR product information (SmPC, PIL) `https://www.ema.europa.eu/en/medicines` [S7] | free, web only | reuse is allowed with EMA credited |
 | 1 (India) | **CDSCO** approvals; **Indian Pharmacopoeia** / **National Formulary of India** (IPC) [S8] | CDSCO: PDF approval lists only, no label database or API. IP and NFI are paid (print/online) | the Indian package insert usually cannot be fetched. Use the US/EU label as a proxy, say so, and note that brand, strength and combination products may differ |
-| 2 Guidelines | ESC [S13a], ACC/AHA/HFSA [S13b] (heart failure); KDIGO [S13c] (kidney); ADA Standards of Care [S13d] (diabetes); AUA [S13e] / EAU [S13f] (BPH/LUTS); Endocrine Society, NICE, ICMR Standard Treatment Workflows [S13g] (Indian context); USPSTF [S13h] (screening) | free to read | **ESC: a licence is needed for use in software or AI.** Link and cite the recommendation number. Others: cite and quote briefly. Always record the version (year, update) |
+| 2 Guidelines, **link-only** | ESC [S13a]; AUA [S13e]; EAU [S13f]; NICE [S13g]; ADA Standards of Care [S13d]; ICMR Standard Treatment Workflows [S13g]; Endocrine Society [S13g] | free to read | **LINK-ONLY: cite and link, never quote or summarise the recommendations.** Output carries body, version, recommendation number (`locator`), URL and no quote. The verifier rejects a quote from these hosts. Terms in the table below |
+| 2 Guidelines, quotable | KDIGO [S13c] (kidney); USPSTF [S13h] (screening); ACC/AHA/HFSA [S13b] (not re-checked) | free to read | brief verbatim quote (<= 400 chars), attributed, unaltered, per the edition's notice. Always record the version |
+
+**Link-only terms (checked 27-Oct-2026; re-check at each review, and whenever a body changes its terms).**
+
+| Body | Verdict | Basis |
+|---|---|---|
+| AUA | link-only | page notice: "You are prohibited from using or uploading content you accessed through this website into external applications ... including those using artificial intelligence ..." (https://www.auanet.org/guidelines-and-quality/guidelines) |
+| EAU | link-only | copyright page: use or upload of the Guidelines "and any material derived from these texts (whether in full or in part) on external websites, bots ... software, or external applications" is prohibited without written permission; the EAU/AUA joint position covers AI tools (https://uroweb.org/guidelines/prostate-cancer/chapter/copyright-and-terms-of-use ; https://uroweb.org/eau-guidelines/citing-usage-republication) |
+| NICE | link-only | content may not be used in a retrieval system without prior written agreement; AI use is outside the open content licence and needs approval, licence and fee; scraping and training not permitted (https://www.nice.org.uk/terms-and-conditions ; https://www.nice.org.uk/reusing-our-content/nice-uk-open-content-licence) |
+| ESC | link-only | licence needed for software or AI use (already link-only) |
+| ADA | link-only (stricter than asked) | 2026 Standards notice: no text or data mining, machine learning or similar without prior written permission; separate AI Content Licensing Policy (https://diabetesjournals.org/journals/pages/ada-journal-policies) |
+| ICMR STW | link-only (precaution) | STW PDFs: "all rights reserved", no reproduction without permission; site policy is looser but excludes this (https://www.icmr.gov.in/copyright-policy ; https://stw.icmr.org.in/) |
+| Endocrine Society | link-only until verified | no AI or reuse terms for the guidelines found; journal reuse via OUP/CCC (https://www.endocrine.org/journals/permissions) |
+| KDIGO | quotable, per edition | 2024 CKD, 2025 IgAN, 2026 anaemia: CC BY-NC-ND, noncommercial text and data mining of the unaltered text allowed; 2012 and 2017 editions: all rights reserved, so treat as link-only. Confirm the edition's notice (PDF front matter, https://kdigo.org/guidelines/) |
+| USPSTF | quotable | AHRQ notice (Sep-2017): unaltered reuse with attribution; some JAMA-published pages carry an AMA copyright, so check the page (https://www.uspreventiveservicestaskforce.org/uspstf/recommendation-topics/copyright-notice) |
+
+Not fetchable from an agent (HTTP 403/404) on 27-Oct-2026: the NICE and ADA terms pages and the EAU copyright
+page were read through search excerpts, not the pages themselves; the owner should open them once.
+A journal or PubMed version of a link-only body's guideline is still link-only.
+
 | 3 Syntheses | **Cochrane** reviews (abstracts free) via PubMed; systematic reviews and meta-analyses | free abstracts | abstracts only unless open access |
 | 4 Primary studies | **PubMed** via NCBI E-utilities [S1]; **Europe PMC** REST `https://www.ebi.ac.uk/europepmc/webservices/rest/search` [S2] | free. E-utilities: ≤3 requests/s without a key, ≤10/s with `api_key`; send `tool` and `email` (registered with NCBI). Europe PMC: no key; official limits not published, so stay under 3/s | quote only from the abstract, or from the full text if it is open access |
 | 4 | **ClinicalTrials.gov API v2** `https://clinicaltrials.gov/api/v2/` [S3] | free, no key; back off on HTTP 429 | context only (ongoing trials). Never a basis for an item on its own |
@@ -204,7 +223,7 @@ Two files in the records repo, plus question rows:
   question list.
 
 Item fields (schema): `id` (rx-NNN), `type`, `statement`, `kb_ids`, `evidence {design, certainty, grade_as_printed,
-ocebm}`, `applicability`, `citations[] {source_type, pmid|doi|url, title, version, locator, quote, accessed}`,
+ocebm}`, `applicability`, `citations[] {source_type, pmid|doi|url, title, version, locator, quote (omitted for link-only bodies), accessed}`,
 `for_clinician`, `question_ids`, `status` (revisit), `verification`.
 
 ## 9. Phrasing rules
@@ -277,7 +296,7 @@ AI use follows the Cochrane, Campbell, JBI and CEE joint position (2025) [S10]:
   reviewed by <owner> on <date>".
 
 **Hallucination controls:**
-1. Every claim carries a PMID, DOI or URL and a verbatim quote.
+1. Every claim carries a PMID, DOI or URL and a verbatim quote (link-only bodies: a locator and no quote).
 2. The verifier resolves every PMID (esummary; the title must match), DOI (doi.org) and URL. With
    `--check-quotes` it also confirms the quote appears in the PubMed abstract or the fetched page.
 3. Nothing is cited from model memory.
@@ -332,7 +351,7 @@ The run records `revisit.next_due` (the run date plus 6 months) and the triggers
 - [S11b] PRISMA-S, Syst Rev 2021;10:39, doi 10.1186/s13643-020-01542-z
 - [S12] GRADE handbook: https://gdt.gradepro.org/app/handbook/handbook.html ; [S12b] OCEBM 2011 levels:
   https://www.cebm.ox.ac.uk/resources/levels-of-evidence/ocebm-levels-of-evidence
-- [S13a] ESC heart failure guidelines (2026 edition; licence needed for software/AI use):
+- [S13a] ESC heart failure guidelines (2026 edition; LINK-ONLY):
   https://www.escardio.org/guidelines/clinical-practice-guidelines/acute-and-chronic-heart-failure/
 - [S13b] ACC/AHA/HFSA 2022 heart failure guideline, doi 10.1161/CIR.0000000000001063: https://hfsa.org/HFGuidelines
 - [S13c] KDIGO 2024 CKD guideline, doi 10.1016/j.kint.2023.10.018:
