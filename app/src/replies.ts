@@ -1,52 +1,52 @@
-// Fixed Hindi labels for the daily digest. Values shown to the family are never LLM-generated text:
-// they are rendered from the stored records.
+// Fixed English labels for the admin digest (ADR 011: the bot writes only to admins, in plain English; Hindi input is
+// still understood). Values shown are never LLM-generated text: they are rendered from the stored records.
 
 import type { Reading, Symptom, SymptomType } from "./types.js";
 
-const SYMPTOM_HI: Partial<Record<SymptomType, string>> = {
-  chest_pain: "सीने में दर्द/दबाव",
-  breathlessness: "साँस फूलना",
-  orthopnea: "लेटने पर साँस फूलना",
-  syncope: "बेहोशी",
-  palpitations: "धड़कन तेज़",
-  dizziness: "चक्कर",
-  swelling: "सूजन",
-  stroke_signs: "लकवे जैसे लक्षण",
-  angioedema: "होंठ/जीभ/गले में सूजन",
-  confusion: "भ्रम/ज़्यादा नींद",
-  vomiting_diarrhoea: "उल्टी/दस्त",
-  pain: "दर्द",
-  numbness: "सुन्नपन",
-  tingling: "झुनझुनी",
-  weakness: "कमज़ोरी",
-  clumsiness: "हाथ से काम में दिक्कत",
-  imbalance: "संतुलन में दिक्कत",
-  fall: "गिरना",
-  fatigue: "थकान",
-  cough: "खाँसी",
-  urinary: "पेशाब की तकलीफ़",
+const SYMPTOM_EN: Partial<Record<SymptomType, string>> = {
+  chest_pain: "chest pain/pressure",
+  breathlessness: "breathlessness",
+  orthopnea: "breathless lying down",
+  syncope: "fainting",
+  palpitations: "palpitations",
+  dizziness: "dizziness",
+  swelling: "swelling",
+  stroke_signs: "stroke-like signs",
+  angioedema: "lip/tongue/throat swelling",
+  confusion: "confusion/drowsiness",
+  vomiting_diarrhoea: "vomiting/diarrhoea",
+  pain: "pain",
+  numbness: "numbness",
+  tingling: "tingling",
+  weakness: "weakness",
+  clumsiness: "clumsiness",
+  imbalance: "imbalance",
+  fall: "fall",
+  fatigue: "fatigue",
+  cough: "cough",
+  urinary: "urinary trouble",
 };
 
-export function readingHi(r: Reading): string {
+export function readingEn(r: Reading): string {
   switch (r.type) {
-    case "bp": return `BP ${r.value}/${r.value2}${r.value3 !== null ? `, पल्स ${r.value3}` : ""}`;
-    case "weight": return `वज़न ${r.value} kg`;
-    case "pulse": return `पल्स ${r.value}`;
+    case "bp": return `BP ${r.value}/${r.value2}${r.value3 !== null ? `, pulse ${r.value3}` : ""}`;
+    case "weight": return `weight ${r.value} kg`;
+    case "pulse": return `pulse ${r.value}`;
     case "spo2": return `SpO2 ${r.value}%`;
-    case "potassium": return `पोटैशियम ${r.value} mmol/L`;
-    case "sodium": return `सोडियम ${r.value} mmol/L`;
-    case "creatinine": return `क्रिएटिनिन ${r.value} mg/dL`;
-    case "glucose_fasting": return `शुगर (खाली पेट) ${r.value} mg/dL`;
-    case "glucose_pp": return `शुगर (खाने के बाद) ${r.value} mg/dL`;
-    case "glucose_random": return `शुगर ${r.value} mg/dL`;
+    case "potassium": return `potassium ${r.value} mmol/L`;
+    case "sodium": return `sodium ${r.value} mmol/L`;
+    case "creatinine": return `creatinine ${r.value} mg/dL`;
+    case "glucose_fasting": return `sugar (fasting) ${r.value} mg/dL`;
+    case "glucose_pp": return `sugar (after food) ${r.value} mg/dL`;
+    case "glucose_random": return `sugar ${r.value} mg/dL`;
   }
 }
 
-export function symptomHi(s: Symptom): string {
-  const parts = [SYMPTOM_HI[s.symptomType] ?? s.freeText ?? "लक्षण"];
+export function symptomEn(s: Symptom): string {
+  const parts = [SYMPTOM_EN[s.symptomType] ?? s.freeText ?? "symptom"];
   if (s.location) parts.push(`(${s.location}${s.side !== "unknown" ? `, ${s.side}` : ""})`);
   if (s.severity !== null) parts.push(`${s.severity}/10`);
-  if (s.durationMin !== null) parts.push(`${s.durationMin} मिनट`);
-  if (s.atRest) parts.push("आराम में");
+  if (s.durationMin !== null) parts.push(`${s.durationMin} min`);
+  if (s.atRest) parts.push("at rest");
   return parts.join(" ");
 }

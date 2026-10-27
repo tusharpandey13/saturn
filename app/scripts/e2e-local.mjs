@@ -4,10 +4,11 @@
 // D1/R2, through a fake Cloudflare REST API (wrangler getPlatformProxy) and a fake `claude` (scripts/fake-claude.mjs).
 // No accounts, no keys, no network. Design: docs/platform/e2e-testing.md (local tier).
 //
-// Flow: wrong secret -> 401; vitals text -> inbox row + "BP 120/80, pulse 72 ✓"; photo -> R2 + inbox media stored;
-//       redelivered update -> still one row, one ack; batch pull -> raw + media in a scratch repo; extract with
-//       Claude auth failing -> exit 3, "extraction delayed", rows stay new; extract again -> BP reading in NDJSON;
-//       KB build ok; finish -> rows done, digest sent to the group.
+// Flow: wrong secret -> 401; vitals text in the group -> inbox row, NO group reply (ADR 011: the group is input-only,
+//       even with ack_mode all); photo -> R2 + inbox media stored, no reply; redelivered update -> still one row;
+//       an admin's private message -> stored + acked in the DM only; batch pull -> raw + media in a scratch repo;
+//       extract with Claude auth failing -> exit 3, rows stay new; finish -> short ops DM to the admin, nothing to the
+//       group; extract again -> BP reading in NDJSON; KB build ok; finish -> rows done, digest DM'd to the admin only.
 //   npm run e2e:local
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -29,6 +30,7 @@ const TOKEN = "e2e-bot-token";
 const SECRET = "e2e-webhook-secret";
 const GROUP = -1001234567890;
 const ALICE = 111;
+const ADMIN = 222;
 
 const telegramCalls = [];
 const stub = createServer(async (req, res) => {
@@ -100,8 +102,9 @@ async function main() {
 
   console.log("1/9 local D1: migrations + seed");
   wrangler(["d1", "migrations", "apply", "DB", "--local", "--persist-to", STATE], { input: "y\n" });
-  d1(`INSERT INTO chats (chat_id, channel, label) VALUES ('${GROUP}', 'telegram', 'family');
-      INSERT INTO persons (id, name, role, sender_id) VALUES ('alice', 'Alice', 'member', '${ALICE}');`);
+  // The label is a free note with no semantics (ADR 011); production relabelled its group 'members-silent'.
+  d1(`INSERT INTO chats (chat_id, channel, label) VALUES ('${GROUP}', 'telegram', 'members-silent');
+      INSERT INTO persons (id, name, role, sender_id) VALUES ('alice', 'Alice', 'member', '${ALICE}'), ('carol-tg', 'Carol', 'admin', '${ADMIN}');`);
 
   console.log("2/9 wrangler dev (local workerd, stub Telegram)");
   const envFile = join(STATE, "e2e.env");
@@ -112,12 +115,10 @@ async function main() {
   console.log("3/9 wrong secret -> 401");
   check((await post({ update_id: 1 }, "nope")).status === 401, "expected 401");
 
-  console.log("4/9 vitals text -> inbox + deterministic echo; redelivery is a no-op");
+  console.log("4/9 vitals text in the group -> inbox, no group reply (ack_mode all); redelivery is a no-op");
   const text = { update_id: 900001, message: { message_id: 1, date: now(), chat: { id: GROUP }, from: { id: ALICE, is_bot: false }, text: "120/80 72" } };
   check((await post(text)).status === 200, "webhook not 200");
   check((await post(text)).status === 200, "redelivery not 200");
-  const ack = await waitFor("ack", () => sent()[0]);
-  check(ack.body.text === "Alice: BP 120/80, pulse 72 ✓", `unexpected ack: ${ack.body.text}`); // ack_mode all (example env)
 
   console.log("5/9 photo -> R2 copy at ingest");
   const photo = { update_id: 900002, message: { message_id: 2, date: now(), chat: { id: GROUP }, from: { id: ALICE, is_bot: false },
@@ -127,9 +128,16 @@ async function main() {
   const rows = d1("SELECT update_id, kind, media_key, media_status, ack, status FROM inbox ORDER BY update_id");
   check(rows.length === 2, `expected 2 inbox rows, got ${rows.length}`);
   check(rows[1].media_status === "stored" && rows[1].media_key === "telegram/u-bp", `media not stored: ${JSON.stringify(rows[1])}`);
-  check(sent().length === 2, `expected 2 acks, got ${sent().length}`);
+  check(sent().length === 0, `the bot posted ${sent().length} message(s) in the group`);
   const obj = wrangler(["r2", "object", "get", `${BUCKET}/telegram/u-bp`, "--local", "--persist-to", STATE, "--pipe"], { encoding: "buffer" });
   check(obj.length === 10 && obj[0] === 0xff, "R2 object missing or wrong");
+
+  console.log("    admin private chat -> stored, acked in the DM only (plain English)");
+  const dm = { update_id: 900003, message: { message_id: 3, date: now(), chat: { id: ADMIN }, from: { id: ADMIN, is_bot: false }, text: "wajan 70" } };
+  check((await post(dm)).status === 200, "admin DM webhook not 200");
+  const dmAck = await waitFor("admin DM ack", () => sent()[0]);
+  check(String(dmAck.body.chat_id) === String(ADMIN) && dmAck.body.text === "Carol: weight 70 kg ✓", `unexpected DM ack: ${JSON.stringify(dmAck.body)}`);
+  check(sent().every((c) => String(c.body.chat_id) !== String(GROUP)), "a message reached the group");
 
   console.log("6/9 batch pull (fake Cloudflare REST over the same local D1/R2) -> raw + media in a scratch repo");
   await new Promise((r) => { dev.once("exit", r); dev.kill("SIGTERM"); });
@@ -177,7 +185,7 @@ async function main() {
   check(pulled.code === 0, `pull failed (${pulled.code}): ${pulled.out}`);
   const rawDir = join(root, "data", "telegram", "raw");
   const raw = readdirSync(rawDir).flatMap((f) => readFileSync(join(rawDir, f), "utf8").split("\n").filter(Boolean));
-  check(raw.length === 2, `expected 2 raw rows, got ${raw.length}`);
+  check(raw.length === 3, `expected 3 raw rows, got ${raw.length}`);
   const media = readdirSync(join(root, "sources", "alice", "media", "telegram"));
   check(media.length === 1, `expected 1 media file in git, got ${media}`);
 
@@ -186,7 +194,14 @@ async function main() {
   check(delayed.code === 3, `expected exit 3, got ${delayed.code}: ${delayed.out}`);
   check(!existsSync(digest), "a delayed run wrote a digest file (the family would get it)");
   const waiting = (await proxy.env.DB.prepare("SELECT status FROM inbox").all()).results;
-  check(waiting.every((r) => r.status === "new"), `rows not left new: ${JSON.stringify(waiting)}`);
+  check(waiting.some((r) => r.status === "new"), `delayed rows not left new: ${JSON.stringify(waiting)}`);
+  check(existsSync(`${digest}.ops`), "a delayed run wrote no ops lines for the admin");
+  const beforeOps = sent().length;
+  const opsRun = await batch(["finish"]);
+  check(opsRun.code === 0 && opsRun.out.includes("group posts 0"), `delayed finish: ${opsRun.out}`);
+  const opsDm = sent().slice(beforeOps);
+  check(opsDm.length === 1 && String(opsDm[0].body.chat_id) === String(ADMIN) && /did not complete/.test(opsDm[0].body.text) && /extraction delayed/.test(opsDm[0].body.text),
+    `ops DM: ${JSON.stringify(opsDm.map((c) => c.body))}`);
 
   console.log("8/9 extract (fake claude) -> NDJSON + KB build");
   const ok = await batch(["extract"]);
@@ -197,15 +212,18 @@ async function main() {
   const built = execFileSync("python3", ["-I", join(APP, "..", "tools", "kb", "build"), "--records", EXAMPLE, "--telegram", join(root, "data", "telegram"), "--db", join(root, "kb.sqlite")], { encoding: "utf8" });
   check(built.startsWith("ok:"), `kb build: ${built}`);
 
-  console.log("9/9 finish -> inbox rows done, digest sent to the group");
+  console.log("9/9 finish -> inbox rows done, digest DM'd to the admin, nothing to the group");
   const before = sent().length;
   const fin = await batch(["finish"]);
   check(fin.code === 0, `finish failed: ${fin.out}`);
   check(fin.out.includes("webhook: ok (gate closed"), `webhook assertion: ${fin.out}`);
   const done = (await proxy.env.DB.prepare("SELECT status FROM inbox").all()).results;
-  check(done.length === 2 && done.every((r) => r.status === "done"), `inbox not done: ${JSON.stringify(done)}`);
+  check(done.length === 3 && done.every((r) => r.status === "done"), `inbox not done: ${JSON.stringify(done)}`);
   const digests = sent().slice(before);
-  check(digests.length >= 1 && digests.every((c) => String(c.body.chat_id) === String(GROUP)), "digest not sent to the group");
+  check(digests.length >= 1 && digests.every((c) => String(c.body.chat_id) === String(ADMIN)), `digest not DM'd to the admin only: ${JSON.stringify(digests.map((c) => c.body.chat_id))}`);
+  // The texts were recorded by the delayed run (no LLM needed); this run adds the photo: one admin question, English.
+  check(digests.some((c) => c.body.text.includes("device reading photo could not be read")) && digests.every((c) => !/[\u0900-\u097F]/.test(c.body.text)),
+    `digest content (English, the photo question): ${digests.map((c) => c.body.text).join("\n---\n")}`);
   check(readFileSync(join(root, "data", "telegram", "digests.jsonl"), "utf8").includes('"date":'), "digest not logged");
 
   console.log("    second full run the same day -> digest skipped (one per day)");
@@ -213,9 +231,10 @@ async function main() {
   const before2 = sent().length;
   const again = await batch(["finish"]);
   check(again.code === 0 && again.out.includes("digest skipped"), `second finish: ${again.out}`);
-  check(sent().slice(before2).every((c) => String(c.body.chat_id) !== String(GROUP)), "a second digest reached the group");
+  check(sent().slice(before2).length === 0, "a second digest was sent");
+  check(telegramCalls.filter((c) => c.method === "sendMessage").every((c) => String(c.body.chat_id) !== String(GROUP)), "the bot posted to the group");
 
-  console.log("\nE2E PASS: secret check, idempotent inbox insert, deterministic ack, media to R2, batch pull/extract/KB/finish, delayed path");
+  console.log("\nE2E PASS: secret check, idempotent inbox insert, group input-only (no bot posts), admin DM ack, media to R2, batch pull/extract/KB/finish, admin-only digest, delayed path");
 }
 
 main()

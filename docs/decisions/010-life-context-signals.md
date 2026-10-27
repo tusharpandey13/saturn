@@ -47,7 +47,7 @@ The existing `travel` event type (a journey recorded from a document or by hand)
 - `tools/kb/gen-views` adds a `gen:context` block to `timeline.md`: context bands (dates, category, summary, source id) alongside readings and symptoms of the same member and dates. Header line: "Shown alongside, not as a cause. Facts as written; not advice; doctors decide."
 - Language rules: the overlay and any text derived from it say "around the same dates", "alongside", "during". A lint rejects causal phrasing ("because of", "due to", "caused", "triggered", "led to", "explains", "के कारण", "की वजह से", "se hua") in generated views, prompts' outputs and questions.
 - Nothing is inferred by the batch. Something notable (e.g. high readings during a reported fasting week) may be drafted as a **question for the named doctor** by the offline Opus agent, tagged `agent-inferred`, in its PR to `questions.md`; a human merges it. Never advice, never a diagnosis.
-- Not in the family digest by default (open decision 3): the digest is read by everyone, and a context line there is where "being watched" is felt most.
+- Not in the digest by default (open decision 3; since ADR 011 the digest goes to the admins only by DM): the digest was read by everyone, and a context line there is where "being watched" is felt most.
 
 **8. LLM budget.** Env vars (env.yaml → batch, like `ack_mode`): `context_mode` ∈ `off` (default) | `shadow` | `on`, and caps. Proposed defaults:
 
@@ -57,7 +57,7 @@ The existing `travel` event type (a journey recorded from a document or by hand)
 | context output tokens/day | 6,000 | ≈100 per message |
 | context tokens/month (input share + output) | 250,000 | the env converts this to money from the current price list |
 
-Over a cap: health extraction runs as normal; the remaining messages are marked `context_status = deferred` on the KB message row and retried oldest-first by the next run in a small context-only call; after 3 days they become `expired` (never extracted). The admin gets the counts by DM (deferred, expired, month-to-date); the family digest does not.
+Over a cap: health extraction runs as normal; the remaining messages are marked `context_status = deferred` on the KB message row and retried oldest-first by the next run in a small context-only call; after 3 days they become `expired` (never extracted). The admin gets the counts by DM (deferred, expired, month-to-date); the digest does not.
 
 ## Risks
 | Risk | Mitigation |

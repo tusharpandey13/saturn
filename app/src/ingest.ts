@@ -1,7 +1,9 @@
 // Ingest (ADR 005): the only always-on piece. Per Telegram update:
 //   secret check -> allowlist (D1 chats, persons) -> INSERT OR IGNORE into inbox (key: update_id)
-//   -> subject (name prefix, records aliases) -> copy media to R2 -> optional ack (ACK_MODE; default off; the echo
-//   names who it was logged for). An admin's "/for <name>" reply re-attributes a row (DM feedback). No LLM, no alerts.
+//   -> subject (name prefix, records aliases) -> copy media to R2 -> optional ack in an admin's private chat only.
+// ADR 011: a group is INPUT-ONLY. The Worker never posts to a group chat (no acks, no notices, whatever ACK_MODE says).
+// An admin's private chat with the bot is also an input chat (answers to the digest questions), and the only place an
+// ack can go. An admin's "/for <name>" reply in the group re-attributes a row (feedback by DM). No LLM, no alerts.
 // Failure policy: if the inbox insert fails, answer 500 so Telegram redelivers (it keeps updates ~24 h).
 // After the insert, answer 200 whatever happens: a failed media copy stays media_status 'pending' and the batch
 // fetches it by file_id; a failed ack is only a missing reply. Never log message content or file URLs.
@@ -11,8 +13,8 @@ import type { InboxRow, MediaStatus, Store } from "./store.js";
 import { displayOf, parseForCommand, resolveName, splitSubject } from "./subject.js";
 import { parseVitals, vitalsEcho } from "./vitals.js";
 
-/** Group replies (env ack_mode -> Worker var ACK_MODE). off: none at all, the daily digest shows what was recorded;
- *  vitals-only: the vitals echo (and the file-too-big notice); all: every ack. Unset or unknown = off. */
+/** Acks (env ack_mode -> Worker var ACK_MODE), in an admin's private chat only; group acks are hard-disabled.
+ *  off: none; vitals-only: the vitals echo (and the file-too-big notice); all: every ack. Unset or unknown = off. */
 export type AckMode = "off" | "vitals-only" | "all";
 export const parseAckMode = (v: string | undefined): AckMode => (v === "all" || v === "vitals-only" ? v : "off");
 
@@ -24,19 +26,23 @@ export interface IngestIO {
   putMedia(key: string, body: ReadableStream | ArrayBuffer, mimeType: string): Promise<void>;
 }
 
+/** Plain English (ADR 011). Admin private chat only. */
 export const ACK = {
-  text: "✓ मिल गया",
-  image: "📷 फ़ोटो मिल गई ✓",
-  document: "📄 दस्तावेज़ मिल गया ✓",
-  audio: "🎤 आवाज़ संदेश मिल गया ✓",
-  tooBig: "यह फ़ाइल 20 MB से बड़ी है, सेव नहीं हुई। कृपया छोटी फ़ाइल या फ़ोटो भेजें।",
-  editPrefix: "सुधार: ",
-  /** The echo names who the message was logged for, so the family can catch a wrong attribution. */
+  text: "received ✓",
+  image: "photo received ✓",
+  document: "document received ✓",
+  audio: "voice note received ✓",
+  tooBig: "File over 20 MB, not saved. Send a smaller file or a photo.",
+  editPrefix: "edit: ",
+  /** The echo names who the message was logged for, so a wrong attribution is easy to catch. */
   subject: (name: string) => `${name}: `,
-  forDone: (name: string) => `✓ ठीक किया: अब ${name} के लिए दर्ज`,
-  forNoTarget: "/for: बॉट के जवाब (या उस संदेश) पर reply करके भेजें, जैसे /for maa",
-  forUnknown: (name: string) => `/for: "${name.slice(0, 30)}" नाम नहीं मिला`,
+  forDone: (name: string) => `✓ now logged for ${name}`,
+  forNoTarget: "/for: reply to the member's original message, e.g. /for <name>",
+  forUnknown: (name: string) => `/for: no member named "${name.slice(0, 30)}"`,
 };
+
+/** A private chat with the bot: Telegram's private chat id is the user's id. */
+export const isPrivateChat = (chatId: string, sender: string) => chatId === sender;
 
 export const safeErr = (err: unknown) => {
   const e = err as { name?: string; status?: number };
@@ -73,9 +79,11 @@ async function ingest(update: TgUpdate, io: IngestIO): Promise<Response> {
     return ok();
   }
   const m = ev.msg;
-  if (!(await io.store.isAllowedChat(m.chatId))) return ok();
+  const priv = isPrivateChat(m.chatId, m.sender);
+  if (!priv && !(await io.store.isAllowedChat(m.chatId))) return ok();
   const person = await io.store.personBySender(m.sender);
   if (!person) return ok(); // strangers are dropped, not stored
+  if (priv && person.role !== "admin") return ok(); // only an admin's private chat is an input chat
 
   const aliases = await io.store.aliases();
   const forName = m.kind === "text" ? parseForCommand(m.text) : null;
@@ -100,7 +108,8 @@ async function ingest(update: TgUpdate, io: IngestIO): Promise<Response> {
   const { subject, rest } = splitSubject(m.text, aliases);
   const subjectId = subject?.personId ?? person.id;
   const name = subject?.display ?? displayOf(person.id, aliases) ?? person.name;
-  const mode = io.ackMode ?? "off";
+  // Never in a group (hard-disabled, whatever ACK_MODE says); in an admin's private chat per ACK_MODE.
+  const mode = priv ? io.ackMode ?? "off" : "off";
   const ack = mode === "off" ? null : ackFor(m.kind, rest, m.ts, tooBig, m.editDate > 0, name, mode === "vitals-only");
   const row: InboxRow = {
     update_id: m.updateId, chat_id: m.chatId, message_id: m.messageId, sender_id: m.sender, person_id: person.id,

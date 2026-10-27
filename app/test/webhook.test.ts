@@ -41,18 +41,19 @@ describe("webhook assertion", () => {
     const down = new TelegramAdapter("x", (async () => Response.json({ ok: false }, { status: 401 })) as unknown as typeof fetch, "https://tg.test");
     expect((await checkWebhook(down, { live: false, now: NOW }))[0]).toMatch(/webhook check failed: telegram getWebhookInfo failed: 401/);
   });
-  it("finish DMs alerts to the admins; the family group gets the digest only", async () => {
+  it("finish DMs alerts to the admins (ops DM first), then the digest; nothing to the group", async () => {
     const t = fakeTelegram();
     const repo = new Repo(mkdtempSync(join(tmpdir(), "hl-wh-")));
-    await finish({ store: (await seededStore()).store, tg: t.tg, repo, now: NOW, digest: "📋 digest", retentionDays: 14, alerts: ["webhook URL mismatch: x ≠ y"] });
-    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", "⚠ webhook URL mismatch: x ≠ y"], [GROUP, "📋 digest"]]);
+    await finish({ store: (await seededStore()).store, tg: t.tg, repo, now: NOW, digest: "digest", retentionDays: 14, alerts: ["webhook URL mismatch: x ≠ y"] });
+    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", "⚠ webhook URL mismatch: x ≠ y"], ["222", "digest"]]);
   });
-  it("no admin in the allowlist: alerts fall back to the family digest as ⚠ lines", async () => {
+  it("no admin: alerts are NOT posted to the group (no fallback); only the workflow log", async () => {
     const t = fakeTelegram();
     const repo = new Repo(mkdtempSync(join(tmpdir(), "hl-wh-")));
     const { db, store } = await seededStore();
     await db.prepare("UPDATE persons SET role = 'member'").run();
-    await finish({ store, tg: t.tg, repo, now: NOW, digest: "📋 digest", retentionDays: 14, alerts: ["webhook URL mismatch: x ≠ y"] });
-    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([[GROUP, "📋 digest\n\n⚠ webhook URL mismatch: x ≠ y"]]);
+    const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: "digest", retentionDays: 14, alerts: ["webhook URL mismatch: x ≠ y"] });
+    expect(f).toMatchObject({ sentTo: 0, opsTo: 0 });
+    expect(t.sent()).toEqual([]);
   });
 });

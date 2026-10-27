@@ -1,12 +1,14 @@
 // Daily batch entrypoint (ADR 005), run by deploy/batch.sh (called from the env repo's thin workflow) under Node:
 //   npx tsx batch/run.ts pull                      D1 inbox + media -> data/telegram/raw/, sources/
 //   npx tsx batch/run.ts extract [--retry-failed]  raw -> STT / Haiku (claude -p) -> data/telegram/*.ndjson, queue, digest file
+//                                                  (+ <digest>.ops: actionable ops lines, e.g. token expiry, delays)
 //                                                  exit 3 when extraction was delayed (auth, usage limit, outage);
 //                                                  the digest file is written only when nothing was delayed
 //   npx tsx batch/run.ts finish [--no-digest] [--force-digest]
-//                                                  mark inbox rows done, assert the webhook, send the digest (once per
-//                                                  IST day, logged in data/telegram/digests.jsonl; --force-digest sends
-//                                                  again), prune. No digest file = failed/delayed run: admin DM only.
+//                                                  mark inbox rows done, assert the webhook, DM the digest to the admins
+//                                                  (once per IST day, logged in data/telegram/digests.jsonl; --force-digest
+//                                                  sends again), DM ops lines separately, prune. No digest file = failed/
+//                                                  delayed run: ops DM only. Never posts to a group chat (ADR 011).
 //                                                  exit 1 when the webhook assertion fails (⚠ lines DM'd to the admins)
 //   pull and finish exit 3 ("delayed") when Cloudflare stays rate limited (429) or unavailable after the retries.
 // Options: --records DIR (records repo root, holds records.yaml and optional config/thresholds.yaml; --root is the old name), --digest FILE (default
@@ -40,6 +42,7 @@ if (!recordsArg) {
 const root = resolve(recordsArg);
 const records = loadRecords(root);
 const digestPath = opt("--digest") ?? process.env.DIGEST_FILE ?? join(process.env.RUNNER_TEMP ?? join(import.meta.dirname, "..", ".batch"), "digest.txt");
+const opsPath = `${digestPath}.ops`;
 const now = opt("--now") ?? new Date().toISOString();
 const repo = new Repo(root, records.d1PersonMap);
 const aliases = aliasesFromRecords(records.aliases, records.display, records.d1PersonMap);
@@ -63,21 +66,22 @@ async function main(cmd: string | undefined) {
     if (!env.ANTHROPIC_API_KEY) {
       const w = tokenExpiryWarning(env.CLAUDE_TOKEN_CREATED, now);
       if (w) warnings.push(w);
-      if (env.CLAUDE_CODE_OAUTH_TOKEN && !env.CLAUDE_TOKEN_CREATED) console.log("::warning::CLAUDE_TOKEN_CREATED is not set; no token-expiry warning in the digest");
+      if (env.CLAUDE_CODE_OAUTH_TOKEN && !env.CLAUDE_TOKEN_CREATED) console.log("::warning::CLAUDE_TOKEN_CREATED is not set; no token-expiry warning to the admins");
     }
     if (!env.SARVAM_API_KEY) console.log("extract: no SARVAM_API_KEY; voice notes are stored as stt_pending");
+    if (records.thresholds.status === "disabled") console.log("extract: rule annotations off (records config/thresholds.yaml not configured)");
     const r = await extract({
       repo, persons, now, thresholds: records.thresholds, warnings, aliases,
       extractor: new ClaudeCliExtractor({ bin: env.CLAUDE_BIN || "claude", context: records.extractionContext }),
       stt: env.SARVAM_API_KEY ? new SarvamSpeechToText(env.SARVAM_API_KEY, undefined, undefined, parseVocab(records.sttVocab ?? "")) : null,
       retryFailed: args.includes("--retry-failed"),
     });
-    // A delayed run writes no digest: finish then DMs the admins only, and the family gets the next full run's digest.
+    // A delayed run writes no digest: finish then sends the ops DM only; the next full run sends the digest.
     rmSync(digestPath, { force: true });
-    if (!r.delayed) {
-      mkdirSync(dirname(digestPath), { recursive: true });
-      writeFileSync(digestPath, r.digest);
-    }
+    rmSync(opsPath, { force: true });
+    mkdirSync(dirname(digestPath), { recursive: true });
+    if (!r.delayed) writeFileSync(digestPath, r.digest);
+    if (r.ops.length) writeFileSync(opsPath, r.ops.join("\n"));
     console.log(`extract: ${r.extracted} messages; pending ${r.pending} (delayed ${r.delayed}); stt_pending ${r.sttPending}; queued for deep read ${r.queued}; changed ${r.changed.join(", ") || "nothing"}`);
     // The workflow commits and builds whenever the outputs were written, even when it fails the job for a delay.
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `completed=true\ndelayed=${r.delayed}\n`);
@@ -92,14 +96,16 @@ async function main(cmd: string | undefined) {
     const tg = new TelegramAdapter(need("TELEGRAM_BOT_TOKEN"), undefined, process.env.TELEGRAM_API_BASE || undefined);
     const live = process.env.GO_LIVE === "true";
     const alerts = await checkWebhook(tg, { live, workerUrl: process.env.WORKER_URL || undefined, now });
+    const ops = existsSync(opsPath) ? readFileSync(opsPath, "utf8").split("\n").filter(Boolean) : [];
     const r = await finish({
-      store: new Store(d1Http(cf)), tg, repo, now, digest, send, alerts, force: args.includes("--force-digest"),
+      store: new Store(d1Http(cf)), tg, repo, now, digest, send, alerts: [...ops, ...alerts], force: args.includes("--force-digest"),
       retentionDays: Number(process.env.INBOX_RETENTION_DAYS || 14),
     });
     if (digest !== null) rmSync(digestPath); // contains PHI
-    const what = !send ? "not sent (--no-digest)" : digest === null ? "MISSING (failed or delayed run: failure notice to the admins only)"
+    rmSync(opsPath, { force: true });
+    const what = !send ? "not sent (--no-digest)" : digest === null ? "MISSING (failed or delayed run: ops DM to the admins only)"
       : r.skipped ? "skipped (today's digest was already sent; dispatch with force_digest to resend)" : "sent";
-    console.log(`finish: marked done ${r.done}; digest ${what}; family chat(s) ${r.sentTo}; admin DM(s) ${r.opsTo}; pruned ${r.pruned}`);
+    console.log(`finish: marked done ${r.done}; digest ${what}; digest DM(s) ${r.sentTo}; ops DM(s) ${r.opsTo}; group posts 0; pruned ${r.pruned}`);
     console.log(`webhook: ${alerts.length ? "PROBLEM" : "ok"} (gate ${live ? "open" : "closed: no webhook expected"})`);
     for (const a of alerts) console.log(`::error::${a}`);
     if (alerts.length) process.exitCode = 1;

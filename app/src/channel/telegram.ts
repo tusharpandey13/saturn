@@ -1,5 +1,6 @@
 // Telegram Bot API: the parts the ingest Worker and the daily batch need (ADR 005).
-// Family group (members + bot; the bot is a group admin so it receives photos and voice notes).
+// Input group(s) (members + bot; the bot is a group admin so it receives photos and voice notes). The bot never posts to a
+// group (ADR 011); it writes only to admins by private chat.
 // Never log or forward Telegram file URLs: they contain the bot token.
 
 export const MAX_FILE_BYTES = 20 * 1024 * 1024; // Bot API getFile limit

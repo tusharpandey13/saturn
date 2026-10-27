@@ -92,12 +92,20 @@ export interface Symptom {
   observedAt: string;
 }
 
-/** What a photo/PDF shows, so non-reading media (medicine strips, prescriptions, reports) is acknowledged, not "retake". */
-export const MEDIA_KINDS = ["device_reading", "medicine", "prescription", "report", "other"] as const;
+/** What a photo/PDF shows; the extractor classifies every photo FIRST (ADR 011). "other" = other health content;
+ *  "non_health" = screenshots, scenery, greetings, ...: recorded as a source with no facts and no question. */
+export const MEDIA_KINDS = ["device_reading", "prescription", "medicine", "report", "other", "non_health"] as const;
 export type MediaKind = (typeof MEDIA_KINDS)[number];
+/** Health classes: unreadable health content is the only media that gets a clarification question (to the admin). */
+export const HEALTH_MEDIA_KINDS: readonly MediaKind[] = ["device_reading", "prescription", "medicine", "report", "other"];
+/** The class recorded on the message (d1.messages image_class -> KB source note/tag). */
+export const IMAGE_CLASS: Record<MediaKind, string> = {
+  device_reading: "device-reading", prescription: "prescription", medicine: "medicine-strip", report: "lab-report",
+  other: "other-health", non_health: "non-health",
+};
 
 /** Everyone is a member: each member's messages are recorded, acked and extracted into their own namespace.
- *  admin = a member plus ops privileges (ops alerts and digest failures by private DM; manages the allowlist and settings). */
+ *  admin = a member plus the only output channel (ADR 011): the digest, questions and ops alerts by private DM. */
 export const ROLES = ["member", "admin"] as const;
 export type Role = (typeof ROLES)[number];
 

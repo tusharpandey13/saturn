@@ -160,15 +160,15 @@ export class Store {
     return { inbox: inbox.results, persons: persons.results.map(rowToPerson), chats: chats.results, corrections: corrections.results };
   }
 
-  /** The batch finish's D1 work in ONE call: mark rows done, prune old done rows, read chats and persons for sending. */
-  async finishSnapshot(updateIds: number[], at: string, pruneBefore: string): Promise<{ done: number; pruned: number; persons: Person[]; chats: { chat_id: string; channel: string; label: string | null }[] }> {
-    const [done, pruned, persons, chats] = await this.many([
+  /** The batch finish's D1 work in ONE call: mark rows done, prune old done rows, read persons (the admins to DM).
+   *  No chats: the bot never posts to a group (ADR 011). */
+  async finishSnapshot(updateIds: number[], at: string, pruneBefore: string): Promise<{ done: number; pruned: number; persons: Person[] }> {
+    const [done, pruned, persons] = await this.many([
       { sql: SQL.markDone, params: [at, JSON.stringify(updateIds)] },
       { sql: SQL.prune, params: [pruneBefore] },
       { sql: SQL.persons },
-      { sql: SQL.chats },
     ]);
-    return { done: updateIds.length ? done.changes : 0, pruned: pruned.changes, persons: persons.results.map(rowToPerson), chats: chats.results };
+    return { done: updateIds.length ? done.changes : 0, pruned: pruned.changes, persons: persons.results.map(rowToPerson) };
   }
 
   // ---------- inbox (Worker side) ----------

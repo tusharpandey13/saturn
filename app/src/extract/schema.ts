@@ -14,6 +14,9 @@ const strs = (description?: string) => (description ? z.array(z.string()).descri
 
 /** The extraction contract (Zod 4). Strict: every property required (nullable where optional), no extras. */
 export const ExtractionOutput = z.strictObject({
+  media_kind: z.enum([...MEDIA_KINDS, "none"]).describe(
+    "classify FIRST: what a photo/PDF shows (device_reading, prescription, medicine strip/box, report = lab report/scan/discharge, other = other health, non_health = screenshot, scenery, greeting, anything not about health); none for text/voice",
+  ),
   readings: z.array(z.strictObject({
     type: z.enum(READING_TYPES),
     value: z.number().describe("weight kg | systolic | bpm | SpO2 % | lab value | blood sugar"),
@@ -35,7 +38,6 @@ export const ExtractionOutput = z.strictObject({
     onset_at: z.string().nullable().describe("ISO-8601 local time the symptom started, only if said (\"kal raat 2 baje\"), else null"),
     free_text: str("verbatim span supporting this record"),
   })),
-  media_kind: z.enum([...MEDIA_KINDS, "none"]).describe("what a photo/PDF shows; none for text/voice"),
   confidence: z.number().describe("0-1 overall confidence"),
   unreadable_reason: z.string().nullable(),
   subject_hint: z.string().nullable().describe(
@@ -192,6 +194,10 @@ export function parseExtraction(raw: unknown, now: string): Extraction {
   const confidence = isNum(obj.confidence) ? Math.min(1, Math.max(0, obj.confidence)) : 0;
   const unreadableReason = typeof obj.unreadable_reason === "string" ? obj.unreadable_reason : null;
   const mediaKind = MEDIA_KINDS.includes(obj.media_kind) ? (obj.media_kind as MediaKind) : null;
+  if (mediaKind === "non_health") {
+    // Not health content: recorded as a source only. No facts, no question, nothing for the deep read.
+    return { readings: [], symptoms: [], confidence, mediaKind, unreadableReason: null, subjectHint: null, rejected: [], outOfRange: [] };
+  }
   const hint = typeof obj.subject_hint === "string" ? obj.subject_hint.trim().slice(0, 80) : "";
   const subjectHint = hint && !/^(null|none|self|sender)$/i.test(hint) ? hint : null;
   return { readings, symptoms, confidence, mediaKind, unreadableReason, subjectHint, rejected, outOfRange };

@@ -16,8 +16,8 @@ Date: 2026-10-25 · Status: PROPOSED (design only; no code changed) · Builds on
 
 ## Responsibilities
 hl-service is the Saturn capture-and-records service for a home health log. It does six things:
-- **Capture.** It receives the Telegram family group (text, photos, voice, PDFs), stores every update durably, and replies with a deterministic ack and a vitals echo.
-- **Daily batch.** It moves raw data from D1 and R2 into git. It runs STT (Sarvam) and extraction (Haiku 5.5, schema-validated), rebuilds the KB, and sends the daily Hindi digest with a ❓ list and the rule annotations (unverified).
+- **Capture.** It receives the Telegram family group (text, photos, voice, PDFs) and stores every update durably. The group is input-only (ADR 011): no replies there; optional acks go only to an admin's private chat.
+- **Daily batch.** It moves raw data from D1 and R2 into git. It runs STT (Sarvam) and extraction (Haiku 5.5, schema-validated), rebuilds the KB, and DMs the daily English digest (records, pending items, questions, rule annotations, unverified) to the admins only (ADR 011).
 - **Clinical KB.** NDJSON facts with provenance live in git and are rebuilt into SQLite with validation and views (ADR 004).
 - **Document pipeline.** OCR sidecars (Apple Vision on a macOS workstation), the hard-read runbook, and `needs_deep` items.
 - **Analysis outputs.** analysis notes and doctor briefs in the records repo, written by humans or agents as git commits.
@@ -37,7 +37,7 @@ hl-service is the Saturn capture-and-records service for a home health log. It d
 | Daily batch | GitHub Actions `daily-batch.yml`, 15:37 UTC | `app/batch/run.ts`, `src/batch/*` | Three idempotent steps, `pull → extract → finish`, with commits between them |
 | Extraction | Node, inside the batch | `extract/` | **an `LlmAdapter` (default `claude-cli`: `claude -p` with `--json-schema`, Haiku 5.5; the account type is an env choice)**, plus our post-parse validation, units, ranges and time normalisation (ADR 005 amendment; no Anthropic SDK) |
 | STT | Node, inside the batch | `stt/` | **`sarvamai` SDK** behind the `SpeechToText` interface: REST for clips ≤30 s, batch job for longer ones |
-| Rules + digest | Node, inside the batch | `rules/`, `batch/digest.ts`, `replies.ts` | Fixed Hindi templates, never LLM text |
+| Rules + digest | Node, inside the batch | `rules/`, `batch/digest.ts`, `replies.ts` | Fixed English templates, never LLM text |
 | KB build | Python stdlib, inside the batch and CI | `tools/kb/build`, `schema/schema.sql` | SQLite is the validator (CHECK/FK/ranges). `kb.sqlite` is gitignored |
 | Query | workstation | `sqlite3` CLI; optionally `uvx datasette <records-dir>/data/kb.sqlite` locally | Never published |
 | OCR + hard reads | macOS (Apple Vision); later OCRmyPDF + Tesseract `hin+eng` on Actions | `tools/ocr/`, `HARD-READ.md`, `tools/doc-scan/` | Hard reads go to the agent service as `phi` jobs, or are done in a manual session |
@@ -69,7 +69,7 @@ sequenceDiagram
   X-->>GA: parsed_output → post-parse checks
   GA->>G: commit NDJSON + needs_deep.jsonl (kb build must print ok)
   GA->>S: mark committed rows done, prune >14 d
-  GA-->>TG: digest + ❓ list to family group
+  GA-->>TG: digest + questions by private DM to the admins (never the group)
   GA-)AS: submit needs_deep jobs (phi, idem = deep id), 10 s timeout
   GA->>HC: ping (or /fail)
   AS->>G: (later) deep-read facts + "done" line in needs_deep.jsonl
@@ -112,7 +112,7 @@ POST {AGENT_ROUTER_URL}/v1/jobs           Authorization: Bearer <AGENT_ROUTER_TO
 - **Dependencies:** Dependabot, weekly and grouped (`github-actions`, `npm` in `app/`, `pip` in `tools/doc-scan`). PRs run CI and auto-merge is off.
 
 ## Ops
-- **Heartbeats:** (1) the digest itself, which the family notices when it is missing; (2) a healthchecks.io ping every run, `/fail` on error, emailing the owner after 27 h of silence; (3) GitHub emails on workflow failure.
+- **Heartbeats:** (1) the admin's digest DM itself, missed when absent; (2) a healthchecks.io ping every run, `/fail` on error, emailing the owner after 27 h of silence; (3) GitHub emails on workflow failure.
 - **Logs:** counts and ids only, never content (already enforced). Workers Logs on Free keep 3 days.
 - **Spend caps:** Anthropic monthly limit $5, Sarvam training opt-out, GitHub Actions budget $0.
 - **Ops cost per week:** ~0 when healthy. Answering the ❓ list is a family task, not an ops task.
@@ -135,7 +135,7 @@ Self-hosted runner fee: postponed indefinitely (GitHub changelog 2025-12-16), an
 |---|---|---|
 | Worker or D1 down | Telegram retries for ≤24 h | `wrangler rollback`. Updates older than 24 h are lost, so fix the same day |
 | Actions cron delayed or dropped | the digest is late or missing; healthchecks alerts at 27 h | `workflow_dispatch`; rows wait in D1 (pruned only after commit) |
-| Anthropic/Sarvam down | the message counts as ⏳ pending in the digest | retried automatically next run |
+| Anthropic/Sarvam down | short ops DM to the admin ("extraction delayed"); no digest that run | retried automatically next run |
 | LLM output fails the Zod parse | that item is dropped and listed under `rejected`; the message goes to ❓ and `needs_deep` | deep read or `retry_failed` |
 | KB build rejects a row | raw and NDJSON are committed and the job fails (email) | fix the mapping or data, re-run |
 | Agent service down or unreachable | `needs_deep` grows in git; the family sees no change | drains when it is back, or from a manual workstation session |

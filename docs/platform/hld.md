@@ -19,7 +19,7 @@ Status: **PROPOSED**. It ties together [hl-service-design](hl-service-design.md)
 ## 1. System context
 | Actor / system | Role | Talks to |
 |---|---|---|
-| Family members (the people whose health is logged) | send text, voice, photos and PDFs in the Telegram family group; read the digest (Hindi templates today) | Telegram |
+| Family members (the people whose health is logged) | send text, voice, photos and PDFs in the Telegram family group; send only: the group is input-only and the bot never posts there (ADR 011); the admin reads the English digest by DM | Telegram |
 | User (the maintainer) | answers the ❓ list, reviews PRs, runs sessions from a phone or workstation | GitHub, Paseo, Tailscale, Telegram DM |
 | Doctors | receive the doctor brief as a PDF at a visit; no system access | the user |
 | **hl-service** | capture, daily batch, KB, digest, analysis docs | Telegram, CF, GitHub, the `LlmAdapter` (default `claude -p`), Sarvam (optional, deferred), healthchecks.io, agent-service (optional) |
@@ -70,7 +70,7 @@ sequenceDiagram
   X-->>B: facts with confidence
   B->>G: commit NDJSON and needs_deep, kb build ok
   B->>S: mark rows done, prune after 14 days
-  B-->>TG: digest and unclear list
+  B-->>TG: digest and questions by DM to the admin only
   B-)R: POST /v1/jobs hl.deep_read, phi, refs only
   R-->>B: 201 queued or 200 existing
   D->>R: claim phi, lease 15 min and fencing token

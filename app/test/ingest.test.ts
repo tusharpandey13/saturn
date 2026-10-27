@@ -3,7 +3,7 @@ import { parseUpdate } from "../src/channel/telegram.js";
 import { ACK, handleWebhook } from "../src/ingest.js";
 import { openSqlite } from "../src/dev/sqlite-d1.js";
 import { Store } from "../src/store.js";
-import { fakeTelegram, fixture, GROUP, ingestIO, seededStore, textUpdate, TOKEN, webhook } from "./helpers.js";
+import { dmUpdate, fakeTelegram, fixture, GROUP, ingestIO, seededStore, textUpdate, TOKEN, webhook } from "./helpers.js";
 
 const inbox = async (db: any) => (await db.prepare("SELECT * FROM inbox ORDER BY update_id").all()).results as any[];
 
@@ -34,7 +34,7 @@ describe("webhook", () => {
     expect((await handleWebhook(bad, io)).status).toBe(400);
   });
 
-  it("stores the raw update, echoes the vitals it read, and is idempotent on update_id", async () => {
+  it("stores the raw update, never replies in the group (even with ack_mode all), and is idempotent on update_id", async () => {
     const { db, store } = await seededStore();
     const t = fakeTelegram();
     const io = ingestIO(store, t.tg);
@@ -43,28 +43,39 @@ describe("webhook", () => {
     expect((await handleWebhook(webhook(u), io)).status).toBe(200); // Telegram redelivery
     const rows = await inbox(db);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ update_id: u.update_id, person_id: "alice", kind: "text", status: "new", media_status: "none", ack: "Alice: BP 120/80, pulse 72 ✓", subject_id: "alice" });
+    expect(rows[0]).toMatchObject({ update_id: u.update_id, person_id: "alice", kind: "text", status: "new", media_status: "none", ack: null, subject_id: "alice" });
     expect(JSON.parse(rows[0].raw)).toEqual(u);
-    expect(t.sent()).toHaveLength(1);
-    expect(t.sent()[0].body).toMatchObject({ chat_id: GROUP, text: "Alice: BP 120/80, pulse 72 ✓", reply_parameters: { message_id: u.message!.message_id } });
+    expect(t.calls.filter((c) => c.method === "sendMessage")).toEqual([]);
   });
 
-  it("plain text gets a short ack; an edit is marked as a correction", async () => {
-    const { store } = await seededStore();
+  it("an admin's private chat is an input chat: stored, acked there (ack_mode), an edit marked; plain English", async () => {
+    const { db, store } = await seededStore();
     const t = fakeTelegram();
-    await handleWebhook(webhook(textUpdate("aaj thoda chakkar aaya")), ingestIO(store, t.tg));
-    await handleWebhook(webhook({ update_id: 77, edited_message: { message_id: 76, date: 1792814400, edit_date: 1792814460, chat: { id: Number(GROUP) }, from: { id: 111 }, text: "wajan 61" } }), ingestIO(store, t.tg));
-    expect(t.sent().map((c) => c.body.text)).toEqual([`Alice: ${ACK.text}`, `${ACK.editPrefix}Alice: weight 61 kg ✓`]);
+    await handleWebhook(webhook(dmUpdate("120/80 72", 222)), ingestIO(store, t.tg));
+    await handleWebhook(webhook(dmUpdate("aaj thoda chakkar aaya", 222)), ingestIO(store, t.tg));
+    await handleWebhook(webhook({ update_id: 77, edited_message: { message_id: 76, date: 1792814400, edit_date: 1792814460, chat: { id: 222 }, from: { id: 222 }, text: "wajan 61" } }), ingestIO(store, t.tg));
+    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", "Carol: BP 120/80, pulse 72 ✓"], ["222", `Carol: ${ACK.text}`], ["222", `${ACK.editPrefix}Carol: weight 61 kg ✓`]]);
+    expect((await inbox(db)).map((r) => [r.chat_id, r.person_id])).toEqual([["222", "carol-tg"], ["222", "carol-tg"], ["222", "carol-tg"]]);
+    expect(t.sent().every((c) => !/[\u0900-\u097F]/.test(c.body.text))).toBe(true); // no Hindi in bot output
   });
 
-  it("copies media to R2 at ingest and acks", async () => {
+  it("a member's or a stranger's private chat is not an input chat: dropped, no reply", async () => {
+    const { db, store } = await seededStore();
+    const t = fakeTelegram();
+    await handleWebhook(webhook(dmUpdate("120/80 72", 111)), ingestIO(store, t.tg));
+    await handleWebhook(webhook(dmUpdate("hello", 999)), ingestIO(store, t.tg));
+    expect(await inbox(db)).toEqual([]);
+    expect(t.calls).toEqual([]);
+  });
+
+  it("copies media to R2 at ingest; no group reply", async () => {
     const { db, store } = await seededStore();
     const t = fakeTelegram({ large: new Uint8Array([0xff, 0xd8, 0xff]) });
     const io = ingestIO(store, t.tg);
     await handleWebhook(webhook(fixture("photo")), io);
     expect(io.r2.objects.get("telegram/u-large")).toEqual({ data: new Uint8Array([0xff, 0xd8, 0xff]), mimeType: "image/jpeg" });
     expect((await inbox(db))[0]).toMatchObject({ kind: "image", media_key: "telegram/u-large", media_status: "stored" });
-    expect(t.sent()[0].body.text).toBe(`Alice: ${ACK.image}`);
+    expect(t.sent()).toEqual([]);
   });
 
   it("a failed media copy still answers 200 and leaves media_status pending for the batch", async () => {
@@ -73,10 +84,10 @@ describe("webhook", () => {
     const res = await handleWebhook(webhook(fixture("voice")), ingestIO(store, t.tg));
     expect(res.status).toBe(200);
     expect((await inbox(db))[0]).toMatchObject({ kind: "audio", media_status: "pending" });
-    expect(t.sent()[0].body.text).toBe(`Alice: ${ACK.audio}`);
+    expect(t.sent()).toEqual([]);
   });
 
-  it("files over 20 MB are not downloaded; the sender is told", async () => {
+  it("files over 20 MB are not downloaded; nothing is posted in the group (the admin digest asks)", async () => {
     const { db, store } = await seededStore();
     const t = fakeTelegram();
     const big = fixture("document-pdf");
@@ -84,10 +95,10 @@ describe("webhook", () => {
     await handleWebhook(webhook(big), ingestIO(store, t.tg));
     expect(t.calls.some((c) => c.method === "getFile")).toBe(false);
     expect((await inbox(db))[0].media_status).toBe("too_big");
-    expect(t.sent()[0].body.text).toBe(ACK.tooBig);
+    expect(t.sent()).toEqual([]);
   });
 
-  it("ignores other chats and strangers; an admin's messages are stored and acked like any member's", async () => {
+  it("ignores other chats and strangers; an admin's group messages are stored like any member's, no reply", async () => {
     const { db, store } = await seededStore();
     const t = fakeTelegram();
     const io = ingestIO(store, t.tg);
@@ -95,7 +106,7 @@ describe("webhook", () => {
     await handleWebhook(webhook(fixture("stranger")), io);
     await handleWebhook(webhook(textUpdate("main kal aa raha hoon", 222)), io);
     expect((await inbox(db)).map((r) => r.person_id)).toEqual(["carol-tg"]);
-    expect(t.sent().map((c) => c.body.text)).toEqual([`Carol: ${ACK.text}`]);
+    expect(t.sent()).toEqual([]);
   });
 
   it("stickers and other files are stored raw but not acked", async () => {

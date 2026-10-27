@@ -48,8 +48,13 @@ Rules:
 - Oximeter: SpO2 -> type spo2, PR/pulse -> separate type pulse reading.
 - Lab reports: only potassium (mmol/L), sodium (mmol/L), creatinine (mg/dL; convert from umol/L by dividing by 88.4).
 - Blood sugar / glucometer (sugar, shugar, khoon mein cheeni), mg/dL: khali pet / fasting -> glucose_fasting; khane ke baad / PP -> glucose_pp; otherwise glucose_random.
-- media_kind: device_reading (BP monitor, oximeter, scale, glucometer), medicine (strip, box, bottle), prescription, report (lab, scan, discharge), other; none if there is no image/PDF.
+- Classify every photo/PDF FIRST (media_kind), then extract:
+  device_reading (BP monitor, oximeter, scale, glucometer), prescription, medicine (strip, box, bottle),
+  report (lab report, scan, discharge summary), other (other health content: wound, rash, swelling, hospital paper),
+  non_health (screenshot, forwarded meme, greeting, scenery, food, people, anything not about health); none if there is no image/PDF.
+  non_health: return no readings, no symptoms and unreadable_reason null; do not try to read it.
   Medicine strips and prescriptions have no readings: return empty readings, not unreadable_reason.
+  Set unreadable_reason only when the image IS health content (not non_health) but its values cannot be read.
 - Symptoms: one record per location/side/character cluster. Handle negation: "seene mein dard nahi" means absent, so emit nothing.
 - severity only if a 0-10 number was said. at_rest true only if explicitly at rest/lying/sitting.
 - onset_at: when it started, only if said ("kal raat 2 baje", "subah 6 baje", "aadha ghanta pehle"), resolved against the message time, as local time (no offset). Else null.
@@ -58,7 +63,7 @@ Rules:
   saans phoolna -> breathlessness; lete hue saans -> orthopnea; chakkar -> dizziness; sujan -> swelling; ulti/dast -> vomiting_diarrhoea.
 - subject_hint: only when the message is clearly about someone other than the sender ("Maa ka BP 120/80", "Papa ko chakkar aaya"):
   who it is about, as written ("Maa"). Else null. Still extract the values; a human decides whose they are.
-- Never diagnose, never advise. If the image is unreadable, set unreadable_reason.`;
+- Never diagnose, never advise. If a health image is unreadable, set unreadable_reason.`;
 }
 
 export const SYSTEM = systemPrompt();

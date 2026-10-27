@@ -3,11 +3,11 @@
 #   deploy/batch.sh pull    --records DIR                 D1 inbox + media -> records (raw first), commit + push
 #   deploy/batch.sh extract --records DIR [--retry-failed]  STT + LLM extraction -> KB build -> generated pages, commit
 #   deploy/batch.sh finish  --records DIR [--no-digest] [--force-digest]
-#                                                         mark inbox rows done, assert the webhook, send the digest
-#                                                         (once per IST day), commit data/telegram/digests.jsonl
-# The family digest goes out only after a fully successful run: pull and extract delete the digest file first, and
-# extract leaves it only when extraction, KB build, gen-views and the commit all succeeded. Otherwise finish DMs the
-# admins only.
+#                                                         mark inbox rows done, assert the webhook, DM the digest to
+#                                                         the admins (once per IST day), commit data/telegram/digests.jsonl
+# The bot never posts to a group (ADR 011). The admin digest goes out only after a fully successful run: pull and
+# extract delete the digest file first, and extract leaves it only when extraction, KB build, gen-views and the commit
+# all succeeded. Otherwise finish sends the short ops DM only.
 # Env per step: see app/batch/run.ts and env.manifest.yaml (secrets). Exit codes: pull/finish 3 = Cloudflare delayed
 # (429 after retries; rows stay new), extract 3 = extraction delayed
 # (what was extracted is still built and committed). Output is counts only: no message content reaches the log.
@@ -42,7 +42,7 @@ ensure_claude() {
 case "$step" in
   pull)
     # Exit 3 = delayed (Cloudflare rate limit/outage): nothing was written or marked; no commit.
-    rm -f "$DIGEST_FILE"
+    rm -f "$DIGEST_FILE" "$DIGEST_FILE.ops"
     code=0; run pull ${extra[@]+"${extra[@]}"} || code=$?
     if [ "$code" != 0 ]; then exit "$code"; fi
     commit "data: telegram raw $(stamp)" data/telegram sources ;;

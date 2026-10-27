@@ -20,7 +20,7 @@ The generic threat model, controls and credential-scoping principles for any Sat
 
 | Principal → resource | Mechanism | Scope | Blast radius if leaked | Control |
 |---|---|---|---|---|
-| Telegram → ingest Worker | `X-Telegram-Bot-Api-Secret-Token` (256-bit), constant-time compare; D1 allowlist of chats and senders | one endpoint | forged updates from allowlisted ids → false facts (integrity), no read | rotate by `setWebhook` + deploy; optional source-IP check |
+| Telegram → ingest Worker | `X-Telegram-Bot-Api-Secret-Token` (256-bit), constant-time compare; D1 allowlist of chats and senders (plus each admin's own private chat, ADR 011; the bot never posts to a group) | one endpoint | forged updates from allowlisted ids → false facts (integrity), no read | rotate by `setWebhook` + deploy; optional source-IP check |
 | Worker → D1 / R2 | bindings | one DB, one bucket | only reachable by deployed code | `preview_urls = false` (preview URLs expose the same bindings) |
 | Worker / batch → Telegram API | bot token | whole bot | `setWebhook` hijack (intercept new messages), `getFile` on known file ids, messages sent as the bot | rotate on any exposure; batch asserts the webhook URL |
 | CI deploy → Cloudflare | API token: Workers Scripts Edit, D1 Edit, Account Settings Read | account | deploy code that reads **every Worker secret and binding** | deploy job only; manual dispatch; account-owned; TTL ≤ 1 y |

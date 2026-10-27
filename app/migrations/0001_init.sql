@@ -14,7 +14,7 @@ CREATE TABLE persons (
 CREATE TABLE chats (
   chat_id     TEXT PRIMARY KEY,
   channel     TEXT NOT NULL,
-  label       TEXT,                            -- 'family' = where the daily digest goes
+  label       TEXT,                            -- free note only (ADR 011: chats are input-only; no digest target)
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

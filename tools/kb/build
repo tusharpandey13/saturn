@@ -110,6 +110,7 @@ def telegram_records(rows, root):
                 ex = _jl(r.get("extraction_json")) if r.get("extraction_json") else None
                 kind = ex.get("media_kind") if isinstance(ex, dict) else None
                 parts = [f"telegram {r['kind']}", kind and kind != "none" and f"media_kind={kind}",
+                         r.get("image_class") and f"class={r['image_class']}",
                          r.get("transcript") and f"transcript: {r['transcript'][:500]}",
                          r.get("subject_hint") and f"subject_hint: {r['subject_hint'][:80]} (attributed to the sender; human review)",
                          _reporter(r) and f"reported by {_reporter(r)} for {ns}"
@@ -122,7 +123,8 @@ def telegram_records(rows, root):
                                     **({"reported_by": _reporter(r)} if _reporter(r) else {})},
                     "recorded_by": r.get("extracted_by") or "telegram-bot",
                     "created_at": r.get("extracted_at") or r["received_at"], "status": "active",
-                    "tags": ["subject-hint"] if r.get("subject_hint") else [],
+                    "tags": (["subject-hint"] if r.get("subject_hint") else [])
+                            + (["non-health"] if r.get("image_class") == "non-health" else []),
                     "note": "; ".join(x for x in parts if x),
                 }))
         except KeyError as e:

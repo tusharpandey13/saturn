@@ -1,6 +1,6 @@
 # Saturn docs
 
-Saturn (working name) is a home health log: household members send readings, photos, voice notes and documents to a Telegram group; a small Worker stores them, a daily batch extracts structured facts into a git-based knowledge base, and a digest goes back to the group. It records and flags only; it never gives medical advice.
+Saturn (working name) is a home health log: household members send readings, photos, voice notes and documents to a Telegram group; a small Worker stores them, a daily batch extracts structured facts into a git-based knowledge base, and a daily digest goes to the admin by private DM; the group is input-only (ADR 011). It records and flags only; it never gives medical advice.
 
 This repo is the **product**: code, schema, templates, generic runbooks and synthetic fixtures. A deployment also needs an **env repo** (`<env-repo>`: concrete config, SOPS secrets, run history) and a **records repo** (`<records-repo>`: all health data). See [ADR 008](decisions/008-product-environment-pii.md).
 

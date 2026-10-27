@@ -27,6 +27,7 @@ Saturn keeps a household's health records in a separate, private **records repo*
 - **Raw inputs** in `sources/` are never edited.
 - **`records.yaml`** at the repo root declares `schema_version` (7 = ADR 007), `namespaces:` (one per person plus `family`, with display names) and `d1_person_map:` (D1 person id → namespace, where they differ; every D1 person is a `member` or `admin`, ADR 009). The product reads these; it never hard-codes people.
 - **`aliases:`** in `records.yaml` (`<ns>: [names]`) are the name prefixes that record a message for another member ("maa 116/47"). **`data/telegram/subject-overrides.ndjson`** re-attributes one Telegram update (`update_id`, `subject` ns, `set_by`, `set_at`, `reason`); append-only, the latest `set_at` wins; the batch also appends the admin's `/for` corrections here (ADR 009).
+- **Telegram output (ADR 011):** the group is input-only; the bot never posts there. The digest, questions and ops alerts go to the admins by private DM, in English. Never ask the family to retype or resend values. Photos are classified first; a non-health photo is a source with `class=non-health` (tag `non-health`) and no facts.
 
 ## 2. IDs
 
@@ -56,7 +57,7 @@ Format: `<ns>:<class>:<local>`. `ns` is one of the `namespaces` in `records.yaml
 
 The product ships the rule engine but **no clinical values**. The values that turn readings and symptoms into digest annotations live in the records repo, in `config/thresholds.yaml`, because they are clinical choices for these people and belong with their doctor.
 
-- **Absent:** the rules are disabled. The digest shows no annotations and says thresholds are not configured.
+- **Absent:** the rules are disabled. The digest shows no annotations (the batch log says thresholds are not configured).
 - **Present:** validated against the product schema (`app/src/config/thresholds.ts`: same camelCase keys, numbers where numbers are expected). Unknown keys, wrong types, duplicate keys or bad YAML stop the batch with an error naming the key (fail closed); nothing runs on half-read thresholds.
 - **Header fields:** `version`, `status` (`pending_clinician_signoff` or `signed_off`), `setBy`, `effectiveFrom` (`YYYY-MM-DD`). The digest prints the status next to every annotation.
 - **Changing values:** edit the file, bump `version`, set `setBy` and `effectiveFrom`, commit. Set `status: signed_off` only after the treating clinician has reviewed the values; until then keep `pending_clinician_signoff` and write "unverified; doctor sign-off pending" in the header comment. Cite the source of each value in a comment (guideline or doctor), and mark any value without a source `PLACEHOLDER`.

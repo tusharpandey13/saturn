@@ -97,7 +97,7 @@ sequenceDiagram
 | Worker → D1 / R2 | one inbox row per `update_id` (kind, person, `media_status=stored`); the R2 object bytes equal the fixture's SHA-256 |
 | batch pull → git | `data/telegram/raw/*.jsonl` row count; the media file in `sources/<person>/media/telegram/`, matching by hash; commit `data: telegram raw` on `run/<id>` |
 | extract → KB | NDJSON has the BP reading, the edit supersedes, voice is `stt_pending`, the PDF is in `needs_deep.jsonl`; `tools/kb/build` prints `ok:` |
-| finish → Telegram | inbox rows `done`; one digest message in the group containing the ❓ item and the voice/PDF lines; no message to any other chat |
+| finish → Telegram | inbox rows `done`; one digest DM to the admin containing the question and the voice/PDF lines; no message to the group or any other chat (ADR 011) |
 | batch → router | the job exists with `data_class=phi`, params ≤2 KB with refs only, `idempotency_key=deep:<chat>:<msg>`; a resubmit → 200 |
 | router → dispatcher | `queued → leased → done`; heartbeat seen; `used.harness=claude`; for T3, `apiKeySource: none` |
 | dispatcher → PR | a PR on the sandbox repo from `jobs/<id>`; the diff touches only `data/queue/needs_deep.jsonl` and `data/<person>/docs/`; `result_ref` = PR URL |

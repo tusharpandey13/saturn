@@ -3,7 +3,7 @@
 //   data/telegram/YYYY-MM.ndjson      extracted rows ("rt": "d1.messages|d1.readings|d1.symptoms"), read by tools/kb/build
 //   data/telegram/directory.ndjson    persons and chats ("rt": "d1.persons|d1.chats")
 //   data/queue/needs_deep.jsonl       work for the offline Opus agent (append-only)
-//   data/telegram/digests.jsonl       family digests sent (IST date, message ids): one digest per day (append-only)
+//   data/telegram/digests.jsonl       admin digests sent (IST date, message ids): one digest per day (append-only)
 //   sources/<person>/media/telegram/<file_unique_id>.<ext>   photos, PDFs, voice notes (ADR 003)
 // .jsonl files are deliberately not *.ndjson: tools/kb/build only reads *.ndjson.
 // Months are Asia/Kolkata calendar months of the message's send time. Output is sorted and stable: re-running on
@@ -67,7 +67,7 @@ export function dayOf(iso: string): string {
   return new Date(Date.parse(iso) + 330 * 60_000).toISOString().slice(0, 10);
 }
 
-/** data/telegram/digests.jsonl: one row per family digest sent. message_ids are the family-chat Telegram message ids. */
+/** data/telegram/digests.jsonl: one row per admin digest sent. message_ids are the admin-DM Telegram message ids. */
 export interface DigestSent {
   date: string;
   message_ids: number[];

@@ -40,6 +40,15 @@ describe("parseExtraction", () => {
     expect(ex.readings[2].measuredAt).toBe(NOW);
   });
 
+  it("classifies photos first: non_health drops any values and the unreadable reason (source only, no question)", () => {
+    const ex = parseExtraction(fx("non-health-screenshot"), NOW);
+    expect(ex).toMatchObject({ mediaKind: "non_health", readings: [], symptoms: [], unreadableReason: null, rejected: [], outOfRange: [] });
+    const blurry = parseExtraction(fx("blurry-bp-monitor"), NOW);
+    expect(blurry).toMatchObject({ mediaKind: "device_reading", readings: [], unreadableReason: "display blurred" });
+    expect(EXTRACTION_SCHEMA.required[0]).toBe("media_kind"); // the model classifies before it extracts
+    expect((EXTRACTION_SCHEMA.properties.media_kind as { enum: string[] }).enum).toContain("non_health");
+  });
+
   it("reports unreadable images and invalid JSON without throwing", () => {
     expect(parseExtraction(fx("unreadable"), NOW).unreadableReason).toBe("glare covers the display");
     const bad = parseExtraction("{not json", NOW);

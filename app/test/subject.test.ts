@@ -14,7 +14,7 @@ import { aliasesFromRecords, parseForCommand, resolveName, splitSubject } from "
 import { oneByOne } from "../../adapters/llm/claude-cli.js";
 import type { Person } from "../src/types.js";
 import worker from "../src/worker.js";
-import { ALIASES, fakeTelegram, GROUP, ingestIO, seededStore, textUpdate, webhook } from "./helpers.js";
+import { ALIASES, dmUpdate, fakeTelegram, GROUP, ingestIO, seededStore, textUpdate, webhook } from "./helpers.js";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const EXAMPLE = join(ROOT, "fixtures", "records-example");
@@ -64,12 +64,20 @@ describe("splitSubject / parseForCommand", () => {
 });
 
 describe("ingest: subject and ack mode", () => {
-  it("a name prefix sets subject_id (the sender stays person_id); the echo names who it was logged for", async () => {
+  it("a name prefix sets subject_id (the sender stays person_id); group: no echo even with ack_mode all", async () => {
     const { db, store } = await seededStore();
     const t = fakeTelegram();
     await handleWebhook(webhook(textUpdate("ali 116/47", 333)), ingestIO(store, t.tg));
-    expect((await inbox(db))[0]).toMatchObject({ person_id: "bob", subject_id: "alice", ack: "Alice: BP 116/47 ✓", ack_message_id: 1 });
-    expect(t.sent().map((c) => c.body.text)).toEqual(["Alice: BP 116/47 ✓"]);
+    expect((await inbox(db))[0]).toMatchObject({ person_id: "bob", subject_id: "alice", ack: null, ack_message_id: null });
+    expect(t.sent()).toEqual([]);
+  });
+
+  it("an admin's private chat: the prefix echo names who it was logged for", async () => {
+    const { db, store } = await seededStore();
+    const t = fakeTelegram();
+    await handleWebhook(webhook(dmUpdate("ali 116/47", 222)), ingestIO(store, t.tg));
+    expect((await inbox(db))[0]).toMatchObject({ person_id: "carol-tg", subject_id: "alice", ack: "Alice: BP 116/47 ✓", ack_message_id: 1 });
+    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", "Alice: BP 116/47 ✓"]]);
   });
 
   it("ack off: no outbound message at all (vitals, text, media, too big); attribution still recorded", async () => {
@@ -85,13 +93,14 @@ describe("ingest: subject and ack mode", () => {
     expect(rows.find((r) => r.update_id === 4998).media_status).toBe("stored");
   });
 
-  it("vitals-only: the vitals echo, nothing else", async () => {
+  it("vitals-only (admin private chat): the vitals echo, nothing else; the group still gets nothing", async () => {
     const { store } = await seededStore();
     const t = fakeTelegram();
     const io = ingestIO(store, t.tg, undefined, "vitals-only");
-    await handleWebhook(webhook(textUpdate("aaj chakkar aaya")), io);
+    await handleWebhook(webhook(dmUpdate("aaj chakkar aaya", 222)), io);
+    await handleWebhook(webhook(dmUpdate("120/80 72", 222)), io);
     await handleWebhook(webhook(textUpdate("120/80 72")), io);
-    expect(t.sent().map((c) => c.body.text)).toEqual(["Alice: BP 120/80, pulse 72 ✓"]);
+    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", "Carol: BP 120/80, pulse 72 ✓"]]);
   });
 });
 
@@ -129,13 +138,15 @@ describe("ingest: the admin's /for correction", () => {
     expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", ACK.forDone("Alice")]]); // private DM, not the group
   });
 
-  it("ack on: replying to the bot's echo works too", async () => {
+  it("ack all: still no echo in the group; /for on the original works and replies by DM only", async () => {
     const { db, store } = await seededStore();
     const t = fakeTelegram();
     const io = ingestIO(store, t.tg);
-    await handleWebhook(webhook(textUpdate("116/47", 333)), io);
-    await handleWebhook(webhook(reply("/for alice", 222, 1)), io); // 1 = the echo's message id (fake Telegram)
+    const orig = textUpdate("116/47", 333);
+    await handleWebhook(webhook(orig), io);
+    await handleWebhook(webhook(reply("/for alice", 222, orig.message!.message_id)), io);
     expect((await inbox(db))[0]).toMatchObject({ person_id: "bob", subject_id: "alice" });
+    expect(t.sent().map((c) => String(c.body.chat_id))).toEqual(["222"]);
   });
 
   it("a member's /for is dropped silently; an unknown name or no reply target gets a DM to the admin", async () => {
@@ -178,7 +189,7 @@ describe("batch: subject namespace, sender provenance, overrides", () => {
     const rows = repo.kbRows();
     expect(rows.find((x) => x.id === key)).toMatchObject({ person_id: "alice", sender_person_id: "bob", subject_source: "prefix", extraction_status: "ok" });
     expect(rows.find((x) => x.rt === "d1.readings")).toMatchObject({ person_id: "alice", type: "bp", value: 116, value2: 47, extracted_by: "vitals-parser" });
-    expect(r.digest).toContain("👤 Alice");
+    expect(r.digest).toContain("\nAlice\n");
     expect(r.digest).toContain(`BP 116/47${VIA("Bob", "Alice")}`);
     expect(r.digest).toContain(FOR_HINT);
     const db = kb();
@@ -248,7 +259,7 @@ describe("batch: subject namespace, sender provenance, overrides", () => {
     const r = await run(repo);
     const last = repo.kbRows().filter((x) => x.rt === "d1.messages").at(-1)!;
     expect(last).toMatchObject({ person_id: "bob", subject_hint: "Alice" });
-    expect(r.digest).toContain('"Alice" के बारे में');
+    expect(r.digest).toContain('may be about "Alice"');
     expect(repo.queue().at(-1)).toMatchObject({ reasons: ["subject_hint"], person_id: "bob" });
   });
 });

@@ -3,7 +3,7 @@ title: Platform how-tos
 audience: engineer, agent
 type: how-to
 owner: maintainer
-last_reviewed: 2026-10-26
+last_reviewed: 2026-10-27
 review_every: 90d
 status: current
 sources: [docs/platform/deploy.md, tools/kb/README.md, tools/ocr/HARD-READ.md]
@@ -20,6 +20,7 @@ The step-by-step guides live next to the code they drive. This page links to the
 | Roll back a deploy | [deploy.md](../deploy.md), "Roll back" | the previous version serves `/health` |
 | Rotate the Telegram bot token | [deploy.md](../deploy.md), "Telegram bot token rotation" | the old token is revoked and the new secret is set |
 | Review all tokens and their blast radius | [security.md](../../security.md), [token-architecture.md](../token-architecture.md) | every control in the security model is in place or accepted |
+| Receive the digest and answer questions (admin) | [ADR 011](../../decisions/011-group-input-only-admin-output.md), [app/README.md](../../../app/README.md) "Safety behaviour" | the admin has started a private chat with the bot; the daily digest arrives by DM; a reply to it (starting with the member's name) is stored; nothing is posted in the group |
 | Run the daily batch | [app/README.md](../../../app/README.md) and [ADR 005](../../decisions/005-ingest-and-batch.md) | the batch workflow run is green |
 | Build and query the KB | [tools/kb/README.md](../../../tools/kb/README.md) | `tools/kb/build --records <records-dir>` passes |
 | OCR a scan | [tools/ocr/README.md](../../../tools/ocr/README.md) | the `.ocr.md` sidecar sits next to the source file |

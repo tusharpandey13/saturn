@@ -52,7 +52,8 @@ export function memR2() {
 export async function seededStore() {
   const db = openSqlite();
   const store = new Store(db);
-  await store.addChat(GROUP, "telegram", "family");
+  // The label is a free note (ADR 011: no digest semantics); production relabelled its group 'members-silent'.
+  await store.addChat(GROUP, "telegram", "members-silent");
   await store.addPerson({ id: "alice", name: "Alice", role: "member", senderId: "111" });
   await store.addPerson({ id: "bob", name: "Bob", role: "member", senderId: "333" });
   // An admin is a member too. D1 id differs from the KB namespace (records d1_person_map: carol-tg -> carol).
@@ -83,4 +84,10 @@ let nextId = 5000;
 export function textUpdate(text: string, from = 111, extra: Record<string, unknown> = {}, date = 1792814400): TgUpdate {
   const id = nextId++;
   return { update_id: id, message: { message_id: id, date, chat: { id: Number(GROUP) }, from: { id: from, is_bot: false }, text, ...extra } } as TgUpdate;
+}
+
+/** A message in the sender's private chat with the bot (Telegram: private chat id = user id). */
+export function dmUpdate(text: string, from = 222, extra: Record<string, unknown> = {}, date = 1792814400): TgUpdate {
+  const id = nextId++;
+  return { update_id: id, message: { message_id: id, date, chat: { id: from }, from: { id: from, is_bot: false }, text, ...extra } } as TgUpdate;
 }

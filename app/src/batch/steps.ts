@@ -1,8 +1,9 @@
 // Daily batch (ADR 005), three idempotent steps. The workflow commits between them:
 //   pull     D1 inbox (status new) + media (R2, or Telegram by file_id) -> data/telegram/raw/ + sources/   [commit]
 //   extract  raw rows not yet extracted -> STT (optional) / vitals parser / Haiku via claude -p -> data/telegram/*.ndjson,
-//            needs_deep queue, digest text                                                               [build, commit]
-//   finish   mark the committed and processed inbox rows done, send the digest, prune old done rows
+//            needs_deep queue, digest text + ops lines                                                   [build, commit]
+//   finish   mark the committed and processed inbox rows done, DM the digest and ops lines to the admins, prune
+// The bot never posts to a group chat (ADR 011): groups are input-only; the admins are the only output channel.
 // Re-running any step on the same input is safe: raw rows are keyed by update_id, extracted rows by message id
 // (chat:message), the queue by message id, and inbox updates only touch rows still 'new'.
 
@@ -11,13 +12,16 @@ import { parseUpdate, type ParsedMessage, type TelegramAdapter } from "../channe
 import type { ThresholdsConfig } from "../config/thresholds.js";
 import { type ExtractInput, type Extractor, ExtractorStopError } from "../extract/adapter.js";
 import { type Extraction, parseExtraction } from "../extract/schema.js";
-import { readingHi } from "../replies.js";
+import { readingEn } from "../replies.js";
 import { evaluate } from "../rules/engine.js";
 import type { Store } from "../store.js";
 import { SARVAM_REST_MAX_SEC, SttJobFailedError } from "../../../adapters/stt/sarvam.js";
-import type { Media, Person, Reading, SpeechToText, Symptom, Transcript } from "../types.js";
+import { HEALTH_MEDIA_KINDS, IMAGE_CLASS, type Media, type Person, type Reading, type SpeechToText, type Symptom, type Transcript } from "../types.js";
 import { parseVitals } from "../vitals.js";
 import { buildDigest, type DigestEntry, STT_PENDING_NOTE } from "./digest.js";
+
+/** Ops line (admin DM only): extraction or STT failed for some messages (auth, usage limit, outage). */
+export const DELAYED_OPS = (n: number) => `extraction delayed for ${n} message(s) (auth, usage limit or outage); all kept, retried next run. Check the batch log.`;
 import { dayOf, MIME_OF_EXT, type RawRow, Repo, type Row, type SubjectOverride } from "./repo.js";
 import { type Alias, displayOf, splitSubject } from "../subject.js";
 
@@ -114,7 +118,7 @@ export interface ExtractDeps {
   sttTimeoutMs?: number;
   /** Re-try messages whose extraction failed permanently before. */
   retryFailed?: boolean;
-  /** Operator warnings for the digest (e.g. Claude token expiry). */
+  /** Operator warnings (e.g. Claude token expiry): ops lines for the admin DM, never in the digest. */
   warnings?: string[];
   /** records.yaml aliases (keyed by D1 person id): name prefixes for rows the Worker did not attribute (pre-v0.3.0). */
   aliases?: Alias[];
@@ -143,6 +147,8 @@ export interface ExtractResult {
   queued: number;
   changed: string[];
   digest: string;
+  /** Short, actionable ops lines for a separate admin DM (warnings, delays). Empty = nothing to say. */
+  ops: string[];
 }
 
 /** A failure the next run may not repeat (network, auth, 429, 5xx, timeouts, CLI crash). */
@@ -191,6 +197,8 @@ type Base = {
   received_at: string; external_id: string; edit_date: number; transcript: string | null; transcript_language: string | null;
   transcript_confidence: number | null; extraction_json: string | null; extracted_by: string | null; extracted_at: string;
   extraction_status: string; confidence: number | null;
+  /** Photo/PDF class (IMAGE_CLASS: device-reading ... non-health), when the extractor reported one. */
+  image_class: string | null;
   /** Who the message seems to be about when that is not the sender (extraction hint, for human review). Never reassigns. */
   subject_hint: string | null;
 };
@@ -224,7 +232,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   const nameOf = (id: string) => d.persons.get(id)?.name ?? displayOf(id, aliases) ?? id;
   for (const { raw, msg, subject } of todo) {
     const entry: DigestEntry = {
-      person: nameOf(subject.id), ts: msg.ts, snippet: snippet(msg.text), kind: msg.kind, questions: [], annotations: [], deep: null, readings: [], symptoms: [], notes: [],
+      person: nameOf(subject.id), ts: msg.ts, snippet: snippet(msg.text), kind: msg.kind, questions: [], annotations: [], deep: null, readings: [], symptoms: [], pending: [],
       ...(subject.id !== raw.person_id && { via: nameOf(raw.person_id) }),
     };
     const base: Base = {
@@ -232,13 +240,13 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       subject_set_by: subject.setBy, chat_id: msg.chatId, kind: msg.kind, media_ref: raw.media_key,
       raw_text: msg.text ?? null, received_at: msg.ts, external_id: `tg:${raw.update_id}`, edit_date: msg.editDate,
       transcript: null, transcript_language: null, transcript_confidence: null,
-      extraction_json: null, extracted_by: null, extracted_at: d.now, extraction_status: "ok", confidence: null, subject_hint: null,
+      extraction_json: null, extracted_by: null, extracted_at: d.now, extraction_status: "ok", confidence: null, subject_hint: null, image_class: null,
     };
 
     if (raw.media_key && raw.media_status === "too_big") {
       out.push({ ...base, extraction_status: "skipped", note: "file over 20 MB, not stored" });
       replaced.add(msg.key);
-      entry.questions.push("फ़ाइल 20 MB से बड़ी थी, सेव नहीं हुई — कृपया छोटी फ़ाइल या फ़ोटो भेजें");
+      entry.questions.push("file over 20 MB, not saved. Ask the sender for a smaller file or a photo.");
       entries.push(entry);
       continue;
     }
@@ -257,7 +265,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
           // Stored (raw + media are in git); transcribed by the first run that has an STT key.
           out.push({ ...base, extraction_status: "stt_pending", note: "voice note stored; transcription pending (no STT key)" });
           replaced.add(msg.key);
-          entry.notes!.push(STT_PENDING_NOTE);
+          entry.pending!.push(STT_PENDING_NOTE);
           entries.push(entry);
           items.pop();
           sttPending++;
@@ -308,7 +316,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       console.error(`update ${raw.update_id}: extraction failed (${err?.name})`);
       out.push({ ...base, extraction_status: "failed", note: `extraction failed: ${err?.name}` });
       replaced.add(msg.key);
-      entry.questions.push("यह संदेश प्रोसेस नहीं हो पाया — कृपया दोबारा भेजें या लिखकर भेजें");
+      entry.pending!.push("could not be processed; kept for a closer read");
       deep.push(deepEntry(d.now, { ...raw, subject_id: subject.id }, msg, base.transcript, ["extraction_failed"], null));
       entry.deep = "extraction_failed";
       entries.push(entry);
@@ -325,29 +333,36 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     entry.readings = ex.readings;
     entry.symptoms = ex.symptoms;
 
-    // Questions for the family (❓) and work for the offline Opus agent (needs_deep).
+    // Questions for the admin and work for the offline Opus agent (needs_deep). Never ask anyone to retype values.
     const reasons: string[] = [];
     const nothing = !ex.readings.length && !ex.symptoms.length;
+    const media = msg.kind === "image" || msg.kind === "document";
+    if (media && ex.mediaKind) base.image_class = IMAGE_CLASS[ex.mediaKind];
     const docKind = ex.mediaKind && ["prescription", "report", "medicine"].includes(ex.mediaKind) ? ex.mediaKind : null;
     if (msg.kind === "document") reasons.push("document");
     if (docKind) reasons.push(docKind);
-    if (ex.unreadableReason && !docKind) {
+    if (ex.unreadableReason && (media || msg.kind === "audio")) {
+      // Health content that could not be read: a question only when the class says it IS health (non_health never
+      // gets here: parseExtraction drops it). Unknown class: queued for the deep read, no question.
       reasons.push("unreadable");
-      entry.questions.push(msg.kind === "audio" ? "आवाज़ संदेश समझ नहीं आया — कृपया लिखकर भेजें" : "फ़ोटो साफ़ नहीं पढ़ी गई — कृपया संख्या लिखकर भेजें");
+      if (msg.kind === "audio") entry.questions.push("voice note could not be understood; kept for a closer read. Reply if you know what it says.");
+      else if (ex.mediaKind && HEALTH_MEDIA_KINDS.includes(ex.mediaKind))
+        entry.questions.push(`${IMAGE_CLASS[ex.mediaKind].replace("-", " ")} ${msg.kind === "document" ? "document" : "photo"} could not be read; kept for a closer read. Reply if you know what it shows.`);
+      else entry.pending!.push("unclear content; kept for a closer read");
     }
     if (ex.outOfRange.length || ex.rejected.length) {
       reasons.push("rejected_values");
-      const what = ex.outOfRange.map((o) => (o.type === "bp" ? `BP ${o.value}` : readingHi({ type: o.type, value: o.value, value2: null, value3: null, unit: "", measuredAt: msg.ts }))).join(", ");
-      entry.questions.push(`${what ? `"${what}"` : "एक संख्या"} सही नहीं लगती — कृपया दोबारा जाँचकर लिखें`);
+      const what = ex.outOfRange.map((o) => (o.type === "bp" ? `BP ${o.value}` : readingEn({ type: o.type, value: o.value, value2: null, value3: null, unit: "", measuredAt: msg.ts }))).join(", ");
+      entry.questions.push(`${what ? `"${what}"` : "a value"} looks implausible and was not recorded; kept for a closer read. Reply if you know the right value.`);
     }
     if (hint) {
       // Records stay with the sender (never auto-reassigned); a human checks who the message is about (admin: /for <name>).
       reasons.push("subject_hint");
-      entry.questions.push(`यह संदेश शायद "${hint.slice(0, 40)}" के बारे में है — अभी भेजने वाले (${entry.person}) के नाम दर्ज है; कृपया बताएँ किसका है`);
+      entry.questions.push(`may be about "${hint.slice(0, 40)}" but is logged for the sender (${entry.person}). Who is it for?`);
     }
     if (!nothing && ex.confidence < LOW_CONFIDENCE) {
       reasons.push("low_confidence");
-      entry.questions.push("पक्का नहीं पढ़ पाया — कृपया ऊपर लिखी संख्याएँ जाँचें");
+      entry.questions.push("read with low confidence; check the values above.");
     }
     if (reasons.length) {
       deep.push(deepEntry(d.now, { ...raw, subject_id: subject.id }, msg, base.transcript, [...new Set(reasons)], ex));
@@ -365,8 +380,9 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
 
   const changed = out.length ? d.repo.writeKb(out, replaced) : [];
   const queued = d.repo.enqueueDeep(deep);
-  const digest = buildDigest({ entries, pending, delayed, warnings: d.warnings, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status });
-  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest };
+  const digest = buildDigest({ entries, pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status });
+  const ops = [...(d.warnings ?? []), ...(delayed ? [DELAYED_OPS(delayed)] : [])];
+  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, ops };
 }
 
 async function transcribe(stt: SpeechToText, d: ExtractDeps, media: Media, durationSec: number): Promise<Transcript> {
@@ -427,19 +443,22 @@ export interface FinishDeps {
   repo: Repo;
   now: string;
   /** The digest text, or null when the run was not fully successful (pull/extract failed or delayed, KB build or
-   *  commit failed): then the family gets nothing and the admins get DIGEST_FAILED by DM. */
+   *  commit failed): then no digest, and the admins get DIGEST_FAILED in the ops DM. */
   digest: string | null;
   retentionDays: number;
   /** false: mark and prune only (manual re-runs). */
   send?: boolean;
   /** Send even if today's digest (IST day, data/telegram/digests.jsonl) was already sent (dispatch input force_digest). */
   force?: boolean;
-  /** Operator alerts (e.g. the webhook assertion): sent to the admins by private DM as ⚠ lines. */
+  /** Operator alerts (e.g. the webhook assertion) and extract ops lines: the separate short admin ops DM, ⚠ lines. */
   alerts?: string[];
 }
 
-export const DIGEST_FAILED = `⚠ ${PRODUCT_NAME}: आज की प्रोसेसिंग पूरी नहीं हुई। सभी संदेश सुरक्षित हैं; कल दोबारा कोशिश होगी।`;
+export const DIGEST_FAILED = `${PRODUCT_NAME}: today's run did not complete. All messages are kept; the next run retries. See the batch workflow log.`;
 
+/** Groups are input-only (ADR 011): everything goes to the admins by private DM (chat id = their Telegram user id;
+ *  the admin must have started a private chat with the bot). With no admin reachable nothing is posted anywhere: the
+ *  workflow log carries a warning (and the run fails for webhook alerts). Never to a group chat. */
 export async function finish(d: FinishDeps): Promise<{ done: number; pruned: number; sentTo: number; opsTo: number; skipped: boolean }> {
   // Only rows that are in git (the raw files of this checkout, which the workflow has pushed) are marked done.
   // Last ~2 months only, to keep the statement small; older rows were marked by earlier runs.
@@ -447,51 +466,46 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
   // Rows not processed yet (extraction delayed, media missing) stay 'new', so they are never pruned before they are.
   const open = unprocessedUpdateIds(d.repo);
   const ids = d.repo.rawRows().filter((r) => Date.parse(r.received_at) >= since && !open.has(r.update_id)).map((r) => r.update_id);
-  // One D1 call for the whole finish (mark, prune, the chats and persons to send to). Pruning first is safe: it only
-  // removes rows marked done more than retentionDays ago.
+  // One D1 call for the whole finish (mark, prune, the persons to DM). Pruning first is safe: it only removes rows
+  // marked done more than retentionDays ago.
   const pruneBefore = new Date(Date.parse(d.now) - d.retentionDays * DAY).toISOString();
-  const { done, pruned, persons, chats } = await d.store.finishSnapshot(ids, d.now, pruneBefore);
+  const { done, pruned, persons } = await d.store.finishSnapshot(ids, d.now, pruneBefore);
   let sentTo = 0;
   let opsTo = 0;
   let skipped = false;
   if (d.send !== false) {
-    const family = chats.filter((c) => c.label === "family");
-    // Ops lines (digest failure, webhook alerts) go to the admins by private DM (chat id = their Telegram user id; the
-    // admin must have started a private chat with the bot). The digest-failure notice never goes to the family group
-    // (the failed workflow emails the owner); webhook alerts (security) fall back to it when no admin is reachable.
-    const alerts = (d.alerts ?? []).map((a) => `⚠ ${a}`);
-    const ops = [...(d.digest === null ? [DIGEST_FAILED] : []), ...alerts];
-    if (ops.length) {
-      const text = ops.join("\n\n");
-      for (const a of persons.filter((p) => p.role === "admin")) {
+    const admins = persons.filter((p) => p.role === "admin");
+    const dm = async (text: string): Promise<{ n: number; ids: number[] }> => {
+      let n = 0;
+      const ids: number[] = [];
+      for (const a of admins) {
         try {
-          for (const part of splitMessage(text)) await d.tg.sendText(a.senderId, part);
-          opsTo++;
+          for (const part of splitMessage(text)) {
+            const id = await d.tg.sendText(a.senderId, part);
+            if (typeof id === "number") ids.push(id);
+          }
+          n++;
         } catch (err) {
-          console.error(`ops DM to an admin failed: ${(err as Error).name}`); // no ids or content in the log
+          console.error(`DM to an admin failed: ${(err as Error).name}`); // no ids or content in the log
         }
       }
-      if (!opsTo) console.log("::warning::no admin reachable by DM; the digest-failure notice was not delivered");
+      return { n, ids };
+    };
+    // 1. Ops DM (short, actionable only): digest failure, delays, warnings, webhook alerts.
+    const ops = [...(d.digest === null ? [DIGEST_FAILED] : []), ...(d.alerts ?? [])].map((a) => `⚠ ${a}`);
+    if (ops.length) {
+      opsTo = (await dm(ops.join("\n\n"))).n;
+      if (!opsTo) console.log("::warning::no admin reachable by DM; the ops notice was not delivered (see this log)");
     }
-    const fallback = opsTo ? [] : alerts;
-    // The family digest: fully successful runs only (digest !== null), at most once per IST day unless forced.
+    // 2. The digest: fully successful runs only (digest !== null), at most once per IST day unless forced.
     const day = dayOf(d.now);
     skipped = d.digest !== null && !d.force && d.repo.digestsSent().some((r) => r.date === day);
-    const familyText = [...(d.digest !== null && !skipped ? [d.digest] : []), ...fallback].join("\n\n");
-    if (familyText && family.length) {
-      const messageIds: number[] = [];
-      try {
-        for (const c of family) {
-          for (const part of splitMessage(familyText)) {
-            const id = await d.tg.sendText(c.chat_id, part);
-            if (typeof id === "number") messageIds.push(id);
-          }
-          sentTo++;
-        }
-      } finally {
-        // Logged even after a partial send, so a re-run does not post a second digest the same day.
-        if (d.digest !== null && !skipped && (sentTo || messageIds.length)) d.repo.logDigest({ date: day, message_ids: messageIds, sent_at: d.now, forced: !!d.force });
-      }
+    if (d.digest !== null && !skipped) {
+      const r = await dm(d.digest);
+      sentTo = r.n;
+      // Logged even after a partial send, so a re-run does not send a second digest the same day.
+      if (r.n || r.ids.length) d.repo.logDigest({ date: day, message_ids: r.ids, sent_at: d.now, forced: !!d.force });
+      else console.log("::warning::no admin reachable by DM; the digest was not delivered");
     }
   }
   return { done, pruned, sentTo, opsTo, skipped };

@@ -1,9 +1,9 @@
 # Saturn bot (app)
 
-Design: [ADR 005](../docs/decisions/005-ingest-and-batch.md). Two halves:
+Design: [ADR 005](../docs/decisions/005-ingest-and-batch.md), [ADR 011](../docs/decisions/011-group-input-only-admin-output.md). Two halves:
 
-- **Ingest Worker** (Cloudflare Workers Free plan, always on): Telegram webhook → secret check → allowlist (D1) → raw update into the D1 `inbox` (idempotent on `update_id`) → media copied to R2 → short deterministic ack ("BP 120/80, pulse 72 ✓"). No LLM, no queue, no alerts.
-- **Daily batch** (GitHub Actions, schedule set by the env): D1 + R2 → raw data committed to the records repo → STT adapter (optional) + LLM extraction adapter → KB NDJSON (`tools/kb/build --records <records-dir>`) → digest with a ❓ list to the family group → inbox rows marked done and pruned. Which adapters run (and on which account) is an env choice in `env.yaml`.
+- **Ingest Worker** (Cloudflare Workers Free plan, always on): Telegram webhook → secret check → allowlist (D1) → raw update into the D1 `inbox` (idempotent on `update_id`) → media copied to R2. Never replies in a group (ADR 011); an optional deterministic ack ("BP 120/80, pulse 72 ✓") goes only to an admin's private chat. No LLM, no queue, no alerts.
+- **Daily batch** (GitHub Actions, schedule set by the env): D1 + R2 → raw data committed to the records repo → STT adapter (optional) + LLM extraction adapter → KB NDJSON (`tools/kb/build --records <records-dir>`) → English digest (records, pending, questions) and a separate ops DM to the admins only → inbox rows marked done and pruned. Which adapters run (and on which account) is an env choice in `env.yaml`.
 
 ```
 src/worker.ts             Worker entry (fetch only)
@@ -18,7 +18,7 @@ src/extract/              extraction schema (Zod 4), validation and plausibility
 ../adapters/stt/          STT adapters: sarvam (REST <= 30 s, batch job for longer notes), none
 src/rules/, src/config/   red-flag rules + thresholds schema: digest annotations only. Values come from the records
                           repo's config/thresholds.yaml (validated); absent = rules disabled
-src/replies.ts            fixed Hindi labels for the digest
+src/replies.ts            fixed English labels for the admin digest (Hindi input is still understood)
 migrations/               D1 schema (persons, chats, inbox)
 ```
 
@@ -40,12 +40,13 @@ The batch against real services: `npx tsx batch/run.ts pull|extract|finish --rec
 
 ## Safety behaviour
 
-- Acks are optional (`ack_mode`: `off` default, `vitals-only`, `all`; Worker var `ACK_MODE`). When on, the ack is deterministic and names who the message was logged for ("Maa: BP 116/47 ✓"): the numbers the sender sees are parsed by code, and vitals-only messages are stored from that same parse (no LLM), so the stored values equal the echoed ones. Implausible values are echoed with "?".
+- The group is input-only (ADR 011): the Worker and the batch never post to a group chat, whatever `ack_mode` says. `chats` rows are allowlisted input chats; `label` is a free note. An admin's private chat with the bot is also an input chat (answers to digest questions); members' and strangers' private chats are dropped.
+- Acks are optional and go only to an admin's private chat (`ack_mode`: `off` default, `vitals-only`, `all`; Worker var `ACK_MODE`). When on, the ack is deterministic and names who the message was logged for ("Maa: BP 116/47 ✓"): the numbers the sender sees are parsed by code, and vitals-only messages are stored from that same parse (no LLM), so the stored values equal the echoed ones. Implausible values are echoed with "?".
 - No medical advice and no real-time alerts (ADR 005: in an emergency people phone family or emergency services directly). Rule results appear in the daily digest as annotations marked "unverified; doctor sign-off pending".
-- Roles (ADR 009): everyone in `persons` is a `member`; each member's messages are stored, acked and extracted into their own namespace. An `admin` is a member plus ops privileges: ops alerts (webhook assertion) and digest failures go to the admins by private DM (falling back to the family group when no admin is reachable), and admins manage the allowlist and settings. Unknown senders and chats are dropped.
-- Subject attribution (ADR 009): a leading name from the records' `aliases:` ("maa 116/47") records the message for that member; the sender is kept as provenance. An admin re-attributes a message by replying `/for <name>` to it; corrections land in the records' `data/telegram/subject-overrides.ndjson`, which the batch honours. The digest shows "(X ने भेजा, Y के लिए दर्ज)" for every such line.
-- Known limitation: an unprefixed message about another member (e.g. "Maa's BP 120/80" sent by her son) is attributed to the **sender**. The extractor sets `subject_hint` (who it seems to be about, as written); the batch then asks in the digest ❓ list, queues the message (`subject_hint` reason) and the KB tags its facts `subject-hint`. Nothing is reassigned automatically: a human moves the facts (KB superseding) if needed. Vitals-only texts read by the deterministic parser carry no hint.
+- Roles (ADR 009): everyone in `persons` is a `member`; each member's messages are stored, acked and extracted into their own namespace. An `admin` is a member plus the only output channel (ADR 011): the daily digest (plain English) and a separate short ops DM (run failed, extraction delayed, token expiry, webhook alerts) go to the admins by private DM; with no admin reachable nothing is posted anywhere and the workflow log carries a warning. Admins manage the allowlist and settings. Unknown senders and chats are dropped.
+- Subject attribution (ADR 009): a leading name from the records' `aliases:` ("maa 116/47") records the message for that member; the sender is kept as provenance. An admin re-attributes a message by replying `/for <name>` to it; corrections land in the records' `data/telegram/subject-overrides.ndjson`, which the batch honours. The digest shows "(sent by X, logged for Y)" for every such line.
+- Known limitation: an unprefixed message about another member (e.g. "Maa's BP 120/80" sent by her son) is attributed to the **sender**. The extractor sets `subject_hint` (who it seems to be about, as written); the batch then asks the admin in the digest questions, queues the message (`subject_hint` reason) and the KB tags its facts `subject-hint`. Nothing is reassigned automatically: a human moves the facts (KB superseding) if needed. Vitals-only texts read by the deterministic parser carry no hint.
 - Logs carry counts and error classes only: no message text, transcripts, values or Telegram file URLs (they contain the bot token).
-- Extraction validates untrusted LLM output in code (`parseExtraction`: schema, plausible ranges, units, times). Low-confidence, unreadable or rejected items go to the digest's ❓ list and to `<records-dir>/data/queue/needs_deep.jsonl` for an offline deep read.
+- Extraction validates untrusted LLM output in code (`parseExtraction`: schema, plausible ranges, units, times). Every photo is classified first (device reading, prescription, medicine strip, lab report, other health, non-health; `image_class` on the message row, `class=` in the KB source note). Non-health photos become a source only: no facts, no question. Low-confidence, rejected or unreadable **health** items go to the admin's digest questions and to `<records-dir>/data/queue/needs_deep.jsonl` for an offline deep read. Nobody is asked to retype values.
 
 Deploy: **[docs/platform/deploy.md](../docs/platform/deploy.md)**.

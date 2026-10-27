@@ -7,10 +7,10 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ANNOTATION_NOTE, STT_PENDING_NOTE, THRESHOLDS_OFF_LINE } from "../src/batch/digest.js";
+import { ANNOTATION_NOTE, EMPTY_LINE, QUESTIONS_HEAD, STT_PENDING_NOTE } from "../src/batch/digest.js";
 import { DISABLED_THRESHOLDS } from "../src/config/thresholds.js";
 import { Repo } from "../src/batch/repo.js";
-import { DIGEST_FAILED, extract, finish, isTransient, pull, splitMessage } from "../src/batch/steps.js";
+import { DELAYED_OPS, DIGEST_FAILED, extract, finish, isTransient, pull, splitMessage } from "../src/batch/steps.js";
 import { loadThresholds } from "../src/batch/records.js";
 import { ClaudeCliError, type ExtractInput, type Extractor, ExtractorStopError, oneByOne } from "../../adapters/llm/claude-cli.js";
 import { StubSpeechToText } from "../../adapters/stt/sarvam.js";
@@ -28,6 +28,13 @@ const PERSONS = new Map<string, Person>([
 ]);
 const JPEG_BP = new Uint8Array([0xff, 0xd8, 0x01]);
 const JPEG_GLUCO = new Uint8Array([0xff, 0xd8, 0x02]);
+const JPEG_SCREENSHOT = new Uint8Array([0xff, 0xd8, 0x03]); // synthetic: the mock classifies it non_health
+const JPEG_BLURRY = new Uint8Array([0xff, 0xd8, 0x04]); // synthetic: a BP monitor photo too blurred to read
+const fx = (name: string) => JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "fixtures", "app", `${name}.json`), "utf8"));
+/** Bot output is plain English (ADR 011). */
+const HINDI = /[\u0900-\u097F]/;
+/** The wording bug: nobody is ever asked to retype or resend values. */
+const RETYPE = /retype|re-type|write (the )?(numbers|values)|send (the )?(numbers|values)|लिखकर/i;
 
 /** Mocked LLM: answers by input. Records every input and every batch call. */
 class MockExtractor implements Extractor {
@@ -44,6 +51,8 @@ class MockExtractor implements Extractor {
     if (this.fail) throw this.fail;
     const none = { readings: [], symptoms: [], media_kind: "none", confidence: 0.9, unreadable_reason: null };
     if (input.media?.mimeType === "application/pdf") return { ...none, media_kind: "prescription" };
+    if (input.media && input.media.data[2] === 0x03) return fx("non-health-screenshot");
+    if (input.media && input.media.data[2] === 0x04) return fx("blurry-bp-monitor");
     if (input.media && input.media.data[2] === 0x01)
       return { ...none, media_kind: "device_reading", confidence: 0.95, readings: [{ type: "bp", value: 78, value2: 50, value3: 38, unit: "mmHg", measured_at: null }] };
     if (input.media) return { ...none, media_kind: "device_reading", confidence: 0.3, unreadable_reason: "display blurred" };
@@ -98,7 +107,7 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     const updates = [textUpdate("120/80 72", 111, {}, 1792814000), photo, voice, pdf, gluco, textUpdate("sugar 1100 khali pet", 333), textUpdate("wajan 70", 222)];
     const { db, store, r2, t, repo } = await ingestAll(updates, { large: JPEG_BP, g1: JPEG_GLUCO, voice1: new TextEncoder().encode("aaj seene mein dard hua 20 minute"), doc1: new Uint8Array([0x25, 0x50]) });
     expect(r2.objects.size).toBe(4);
-    expect(t.sent().map((c) => c.body.text)[0]).toBe("Alice: BP 120/80, pulse 72 ✓");
+    expect(t.sent()).toEqual([]); // the group is input-only: no acks even with ACK_MODE all
 
     // pull: raw first
     const p1 = await pull({ store, r2, tg: t.tg, repo });
@@ -133,24 +142,27 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
 
     // digest text
     const d = r.digest;
-    expect(d).toContain("👤 Alice");
-    expect(d).toContain("BP 120/80, पल्स 72");
-    expect(d).toContain("BP 78/50, पल्स 38");
-    expect(d).toContain("सीने में दर्द/दबाव");
-    expect(d).toContain("📄 ध्यान से पढ़ने के लिए रखे गए: Alice");
-    expect(d).toContain("❓");
-    expect(d).toContain("फ़ोटो साफ़ नहीं पढ़ी गई");
-    expect(d).toContain('"शुगर (खाली पेट) 1100 mg/dL" सही नहीं लगती');
+    expect(d).toContain("\nAlice\n");
+    expect(d).toContain("BP 120/80, pulse 72");
+    expect(d).toContain("BP 78/50, pulse 38");
+    expect(d).toContain("chest pain/pressure");
+    expect(d).toMatch(/\nPending\n• Alice \d\d:\d\d prescription: kept for a closer read/);
+    expect(d).toContain(QUESTIONS_HEAD);
+    expect(d).toContain("device reading photo could not be read; kept for a closer read");
+    expect(d).toContain('"sugar (fasting) 1100 mg/dL" looks implausible');
+    expect(d).not.toMatch(HINDI);
+    expect(d).not.toMatch(RETYPE);
+    expect(d).not.toMatch(/delayed|token|webhook/i); // no ops noise in the digest
     expect(d.indexOf("BP 120/80")).toBeLessThan(d.indexOf("BP 78/50")); // by time, not by arrival
     expect(d).toContain(ANNOTATION_NOTE);
     expect(d).toMatch(/T1 PULSE_VERY_LOW/);
-    expect(d).toContain("👤 Carol");
+    expect(d).toContain("\nCarol\n");
 
-    // finish: rows done, digest to the family group, nothing pruned yet
+    // finish: rows done, digest to the admin by private DM (never the group), nothing pruned yet
     const before = t.sent().length;
     const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: d, retentionDays: 14 });
     expect(f).toEqual({ done: 7, pruned: 0, sentTo: 1, opsTo: 0, skipped: false });
-    expect(t.sent().slice(before).map((c) => [c.body.chat_id, c.body.text])).toEqual([[GROUP, d]]);
+    expect(t.sent().slice(before).map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", d]]);
     expect((await db.prepare("SELECT count(*) AS n FROM inbox WHERE status = 'new'").first<any>()).n).toBe(0);
 
     // re-run: nothing new, no LLM calls, identical files
@@ -160,7 +172,7 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     expect(r2nd).toMatchObject({ extracted: 0, queued: 0, changed: [] });
     expect(llm.calls).toHaveLength(5);
     expect(readFileSync(join(root, "data/telegram/2026-10.ndjson"), "utf8")).toBe(snapshot);
-    expect(r2nd.digest).toContain("आज कोई नया संदेश दर्ज नहीं हुआ");
+    expect(r2nd.digest).toContain(EMPTY_LINE);
 
     // prune after the retention window
     expect((await finish({ store, tg: t.tg, repo, now: "2026-11-10T15:30:00.000Z", digest: r2nd.digest, retentionDays: 14 })).pruned).toBe(7);
@@ -170,12 +182,12 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
 describe("batch details", () => {
   const run = (repo: Repo, llm: Extractor) => extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
 
-  it("thresholds not configured: no rule annotations, the digest says so", async () => {
+  it("thresholds not configured: no rule annotations (and no ops line in the digest)", async () => {
     const { store, r2, t, repo } = await ingestAll([textUpdate("pulse 38")]);
     await pull({ store, r2, tg: t.tg, repo });
     const r = await extract({ repo, extractor: new MockExtractor(), stt: new StubSpeechToText(), thresholds: DISABLED_THRESHOLDS, persons: PERSONS, now: NOW });
-    expect(r.digest).toContain("पल्स 38"); // recorded
-    expect(r.digest).toContain(THRESHOLDS_OFF_LINE);
+    expect(r.digest).toContain("pulse 38"); // recorded
+    expect(r.digest).not.toMatch(/threshold/i);
     expect(r.digest).not.toContain(ANNOTATION_NOTE);
     expect(r.digest).not.toContain("PULSE_VERY_LOW");
   });
@@ -198,8 +210,8 @@ describe("batch details", () => {
     const { store, r2, t, repo } = await ingestAll([textUpdate("aaj chakkar aaya")]);
     await pull({ store, r2, tg: t.tg, repo });
     const r = await run(repo, new MockExtractor(Object.assign(new Error("overloaded"), { status: 529 })));
-    expect(r).toMatchObject({ extracted: 0, pending: 1, delayed: 1, queued: 0 });
-    expect(r.digest).toContain("⚠ extraction delayed: 1");
+    expect(r).toMatchObject({ extracted: 0, pending: 1, delayed: 1, queued: 0, ops: [DELAYED_OPS(1)] });
+    expect(r.digest).not.toMatch(/delayed|waiting/); // ops line only (separate admin DM), not in the digest
     const ok = new MockExtractor();
     expect((await run(repo, ok)).extracted).toBe(1);
     expect(ok.calls).toHaveLength(1);
@@ -210,9 +222,8 @@ describe("batch details", () => {
     await pull({ store, r2, tg: t.tg, repo });
     for (const err of [new ClaudeCliError(401, "auth_failed"), new ClaudeCliError(429, "rate_limited")]) {
       const r = await run(repo, new MockExtractor(err));
-      expect(r).toMatchObject({ pending: 1, delayed: 1 });
-      expect(r.digest).toContain("⚠ extraction delayed: 1");
-      if (err.status === 401) expect(r.digest).toContain("BP 120/80, पल्स 72"); // the vitals text needs no LLM
+      expect(r).toMatchObject({ pending: 1, delayed: 1, ops: [DELAYED_OPS(1)] });
+      if (err.status === 401) expect(r.digest).toContain("BP 120/80, pulse 72"); // the vitals text needs no LLM
       expect((await finish({ store, tg: t.tg, repo, now: NOW, digest: r.digest, retentionDays: 14 })).done).toBeLessThanOrEqual(1);
       const open = await db.prepare("SELECT count(*) AS n FROM inbox WHERE status = 'new'").first<any>();
       expect(open.n).toBe(1);
@@ -257,7 +268,7 @@ describe("batch details", () => {
     const r = await run(repo, new MockExtractor(new ExtractorStopError("refusal")));
     expect(r).toMatchObject({ extracted: 1, queued: 1 });
     expect(ndjson(repo)[0]).toMatchObject({ extraction_status: "failed" });
-    expect(r.digest).toContain("प्रोसेस नहीं हो पाया");
+    expect(r.digest).toContain("could not be processed; kept for a closer read");
     const again = new MockExtractor();
     await run(repo, again);
     expect(again.calls).toHaveLength(0);
@@ -271,13 +282,13 @@ describe("batch details", () => {
     expect(readFileSync(join(root, "sources/alice/media/telegram/u-voice1.ogg"), "utf8")).toBe("wajan 60");
   });
 
-  it("no digest file (extract failed): the failure notice goes to the admins by private DM, not the family group", async () => {
+  it("no digest file (extract failed): the failure notice goes to the admins by private DM, not the group", async () => {
     const { store, t, repo } = await ingestAll([]);
     expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 })).toMatchObject({ sentTo: 0, opsTo: 1 });
-    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", DIGEST_FAILED]]);
+    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", `⚠ ${DIGEST_FAILED}`]]);
   });
 
-  it("no admin reachable (DM fails): the failure notice is NOT posted to the family group", async () => {
+  it("no admin reachable (DM fails): nothing is posted to the group", async () => {
     const { store, repo } = await ingestAll([]);
     const t = fakeTelegram({}, { failSendTo: "222" });
     expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 })).toMatchObject({ sentTo: 0, opsTo: 0 });
@@ -285,25 +296,25 @@ describe("batch details", () => {
     expect(repo.digestsSent()).toEqual([]);
   });
 
-  it("failed or delayed run (27-Oct regression): admin DM only, no family digest, nothing logged", async () => {
+  it("failed or delayed run (27-Oct regression): short ops DM to the admin only, no digest, nothing logged", async () => {
     const { store, r2, t, repo } = await ingestAll([textUpdate("aaj chakkar aaya")]);
     await pull({ store, r2, tg: t.tg, repo });
     const r = await run(repo, new MockExtractor(new ClaudeCliError(401, "auth_failed")));
     expect(r.delayed).toBe(1); // batch/run.ts writes no digest file for a delayed run, so finish gets null
     const before = t.sent().length;
-    const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: null, alerts: ["webhook moved"], retentionDays: 14 });
+    const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: null, alerts: [...r.ops, "webhook moved"], retentionDays: 14 });
     expect(f).toMatchObject({ sentTo: 0, opsTo: 1, skipped: false });
     const sent = t.sent().slice(before).map((c) => [String(c.body.chat_id), c.body.text]);
-    expect(sent).toEqual([["222", `${DIGEST_FAILED}\n\n⚠ webhook moved`]]);
+    expect(sent).toEqual([["222", `⚠ ${DIGEST_FAILED}\n\n⚠ ${DELAYED_OPS(1)}\n\n⚠ webhook moved`]]);
     expect(sent.some(([chat]) => chat === String(GROUP))).toBe(false);
     expect(repo.digestsSent()).toEqual([]);
     // A full run later the same day still sends that day's one digest.
     expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: "ok", retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
   });
 
-  it("one family digest per IST day: a second run is skipped, force_digest resends, the next day sends", async () => {
+  it("one admin digest per IST day: a second run is skipped, force_digest resends, the next day sends", async () => {
     const { store, t, repo } = await ingestAll([]);
-    const group = () => t.sent().filter((c) => c.ok && String(c.body.chat_id) === String(GROUP)).length;
+    const group = () => t.sent().filter((c) => c.ok && String(c.body.chat_id) === "222").length;
     expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: "d1", retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
     expect(repo.digestsSent()).toEqual([{ date: "2026-10-25", message_ids: [1], sent_at: NOW, forced: false }]);
     // 23:59 IST the same day (18:29Z): skipped, admins not bothered, no new log row
@@ -317,6 +328,7 @@ describe("batch details", () => {
     expect(await finish({ store, tg: t.tg, repo, now: "2026-10-25T18:31:00.000Z", digest: "d4", retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
     expect(repo.digestsSent().at(-1)).toMatchObject({ date: "2026-10-26", forced: false });
     expect(group()).toBe(3);
+    expect(t.sent().some((c) => String(c.body.chat_id) === String(GROUP))).toBe(false);
     // the log is a .jsonl: tools/kb/build (reads *.ndjson) never sees it
     expect(readFileSync(join(root, "data/telegram/digests.jsonl"), "utf8").trim().split("\n")).toHaveLength(3);
   });
@@ -331,11 +343,35 @@ describe("batch details", () => {
     expect(rows.find((x) => x.id === key)).toMatchObject({ rt: "d1.messages", person_id: "carol-tg", subject_hint: "Maa" });
     expect(rows.find((x) => x.rt === "d1.readings")).toMatchObject({ person_id: "carol-tg", type: "bp", value: 130 }); // never auto-reassigned
     expect(repo.queue().map((e) => [e.message_id, e.reasons])).toEqual([[key, ["subject_hint"]]]);
-    expect(r.digest).toMatch(/Carol .*"Maa" के बारे में .*\(Carol\)/);
+    expect(r.digest).toMatch(/Carol .*may be about "Maa" but is logged for the sender \(Carol\)/);
     expect(kbBuild()).toMatch(/^ok:/);
     const kb = new DatabaseSync(join(root, "kb.sqlite"));
     const tags = kb.prepare("SELECT ns, tags FROM fact WHERE id LIKE '%tg.%'").all() as { ns: string; tags: string }[];
     expect(tags).toEqual([{ ns: "carol", tags: JSON.stringify(["subject-hint"]) }]);
+    kb.close();
+  });
+
+  it("photos are classified first: non-health = source only (no facts, no question); health but blurry = one admin question", async () => {
+    const img = (id: number, from: number, file: string) => ({ update_id: id, message: { message_id: id, date: 1792814460, chat: { id: Number(GROUP) }, from: { id: from }, photo: [{ file_id: file, file_unique_id: `u-${file}`, width: 900, height: 1200, file_size: 5000 }] } });
+    const { store, r2, t, repo } = await ingestAll([img(3001, 111, "shot"), img(3002, 333, "blur"), textUpdate("good morning")], { shot: JPEG_SCREENSHOT, blur: JPEG_BLURRY });
+    await pull({ store, r2, tg: t.tg, repo });
+    const r = await run(repo, new MockExtractor());
+    const rows = ndjson(repo);
+    expect(rows.find((x) => x.id === `${GROUP}:3001`)).toMatchObject({ rt: "d1.messages", kind: "image", image_class: "non-health", extraction_status: "ok" });
+    expect(rows.find((x) => x.id === `${GROUP}:3002`)).toMatchObject({ rt: "d1.messages", kind: "image", image_class: "device-reading" });
+    expect(rows.filter((x) => x.rt !== "d1.messages")).toEqual([]); // no facts: the screenshot's "BP 120/80" is not recorded
+    expect(repo.queue().map((e) => [e.message_id, e.reasons])).toEqual([[`${GROUP}:3002`, ["unreadable"]]]);
+    const q = r.digest.split("\n").filter((l) => /^\d+\. /.test(l));
+    expect(q).toEqual([expect.stringMatching(/^1\. Bob \d\d:\d\d photo: device reading photo could not be read; kept for a closer read\. Reply if you know what it shows\.$/)]);
+    expect(r.digest).not.toMatch(/Alice/); // the screenshot and the chit-chat text leave no trace in the digest
+    expect(r.digest).not.toMatch(RETYPE);
+    expect(r.digest).not.toMatch(HINDI);
+    expect(kbBuild()).toMatch(/^ok:/);
+    const kb = new DatabaseSync(join(root, "kb.sqlite"));
+    const src = kb.prepare("SELECT note, tags FROM source WHERE note LIKE '%class=non-health%'").all() as { note: string; tags: string }[];
+    expect(src).toHaveLength(1);
+    expect(JSON.parse(src[0].tags)).toContain("non-health");
+    expect(kb.prepare("SELECT count(*) AS n FROM fact WHERE id LIKE '%tg.%'").get()).toEqual({ n: 0 });
     kb.close();
   });
 

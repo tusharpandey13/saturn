@@ -102,7 +102,7 @@ describe("cloudflare 429 handling", () => {
 describe("one D1 call per batch step", () => {
   it("pullSnapshot sends the alias sync and all four reads as ONE /query batch", async () => {
     const r = (results: unknown[] = []) => ({ results, meta: { changes: 0 } });
-    const { calls, cfg } = scripted([() => ok([r(), r(), r([{ update_id: 1 }]), r([{ id: "p1", name: "A", role: "admin", sender_id: "9" }]), r([{ chat_id: "c", channel: "telegram", label: "family" }]), r()])]);
+    const { calls, cfg } = scripted([() => ok([r(), r(), r([{ update_id: 1 }]), r([{ id: "p1", name: "A", role: "admin", sender_id: "9" }]), r([{ chat_id: "c", channel: "telegram", label: "members-silent" }]), r()])]);
     const snap = await new Store(d1Http(cfg)).pullSnapshot([{ alias: "Maa", personId: "p1", display: "Maa" }]);
     expect(calls).toHaveLength(1);
     expect(calls[0].body.batch).toHaveLength(6);
@@ -111,9 +111,10 @@ describe("one D1 call per batch step", () => {
     expect(snap.chats).toHaveLength(1);
   });
   it("finishSnapshot marks, prunes and reads in ONE call", async () => {
-    const { calls, cfg } = scripted([() => ok([{ results: [], meta: { changes: 3 } }, { results: [], meta: { changes: 1 } }, { results: [], meta: {} }, { results: [], meta: {} }])]);
+    const { calls, cfg } = scripted([() => ok([{ results: [], meta: { changes: 3 } }, { results: [], meta: { changes: 1 } }, { results: [], meta: {} }])]);
     const snap = await new Store(d1Http(cfg)).finishSnapshot([1, 2, 3], "2026-10-27T00:00:00Z", "2026-10-13T00:00:00Z");
     expect(calls).toHaveLength(1);
-    expect(snap).toEqual({ done: 3, pruned: 1, persons: [], chats: [] });
+    expect(snap).toEqual({ done: 3, pruned: 1, persons: [] });
+    expect(calls[0].body.batch.map((q: { sql: string }) => q.sql).join(" ")).not.toMatch(/FROM chats/); // no group to post to
   });
 });

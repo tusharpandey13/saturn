@@ -1,6 +1,6 @@
 # 005 — Ingest-only Worker (Free plan) + daily batch
 
-Date: 2026-10-25 · Status: **ACCEPTED** (decisions by the user, 2026-10-25) · Supersedes: the real-time bot parts of 001 (inline confirm buttons, immediate alerts; the channel choice stands) and ADR 004's "Telegram ↔ git sync" section (the 3-hourly D1 export). · Related: 003 (media in git), 004 (data model, unchanged), [cost and infra research](../research/cost-and-infra-2026-10.md).
+Date: 2026-10-25 · Status: **ACCEPTED** (decisions by the user, 2026-10-25); digest and reply channel **amended by [011](011-group-input-only-admin-output.md)** (group input-only, admin DM only) · Supersedes: the real-time bot parts of 001 (inline confirm buttons, immediate alerts; the channel choice stands) and ADR 004's "Telegram ↔ git sync" section (the 3-hourly D1 export). · Related: 003 (media in git), 004 (data model, unchanged), [cost and infra research](../research/cost-and-infra-2026-10.md).
 
 ## Context
 The app was built for real time: a queue consumer doing STT and extraction per message, confirm buttons in the family's language, immediate Tier 1/2 alerts, an outbox, a reminder cron and a dead-letter path. That needs Workers Paid ($5/mo, 62–94% of the bill) because of the 10 ms CPU limit, and it is the most complex part of the repo.

@@ -1,6 +1,6 @@
 # 009 — Everyone is a member; admin adds ops privileges; subject attribution; acks off by default
 
-Date: 2026-10-27 · Status: **ACCEPTED** (2026-10-27, owner decision) · Related: 005 (ingest and batch), 008 · Implemented in v0.3.0 (`app/migrations/0002_member_admin_roles.sql`, `0003_inbox_subject.sql`)
+Date: 2026-10-27 · Status: **ACCEPTED** (2026-10-27, owner decision); **amended by [011](011-group-input-only-admin-output.md)** (group input-only, no group fallback, English admin-only digest) · Related: 005 (ingest and batch), 008 · Implemented in v0.3.0 (`app/migrations/0002_member_admin_roles.sql`, `0003_inbox_subject.sql`)
 
 ## Context
 `persons.role` was `patient` or `caregiver`. A caregiver's messages were stored raw but never acked or extracted, so

@@ -7,7 +7,9 @@
 Saturn is a self-hosted **home health log** for a household. Family members send blood-pressure photos, oximeter
 readings, lab reports, prescriptions and voice notes (Hindi, Hinglish or English) to a private Telegram group. A
 small Cloudflare Worker stores each message; a daily batch transcribes and extracts structured facts into a
-git-based knowledge base; generated pages and a digest go back to the family.
+git-based knowledge base and generated pages. **The group is input-only: the bot never posts there**
+([ADR 011](docs/decisions/011-group-input-only-admin-output.md)). The daily digest, clarification questions and ops
+alerts go only to the household's admin(s), by private Telegram DM, in plain English.
 
 **Saturn records and flags. It is not medical advice and not a medical device.** It never diagnoses and never
 suggests starting, stopping or changing a medicine; concerns are phrased as questions for the treating doctor.
@@ -22,7 +24,7 @@ Telegram group ──webhook──▶ Worker (app/src/worker.ts) ──▶ D1 in
                         extract ─▶ STT adapter (adapters/stt) + LLM adapter (adapters/llm), Zod-validated
                         KB build ─▶ tools/kb/build: validate data/**/*.ndjson, build kb.sqlite (schema/)
                         pages ─▶ tools/kb/gen-views: generated blocks in docs/health/<ns>/*.md
-                        finish ─▶ digest to the group, inbox rows marked done
+                        finish ─▶ digest + ops DM to the admins (never the group), inbox rows marked done
 ```
 
 - **Knowledge base** ([ADR 007](docs/decisions/007-simplified-clinical-data-model.md)): three concepts, `source`

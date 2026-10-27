@@ -18,6 +18,7 @@ Architecture decision records (ADRs). Each file is one decision: the context, wh
 | [008-product-environment-pii.md](008-product-environment-pii.md) | Split into product (public-ready), environment and PII units joined by `env.manifest.yaml`, `product.lock` and `records.yaml`. | Accepted 2026-10-26 | engineer, maintainer |
 | [009-member-admin-roles.md](009-member-admin-roles.md) | Everyone is a `member` (extracted into their own namespace); `admin` adds ops DMs and allowlist/settings. `subject_hint` flags messages about another member. | Accepted 2026-10-27 | engineer, maintainer |
 | [010-life-context-signals.md](010-life-context-signals.md) | Closed-vocabulary life-context signals (stress, travel, fasting, ...) from group chat as `event` facts with `data.type = context`; per-member consent, `/private`, summaries only, association-only timeline overlay, capped Haiku cost. | Proposed 2026-10-27 | engineer, maintainer |
+| [011-group-input-only-admin-output.md](011-group-input-only-admin-output.md) | The group is input-only (the bot never posts there); the admins are the only output channel: English digest + questions + ops by private DM. Photos are classified first; non-health photos are sources only. | Accepted 2026-10-27 (v0.4.0); amends 005, 009 | engineer, maintainer |
 
 ## Reading order
 
