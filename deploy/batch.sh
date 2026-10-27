@@ -3,7 +3,8 @@
 #   deploy/batch.sh pull    --records DIR                 D1 inbox + media -> records (raw first), commit + push
 #   deploy/batch.sh extract --records DIR [--retry-failed]  STT + LLM extraction -> KB build -> generated pages, commit
 #   deploy/batch.sh finish  --records DIR [--no-digest]   mark inbox rows done, assert the webhook, send the digest
-# Env per step: see app/batch/run.ts and env.manifest.yaml (secrets). Exit codes: extract 3 = extraction delayed
+# Env per step: see app/batch/run.ts and env.manifest.yaml (secrets). Exit codes: pull/finish 3 = Cloudflare delayed
+# (429 after retries; rows stay new), extract 3 = extraction delayed
 # (what was extracted is still built and committed). Output is counts only: no message content reaches the log.
 set -euo pipefail
 PRODUCT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,7 +23,9 @@ stamp() { date -u +%Y-%m-%dT%H:%MZ; }
 
 case "$step" in
   pull)
-    run pull ${extra[@]+"${extra[@]}"}
+    # Exit 3 = delayed (Cloudflare rate limit/outage): nothing was written or marked; no commit.
+    code=0; run pull ${extra[@]+"${extra[@]}"} || code=$?
+    if [ "$code" != 0 ]; then exit "$code"; fi
     commit "data: telegram raw $(stamp)" data/telegram sources ;;
   extract)
     code=0; run extract ${extra[@]+"${extra[@]}"} || code=$?

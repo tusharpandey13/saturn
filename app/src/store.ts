@@ -12,6 +12,8 @@ export interface Stmt {
 }
 export interface Db {
   prepare(sql: string): Stmt;
+  /** Several statements in one round trip (the D1 REST client). Absent: Store runs them one by one. */
+  batch?(qs: { sql: string; params?: unknown[] }[]): Promise<{ results: any[]; meta: { changes: number } }[]>;
 }
 
 export type InboxKind = "text" | "audio" | "image" | "document" | "other";
@@ -42,6 +44,17 @@ export interface SubjectCorrection {
   reason: string | null;
 }
 
+const SQL = {
+  persons: "SELECT id, name, role, sender_id FROM persons ORDER BY id",
+  chats: "SELECT chat_id, channel, label FROM chats ORDER BY chat_id",
+  aliasDelete: "DELETE FROM aliases WHERE alias NOT IN (SELECT json_extract(value, '$.a') FROM json_each(?))",
+  aliasUpsert: "INSERT OR REPLACE INTO aliases (alias, person_id, display) SELECT json_extract(value, '$.a'), json_extract(value, '$.p'), json_extract(value, '$.d') FROM json_each(?)",
+  corrections: "SELECT id, update_id, subject_id, set_by, set_at, reason FROM subject_corrections ORDER BY id",
+  newInbox: "SELECT update_id, chat_id, message_id, sender_id, person_id, kind, received_at, raw, media_key, media_status, ack, subject_id FROM inbox WHERE status = 'new' ORDER BY update_id",
+  markDone: "UPDATE inbox SET status = 'done', done_at = ? WHERE status = 'new' AND update_id IN (SELECT value FROM json_each(?))",
+  prune: "DELETE FROM inbox WHERE status = 'done' AND done_at < ?",
+};
+
 const rowToPerson = (r: any): Person => ({ id: r.id, name: r.name, role: r.role, senderId: r.sender_id });
 
 export class Store {
@@ -59,7 +72,7 @@ export class Store {
   }
 
   async persons(): Promise<Person[]> {
-    return (await this.db.prepare("SELECT id, name, role, sender_id FROM persons ORDER BY id").all()).results.map(rowToPerson);
+    return (await this.db.prepare(SQL.persons).all()).results.map(rowToPerson);
   }
 
   async addChat(chatId: string, channel: string, label: string | null = null): Promise<void> {
@@ -67,7 +80,7 @@ export class Store {
   }
 
   async chats(): Promise<{ chat_id: string; channel: string; label: string | null }[]> {
-    return (await this.db.prepare("SELECT chat_id, channel, label FROM chats ORDER BY chat_id").all<any>()).results;
+    return (await this.db.prepare(SQL.chats).all<any>()).results;
   }
 
   async isAllowedChat(chatId: string): Promise<boolean> {
@@ -89,9 +102,9 @@ export class Store {
   /** Replace the alias table with the records' aliases (the batch, each pull). Two statements: no D1 REST transaction. */
   async replaceAliases(list: Alias[]): Promise<void> {
     const rows = list.map((a) => ({ a: a.alias.normalize("NFC").toLocaleLowerCase("en"), p: a.personId, d: a.display }));
-    await this.db.prepare("DELETE FROM aliases WHERE alias NOT IN (SELECT json_extract(value, '$.a') FROM json_each(?))").bind(JSON.stringify(rows)).run();
+    await this.db.prepare(SQL.aliasDelete).bind(JSON.stringify(rows)).run();
     await this.db
-      .prepare("INSERT OR REPLACE INTO aliases (alias, person_id, display) SELECT json_extract(value, '$.a'), json_extract(value, '$.p'), json_extract(value, '$.d') FROM json_each(?)")
+      .prepare(SQL.aliasUpsert)
       .bind(JSON.stringify(rows))
       .run();
   }
@@ -116,11 +129,46 @@ export class Store {
   }
 
   async corrections(): Promise<SubjectCorrection[]> {
-    return (await this.db.prepare("SELECT id, update_id, subject_id, set_by, set_at, reason FROM subject_corrections ORDER BY id").all<SubjectCorrection>()).results;
+    return (await this.db.prepare(SQL.corrections).all<SubjectCorrection>()).results;
   }
 
   async setAckMessage(updateId: number, messageId: number): Promise<void> {
     await this.db.prepare("UPDATE inbox SET ack_message_id = ? WHERE update_id = ?").bind(messageId, updateId).run();
+  }
+
+  /** Runs statements in one call when the Db can batch (REST: one API request), else one by one (tests, Worker). */
+  private async many(qs: { sql: string; params?: unknown[] }[]): Promise<{ results: any[]; changes: number }[]> {
+    if (this.db.batch) return (await this.db.batch(qs)).map((r) => ({ results: r.results, changes: r.meta.changes }));
+    const out: { results: any[]; changes: number }[] = [];
+    for (const q of qs) {
+      const st = this.db.prepare(q.sql).bind(...(q.params ?? []));
+      if (/^\s*SELECT/i.test(q.sql)) out.push({ results: (await st.all()).results, changes: 0 });
+      else out.push({ results: [], changes: (await st.run()).meta.changes });
+    }
+    return out;
+  }
+
+  /** Everything the batch pull reads (and the alias sync) in ONE D1 call: the REST API is rate limited per user. */
+  async pullSnapshot(aliases?: Alias[]): Promise<{ inbox: InboxRow[]; persons: Person[]; chats: { chat_id: string; channel: string; label: string | null }[]; corrections: SubjectCorrection[] }> {
+    const rows = (aliases ?? []).map((a) => ({ a: a.alias.normalize("NFC").toLocaleLowerCase("en"), p: a.personId, d: a.display }));
+    const sync = aliases ? [
+      { sql: SQL.aliasDelete, params: [JSON.stringify(rows)] },
+      { sql: SQL.aliasUpsert, params: [JSON.stringify(rows)] },
+    ] : [];
+    const r = await this.many([...sync, { sql: SQL.newInbox }, { sql: SQL.persons }, { sql: SQL.chats }, { sql: SQL.corrections }]);
+    const [inbox, persons, chats, corrections] = r.slice(sync.length);
+    return { inbox: inbox.results, persons: persons.results.map(rowToPerson), chats: chats.results, corrections: corrections.results };
+  }
+
+  /** The batch finish's D1 work in ONE call: mark rows done, prune old done rows, read chats and persons for sending. */
+  async finishSnapshot(updateIds: number[], at: string, pruneBefore: string): Promise<{ done: number; pruned: number; persons: Person[]; chats: { chat_id: string; channel: string; label: string | null }[] }> {
+    const [done, pruned, persons, chats] = await this.many([
+      { sql: SQL.markDone, params: [at, JSON.stringify(updateIds)] },
+      { sql: SQL.prune, params: [pruneBefore] },
+      { sql: SQL.persons },
+      { sql: SQL.chats },
+    ]);
+    return { done: updateIds.length ? done.changes : 0, pruned: pruned.changes, persons: persons.results.map(rowToPerson), chats: chats.results };
   }
 
   // ---------- inbox (Worker side) ----------
@@ -142,7 +190,7 @@ export class Store {
 
   async newInbox(): Promise<InboxRow[]> {
     return (await this.db
-      .prepare("SELECT update_id, chat_id, message_id, sender_id, person_id, kind, received_at, raw, media_key, media_status, ack, subject_id FROM inbox WHERE status = 'new' ORDER BY update_id")
+      .prepare(SQL.newInbox)
       .all<InboxRow>()).results;
   }
 
@@ -150,7 +198,7 @@ export class Store {
   async markDone(updateIds: number[], at: string): Promise<number> {
     if (!updateIds.length) return 0;
     const res = await this.db
-      .prepare("UPDATE inbox SET status = 'done', done_at = ? WHERE status = 'new' AND update_id IN (SELECT value FROM json_each(?))")
+      .prepare(SQL.markDone)
       .bind(at, JSON.stringify(updateIds))
       .run();
     return res.meta.changes;
@@ -158,6 +206,6 @@ export class Store {
 
   /** Delete rows committed to git more than `days` ago. */
   async prune(beforeIso: string): Promise<number> {
-    return (await this.db.prepare("DELETE FROM inbox WHERE status = 'done' AND done_at < ?").bind(beforeIso).run()).meta.changes;
+    return (await this.db.prepare(SQL.prune).bind(beforeIso).run()).meta.changes;
   }
 }

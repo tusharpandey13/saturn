@@ -142,10 +142,11 @@ async function main() {
       const q = req.url.match(/\/client\/v4\/accounts\/[^/]+\/d1\/database\/[^/]+\/query$/);
       const o = req.url.match(/\/client\/v4\/accounts\/[^/]+\/r2\/buckets\/[^/]+\/objects\/(.+)$/);
       if (q && req.method === "POST") {
-        const { sql, params = [] } = JSON.parse(body);
-        const r = await proxy.env.DB.prepare(sql).bind(...params).all();
+        const parsed = JSON.parse(body);
+        const qs = parsed.batch ?? [parsed]; // {sql, params} or {batch: [{sql, params}, ...]} (one result per statement)
+        const out = await proxy.env.DB.batch(qs.map(({ sql, params = [] }) => proxy.env.DB.prepare(sql).bind(...params)));
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ success: true, result: [{ results: r.results, meta: { changes: r.meta.changes } }] }));
+        return res.end(JSON.stringify({ success: true, result: out.map((r) => ({ results: r.results, meta: { changes: r.meta.changes } })) }));
       }
       const obj = o && (await proxy.env.MEDIA.get(decodeURIComponent(o[1])));
       if (obj) {

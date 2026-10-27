@@ -36,8 +36,8 @@ export interface PullDeps {
 }
 
 export async function pull(d: PullDeps): Promise<{ pulled: number; mediaCopied: number; mediaMissing: number; overrides: number; changed: string[] }> {
-  if (d.aliases) await d.store.replaceAliases(d.aliases);
-  const [rows, persons, chats] = [await d.store.newInbox(), await d.store.persons(), await d.store.chats()];
+  // One D1 call for the whole pull (alias sync + every read): the Cloudflare REST API is rate limited per user.
+  const { inbox: rows, persons, chats, corrections } = await d.store.pullSnapshot(d.aliases);
   const role = new Map(persons.map((p) => [p.id, p.role]));
   d.repo.writeDirectory([
     ...persons.map((p) => ({ rt: "d1.persons", id: p.id, name: p.name, role: p.role, sender_id: p.senderId })),
@@ -74,7 +74,7 @@ export async function pull(d: PullDeps): Promise<{ pulled: number; mediaCopied: 
   }
   const changed = d.repo.writeRaw([...fresh, ...retry.filter((r) => r.media_path)]);
   // Admins' /for corrections -> the records' auditable override file (namespaces, not D1 ids).
-  const fromD1: SubjectOverride[] = (await d.store.corrections()).map((c) => ({
+  const fromD1: SubjectOverride[] = corrections.map((c) => ({
     id: `tg-for:${c.id}`, update_id: c.update_id, subject: d.repo.personDir(c.subject_id), set_by: d.repo.personDir(c.set_by),
     set_at: c.set_at, reason: c.reason ?? "telegram /for",
   }));
@@ -443,17 +443,20 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
   // Rows not processed yet (extraction delayed, media missing) stay 'new', so they are never pruned before they are.
   const open = unprocessedUpdateIds(d.repo);
   const ids = d.repo.rawRows().filter((r) => Date.parse(r.received_at) >= since && !open.has(r.update_id)).map((r) => r.update_id);
-  const done = await d.store.markDone(ids, d.now);
+  // One D1 call for the whole finish (mark, prune, the chats and persons to send to). Pruning first is safe: it only
+  // removes rows marked done more than retentionDays ago.
+  const pruneBefore = new Date(Date.parse(d.now) - d.retentionDays * DAY).toISOString();
+  const { done, pruned, persons, chats } = await d.store.finishSnapshot(ids, d.now, pruneBefore);
   let sentTo = 0;
   let opsTo = 0;
   if (d.send !== false) {
-    const family = (await d.store.chats()).filter((c) => c.label === "family");
+    const family = chats.filter((c) => c.label === "family");
     // Ops lines (digest failure, webhook alerts) go to the admins by private DM (chat id = their Telegram user id; the
     // admin must have started a private chat with the bot). No admin reachable: they fall back to the family group.
     const ops = [...(d.digest === null ? [DIGEST_FAILED] : []), ...(d.alerts ?? []).map((a) => `⚠ ${a}`)];
     if (ops.length) {
       const text = ops.join("\n\n");
-      for (const a of (await d.store.persons()).filter((p) => p.role === "admin")) {
+      for (const a of persons.filter((p) => p.role === "admin")) {
         try {
           for (const part of splitMessage(text)) await d.tg.sendText(a.senderId, part);
           opsTo++;
@@ -466,7 +469,6 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
     if (familyText) for (const c of family) for (const part of splitMessage(familyText)) await d.tg.sendText(c.chat_id, part);
     sentTo = familyText ? family.length : 0;
   }
-  const pruned = await d.store.prune(new Date(Date.parse(d.now) - d.retentionDays * DAY).toISOString());
   return { done, pruned, sentTo, opsTo };
 }
 

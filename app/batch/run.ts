@@ -4,6 +4,7 @@
 //                                                  exit 3 when extraction was delayed (auth, usage limit, outage)
 //   npx tsx batch/run.ts finish [--no-digest]      mark inbox rows done, assert the webhook, send the digest, prune
 //                                                  exit 1 when the webhook assertion fails (⚠ lines DM'd to the admins)
+//   pull and finish exit 3 ("delayed") when Cloudflare stays rate limited (429) or unavailable after the retries.
 // Options: --records DIR (records repo root, holds records.yaml and optional config/thresholds.yaml; --root is the old name), --digest FILE (default
 //          $RUNNER_TEMP or app/.batch/digest.txt), --now ISO.
 // Env: pull/finish CLOUDFLARE_D1_TOKEN (fallback CLOUDFLARE_API_TOKEN), CLOUDFLARE_R2_TOKEN (optional), CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID, R2_BUCKET, TELEGRAM_BOT_TOKEN;
@@ -13,7 +14,7 @@
 // Output is counts only: no message content reaches the Actions log.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { cloudflareFromEnv, d1Http, r2Http } from "../src/batch/cloudflare.js";
+import { CloudflareTransientError, cloudflareFromEnv, d1Http, r2Http } from "../src/batch/cloudflare.js";
 import { Repo } from "../src/batch/repo.js";
 import { extract, finish, pull } from "../src/batch/steps.js";
 import { checkWebhook } from "../src/batch/webhook.js";
@@ -100,6 +101,12 @@ async function main(cmd: string | undefined) {
 }
 
 main(args[0]).catch((err) => {
+  if (err instanceof CloudflareTransientError) {
+    // Rate limit (429), 5xx or network after the retries: nothing was marked; inbox rows stay new for the next run.
+    console.log(`::warning::batch ${args[0]} delayed: ${err.message}; inbox rows stay new`);
+    process.exitCode = 3;
+    return;
+  }
   console.error(`batch ${args[0]} failed: ${(err as Error).name}: ${(err as Error).message}`);
   process.exitCode = 1;
 });

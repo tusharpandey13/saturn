@@ -64,7 +64,7 @@ uncertain_ref, status, supersedes, recorded_by, created_at, tags`; `data` is che
 **External raw files:** a source whose raw file is kept outside git on purpose (e.g. `<media-dir>/`)
 sets `"external": true` and says where in `note`; the build then skips the path check. Without a note it is an error.
 
-**Credentials (party refs).** `data.credentials` holds what the documents print (each field cited in `printed[]`: source id, page, quote) and the public checks (`verified[]` / `accreditation[]`: URL, date, matched / not found / mismatch / not checked). Display only, never a rank ([AGENTS.md](../../AGENTS.md) section 6; [method](../../docs/log/research/2026-10-27-clinician-credentials.md)). Inside `data`, `x-ref: source` marks a citation that must resolve to a source.
+**Credentials (party refs).** `data.credentials` holds what the documents print (each field cited in `printed[]`: source id, page, quote) and the public checks (`verified[]` / `accreditation[]`: URL, date, matched / not found / mismatch / not checked). Display only, never a rank ([AGENTS.md](../../AGENTS.md) section 6; method: the records repo's `docs/log/research/2026-10-27-clinician-credentials.md`). Inside `data`, `x-ref: source` marks a citation that must resolve to a source.
 
 **Folding a per-task ref that adds to an existing ref.** A row in `data/ref/<kind>-<TASK>.ndjson` with the id of an existing ref replaces it on fold only if it keeps every value and just adds (data keys, tags, text appended to the note); any changed value stops the run.
 
