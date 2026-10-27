@@ -9,9 +9,12 @@ the Saturn version pinned in its `product.lock`, by adding a checkout of this di
 - Every task is `min_class: phi`, refs-only params (queue ids, paths, sha256; no file contents, no names), claude-tier
   only, and `outputs: [git_pr]`.
 - `saturn.research_crossref` ([method](../docs/methods/research-crossref.md)): deep tier (claude, opus), params
-  `ns` + optional `focus`/`previous`/`reason`. It writes `docs/health/<ns>/research/YYYY-MM-DD-crossref.md`, its JSON
-  sidecar ([output schema](saturn.research_crossref.output.schema.json)) and new `questions.md` rows. The sidecar must
-  pass `tools/research/verify_citations.py`.
+  `ns` + optional `focus`/`previous`/`reason`/`visibility`. It writes `docs/health/<ns>/research/YYYY-MM-DD-crossref.md`
+  (`visibility: private`: under `research/private/`), its JSON sidecar
+  ([output schema](saturn.research_crossref.output.schema.json)) and new `questions.md` rows. The sidecar must
+  pass `tools/research/verify_citations.py`. v0.6.0 added private mode (method 4a: copyright-only sources under
+  licence `private-research`, private outputs only; no-AI bodies stay link-only) and the `read_checklist[]`
+  ("you read it" items for link-only guidelines, method 5b).
 - **PR target = the records repo, set by the environment, not here.** A client submits
   `output: {type: git_pr, repo: <records repo>}`, and the router accepts it only if the repo is in the client token's
   `repos` allowlist (`clients.yaml` in the env repo). No repo name, person name or path to real records appears in this pack.

@@ -13,6 +13,12 @@ Checks every citation on every item:
     tier (oa_article, bookshelf, abstract), and the item statement must say "secondary: reports" (a secondary
     statement is never presented as the guideline's own text);
   - phrasing: statements and questions carry no dose advice, no diagnosis, no "you should" (error);
+  - visibility (method section 4a): `visibility: private` only in a file under a `research/private/` directory (the
+    path comes from the command line). Licence `private-research` (tier `restricted`) only in such a file. In private
+    mode a copyright-only link-only host (not NO_AI_HOSTS) may be quoted under `private-research`; NO_AI_HOSTS stay
+    link-only in both modes (no quote, no private-research licence, no statement saying what they recommend);
+  - read_checklist[] ("you read it" items for link-only guidelines): a link-only URL, a locator, KB ids, a
+    recheck_after date after run_date, an empty own_words_note, and no other field (no quote, no recommendation);
   - online (default): each PMID resolves (NCBI E-utilities esummary; the stated title, if any, must match),
     each DOI resolves (HEAD https://doi.org/<doi>, redirects not followed: 3xx = ok, 404 = unresolved),
     each URL answers (HEAD; 403/405/429 = warning "blocked", not proof either way);
@@ -24,7 +30,7 @@ public identifiers (PMIDs, DOIs, URLs) leave the machine.
 NCBI policy: <= 3 requests/s without a key, <= 10/s with one. Set NCBI_API_KEY, NCBI_TOOL and NCBI_EMAIL in the
 environment (never in files); the script sleeps between calls to stay under the limit.
 """
-import difflib, html, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+import difflib, html, json, os, pathlib, re, sys, time, urllib.error, urllib.parse, urllib.request
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 UA = "saturn-verify-citations/1 (+https://github.com/)"
@@ -101,9 +107,18 @@ class Net:
 # A citation to one of these hosts must carry a locator (recommendation number) and must NOT carry a quote.
 LINK_ONLY_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk",
                    "diabetesjournals.org", "diabetes.org", "icmr.gov.in", "icmr.org.in", "endocrine.org")
+# The subset whose terms ban AI, text-and-data-mining or upload use outright (method, "group B"): link-only in BOTH
+# visibility modes. The other link-only hosts are restricted by copyright only and may be quoted in private mode.
+NO_AI_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk", "diabetesjournals.org", "diabetes.org")
+PRIVATE_LICENSE = "private-research"  # personal research use (method 4a); never in a public file
+PRIVATE_TIER = "restricted"
+PRIVATE_DIR = "research/private/"
+# Wording that says what a link-only guideline recommends (a summary), in an item that cites it directly.
+SUMMARY = re.compile(r"\b(recommend\w*|advis\w*|suggest\w*|endorse\w*)\b", re.I)
+CHECKLIST_KEYS = {"body", "title", "version", "url", "locator", "kb_ids", "recheck_after", "own_words_note"}
 # Source tiers (method, section 4). Quoted citations must name one and a licence that permits quoting.
-TIERS = ("label", "guideline_open", "guideline_link_only", "oa_article", "bookshelf", "abstract")
-SECONDARY_TIERS = ("oa_article", "bookshelf", "abstract")
+TIERS = ("label", "guideline_open", "guideline_link_only", "oa_article", "bookshelf", "abstract", PRIVATE_TIER)
+SECONDARY_TIERS = ("oa_article", "bookshelf", "abstract", PRIVATE_TIER)
 LABEL_HOSTS = ("dailymed.nlm.nih.gov", "api.fda.gov", "open.fda.gov", "accessdata.fda.gov", "ema.europa.eu")
 # Licences (normalised by norm_license) under which a short attributed verbatim quote is allowed.
 QUOTABLE_LICENSES = {"public-domain", "cc0", "cc-by", "cc-by-sa", "cc-by-nc", "cc-by-nc-sa", "cc-by-nc-nd",
@@ -114,14 +129,19 @@ SECONDARY_LABEL = "secondary: reports"
 TAG = re.compile(r"</?[A-Za-z][^<>]*>|<[!?][^<>]*>")
 
 
-def link_only(url):
-    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
-    return any(host == h or host.endswith("." + h) for h in LINK_ONLY_HOSTS)
-
-
 def host_in(url, hosts):
     host = (urllib.parse.urlparse(url or "").hostname or "").lower()
     return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def link_only(url, c=None, private=False):
+    """Link-only for this citation: a no-AI host always; another link-only host unless quoted under
+    private-research in a private file."""
+    if host_in(url, NO_AI_HOSTS):
+        return True
+    if private and c is not None and norm_license(c.get("license")) == PRIVATE_LICENSE:
+        return False
+    return host_in(url, LINK_ONLY_HOSTS)
 
 
 def norm_license(s):
@@ -131,10 +151,17 @@ def norm_license(s):
     return s
 
 
-def check_tier(it, c, where, q, out):
+def check_tier(it, c, where, q, out, private=False):
     tier, lic = c.get("source_tier"), c.get("license")
     if tier is not None and tier not in TIERS:
         out.append(("error", where, f"unknown source_tier {tier!r}"))
+    is_priv = norm_license(lic) == PRIVATE_LICENSE
+    if (is_priv or tier == PRIVATE_TIER) and not private:
+        out.append(("error", where, f"{PRIVATE_LICENSE} licence / {PRIVATE_TIER} tier only in a visibility: private file"))
+    if is_priv != (tier == PRIVATE_TIER):
+        out.append(("error", where, f"{PRIVATE_LICENSE} licence and {PRIVATE_TIER} tier go together"))
+    if (is_priv or tier == PRIVATE_TIER) and host_in(c.get("url"), NO_AI_HOSTS):
+        out.append(("error", where, "no-AI link-only body: link-only in both modes (no private-research use)"))
     if c.get("reports_guideline"):
         if tier not in SECONDARY_TIERS:
             out.append(("error", where, "reports_guideline only on a secondary tier "
@@ -143,7 +170,7 @@ def check_tier(it, c, where, q, out):
             out.append(("error", where, f"reports_guideline: the statement must be labelled '{SECONDARY_LABEL} <guideline>'"))
     if tier == "guideline_link_only" and q:
         out.append(("error", where, "guideline_link_only tier: no quote allowed"))
-    if not q or link_only(c.get("url")):
+    if not q or link_only(c.get("url"), c, private):
         return  # nothing quoted, or the link-only host rule already applied
     if tier is None:
         out.append(("error", where, "quoted citation needs source_tier"))
@@ -152,7 +179,7 @@ def check_tier(it, c, where, q, out):
         out.append(("error", where, "label tier: host is not a known label host"))
     if not lic:
         out.append(("error", where, "quoted citation needs license"))
-    elif norm_license(lic) not in QUOTABLE_LICENSES:
+    elif norm_license(lic) not in QUOTABLE_LICENSES and not (is_priv and private):
         out.append(("error", where, f"license {lic!r} is not on the quotable allow-list"))
     if tier == "abstract" and len(q) > ABSTRACT_QUOTE_MAX:
         out.append(("error", where, f"abstract quote longer than {ABSTRACT_QUOTE_MAX} chars"))
@@ -171,12 +198,42 @@ def phrasing(text, where, out):
             out.append(("error", where, f"phrasing: {why}: '{m.group(0)}'"))
 
 
-def verify(doc, net=None, check_quotes=False):
-    """Return a list of (level, where, message); level is 'error' or 'warn'."""
+def check_checklist(doc, out):
+    for n, r in enumerate(doc.get("read_checklist") or []):
+        where = f"read_checklist {n + 1}"
+        extra = sorted(set(r) - CHECKLIST_KEYS)
+        if extra:
+            out.append(("error", where, f"no quote or recommendation content: unexpected field(s) {', '.join(extra)}"))
+        if not host_in(r.get("url"), LINK_ONLY_HOSTS):
+            out.append(("error", where, "url must be a link-only guideline body"))
+        for k in ("body", "title", "version", "locator"):
+            if not (r.get(k) or "").strip():
+                out.append(("error", where, f"{k} required"))
+        if not r.get("kb_ids"):
+            out.append(("error", where, "kb_ids required (the facts to compare against)"))
+        due = r.get("recheck_after") or ""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due) or due <= (doc.get("run_date") or ""):
+            out.append(("error", where, "recheck_after must be an ISO date after run_date"))
+        if r.get("own_words_note", "") != "":
+            out.append(("error", where, "own_words_note stays blank in the agent's output (the human writes it)"))
+
+
+def verify(doc, net=None, check_quotes=False, path=None):
+    """Return a list of (level, where, message); level is 'error' or 'warn'.
+    path: the sidecar's file path (needed for visibility: private)."""
     out = []
     items = doc.get("items")
     if not isinstance(items, list):
         return [("error", "$", "no items[] array")]
+    vis = doc.get("visibility", "public")
+    private = vis == "private"
+    if vis not in ("public", "private"):
+        out.append(("error", "visibility", f"unknown visibility {vis!r}"))
+    in_private_dir = path is not None and "/" + PRIVATE_DIR in pathlib.Path(path).resolve().as_posix()
+    if private and not in_private_dir:
+        private = False  # nothing private is accepted outside research/private/
+        out.append(("error", "visibility", f"visibility: private file must sit under a {PRIVATE_DIR} directory"))
+    check_checklist(doc, out)
     phrasing(doc.get("summary", ""), "summary", out)
     for q in doc.get("questions", []):
         phrasing(q.get("text", ""), f"question {q.get('id', '?')}", out)
@@ -185,6 +242,12 @@ def verify(doc, net=None, check_quotes=False):
         iid = it.get("id", "?")
         phrasing(it.get("statement", ""), f"item {iid}", out)
         cs = it.get("citations") or []
+        direct = [c for c in cs if link_only(c.get("url"), c, private)]
+        if direct and not any(c.get("reports_guideline") for c in cs):
+            m = SUMMARY.search(it.get("statement") or "")
+            if m:
+                out.append(("error", f"item {iid}", f"link-only body: the statement must not say what it recommends: "
+                                                    f"'{m.group(0)}'"))
         if not cs:
             out.append(("error", f"item {iid}", "no citations"))
         for n, c in enumerate(cs):
@@ -192,7 +255,7 @@ def verify(doc, net=None, check_quotes=False):
             if not any(c.get(k) for k in ("pmid", "doi", "url")):
                 out.append(("error", where, "no pmid, doi or url"))
             q = (c.get("quote") or "").strip()
-            if link_only(c.get("url")):
+            if link_only(c.get("url"), c, private):
                 if q:
                     out.append(("error", where, "link-only source: no quote allowed (cite and link only)"))
                 if not (c.get("locator") or "").strip():
@@ -201,7 +264,7 @@ def verify(doc, net=None, check_quotes=False):
                 out.append(("error", where, "missing quote"))
             elif len(q) > QUOTE_MAX:
                 out.append(("error", where, f"quote longer than {QUOTE_MAX} chars"))
-            check_tier(it, c, where, q, out)
+            check_tier(it, c, where, q, out, private)
             if c.get("pmid") and not re.fullmatch(r"[1-9][0-9]{0,8}", str(c["pmid"])):
                 out.append(("error", where, f"malformed PMID {c['pmid']!r}"))
             if c.get("doi") and not re.fullmatch(r"10\.\d{4,9}/\S+", c["doi"]):
@@ -262,7 +325,7 @@ def verify(doc, net=None, check_quotes=False):
                 out.append(("warn", where, f"URL blocked a HEAD check ({st}); human check"))
             elif not (isinstance(st, int) and st < 400):
                 out.append(("error", where, f"URL does not resolve ({st}): {c['url']}"))
-            elif check_quotes and c.get("quote") and not c.get("pmid") and not link_only(c["url"]):
+            elif check_quotes and c.get("quote") and not c.get("pmid") and not link_only(c["url"], c, private):
                 try:
                     text = net.get_text(c["url"])
                     if text is None:
@@ -285,7 +348,7 @@ def main(argv):
     except (OSError, ValueError) as e:
         print(f"cannot read {args[0]}: {e}", file=sys.stderr)
         return 2
-    res = verify(doc, None if "--offline" in argv else Net(), "--check-quotes" in argv)
+    res = verify(doc, None if "--offline" in argv else Net(), "--check-quotes" in argv, path=args[0])
     errors = sum(1 for lv, _, _ in res if lv == "error")
     if "--json" in argv:
         print(json.dumps({"errors": errors, "warnings": len(res) - errors,

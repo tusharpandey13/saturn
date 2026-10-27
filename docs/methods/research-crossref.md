@@ -67,6 +67,7 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
 | `docs/health/<ns>/care-team.md` | which clinician (party ref or role) each question goes to |
 | `docs/health/<ns>/research/*-crossref.json` | the previous run, for a revisit (step 10) |
 | `config/thresholds.yaml` | red-flag values, if the records owner has set them |
+| `config/research-private-sources.yaml` | private mode only (section 4a): the copyright-only sources the owner may lawfully read. The product never lists them |
 
 ## 3. Procedure
 
@@ -93,7 +94,8 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
 5. **Guideline pass (per condition).** Find the current guideline from the bodies in section 4, tier 2. Check the
    version is the latest (step 10 triggers). Extract the recommendation on monitoring, targets or tests, with its
    number and printed grade, **except for link-only bodies** (section 4): never fetch, quote or summarise their
-   recommendations. Cite body, version, recommendation number and URL, and point the clinician to it by name.
+   recommendations. Cite body, version, recommendation number and URL, and point the clinician to it by name. In
+   private mode (section 4a), listed group A sources are read and quoted briefly instead; group B stays link-only.
    **5a. Secondary sources for link-only guidelines.** For each relevant link-only guideline:
    (a) link it for the clinician by body, version, section or recommendation number (`locator`) and URL, with no
    quote; (b) search for an open-access secondary source (section 4, "Quotable secondary sources") that states the
@@ -102,6 +104,22 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
    evidence block describing the secondary source itself (its design and certainty, not the guideline's);
    (c) never present the secondary statement as the guideline's own text, and never infer the guideline's wording or
    grade from it. If no such source exists, keep the link-only item and say nothing about what it recommends.
+   **5b. "You read it" checklist.** For each relevant link-only guideline, also write one `read_checklist[]` entry
+   for the owner: `body`, guideline `title`, `version` (edition or year), `url`, the `locator` to read (section or
+   recommendation number), the `kb_ids` of the person's facts to compare against, `recheck_after` (table below)
+   and a blank `own_words_note`. It carries no guideline text and no summary of what it recommends (the verifier
+   rejects any other field). The owner reads the guideline, writes a note in their own words, and that note is
+   ingested later as a family-reported log (`docs/log/extraction/patient-reported/`), never as the guideline's text.
+
+   | Body | Update cadence (approximate; verify on the body's site when writing) | `recheck_after` |
+   |---|---|---|
+   | EAU | annually, around March | the next 31-Mar after the run |
+   | ADA Standards of Care | annually (published December/January), plus living updates | the next 31-Jan after the run |
+   | ESC | new and updated guidelines each year at the late-August congress; a given topic every few years | the next 30-Sep after the run |
+   | AUA | topic guidelines amended every few years | run date + 12 months |
+   | NICE | ad hoc, after surveillance reviews | run date + 6 months |
+   | other link-only bodies | not set here | run date + 12 months |
+
 6. **Literature pass (only for topics the label and guideline passes leave open).** Search PubMed/Europe PMC
    (section 5). Prefer systematic reviews and meta-analyses, then RCTs, then cohorts. Screen titles and abstracts,
    then fetch the record you cite and quote from it. Log every query (section 9).
@@ -113,7 +131,8 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
     changed) or `retired` (no longer supported, or the inputs are gone). Never delete old pages. The new run is a
     new dated file.
 11. **Verify.** Run
-    `python3 -I tools/research/verify_citations.py <sidecar.json> --check-quotes`. Fix every error. If an
+    `python3 -I tools/research/verify_citations.py <sidecar.json> --check-quotes` (the path matters: private
+    mode is accepted only under `research/private/`). Fix every error. If an
     identifier does not resolve or a quote cannot be found, drop the item; never "repair" a citation from memory.
     Record the result in `verifier`.
 12. **PR.** Add the page, the sidecar and the new `questions.md` rows. Mark briefs whose inputs changed
@@ -151,11 +170,40 @@ Not fetchable from an agent (HTTP 403/404) on 27-Oct-2026: the NICE and ADA term
 page were read through search excerpts, not the pages themselves; the owner should open them once.
 A journal or PubMed version of a link-only body's guideline is still link-only.
 
+**Two groups of restricted bodies.** Group B (**no-AI**: AUA, EAU, NICE, ESC, ADA) bans AI, text-and-data-mining or
+upload use outright; they are link-only in **both** visibility modes (verifier `NO_AI_HOSTS`). Group A
+(**copyright-only**: bodies restricted by copyright with no AI/TDM/upload ban, e.g. the ICMR STW, Endocrine Society
+and KDIGO 2012/2017 verdicts above, and paywalled papers the owner can lawfully access) is link-only in public mode
+and readable in private mode (section 4a).
+
+### 4a. Private mode (`visibility: private`)
+
+A run with `visibility: private` may fetch, read, summarise and quote group A sources, into private outputs only.
+Legal basis: India, Copyright Act 1957, s.52(1)(a)(i): fair dealing with a work (not a computer programme) for
+private or personal use, including research [L1]. The basis covers the family's own research use, not
+publication, so:
+
+- **Which sources.** Only those the records repo lists in `config/research-private-sources.yaml` (body, hosts,
+  editions, how the owner has access, date checked). The product names none. Group B bodies are never listed; the
+  verifier rejects their hosts in private mode as in public mode.
+- **Where.** Outputs go to `docs/health/<ns>/research/private/YYYY-MM-DD-crossref.{md,json}` with top-level
+  `"visibility": "private"`. The verifier rejects a private sidecar anywhere else, and rejects the
+  `private-research` licence in a public file.
+- **How quoted.** Short and attributed (at most 400 characters, unaltered, with body, edition, locator and URL),
+  `source_tier: restricted`, `license: private-research`. Summaries are in the agent's own words and tagged
+  agent-inferred. Never a whole table, figure or section.
+- **PDFs.** Restricted PDFs are cached locally in `docs/health/<ns>/research/private/.cache/`, which the records
+  repo gitignores (`**/research/private/.cache/` and `**/research/private/**/*.pdf`). The owner places paywalled
+  copies there; the agent reads them from there. They are never committed. Only notes, short quotes and links go to
+  git.
+- **Never shared.** Nothing from a private output goes into a public page, a doctor brief, a docs site, a search
+  query or a PR outside the records repo. A question raised by a private item is phrased without the quoted text.
+
 ### Quotable secondary sources and licences (checked 27-Oct-2026)
 
 Every quoted citation carries `source_tier` and `license`. Quote only when the licence permits it. The verifier
 (`QUOTABLE_LICENSES`) accepts: public-domain, cc0, cc-by, cc-by-sa, cc-by-nc, cc-by-nc-sa, cc-by-nc-nd, cc-by-nd,
-ahrq-unaltered, ema-credit, publisher-abstract. Saturn is a non-commercial family records tool, so NC licences
+ahrq-unaltered, ema-credit, publisher-abstract; plus `private-research` in private mode only (section 4a). Saturn is a non-commercial family records tool, so NC licences
 fit; if the use ever becomes commercial, drop the NC tiers. Quotes stay at most 400 characters (abstracts: 250),
 attributed, unaltered, with the URL and the date checked.
 
@@ -169,6 +217,7 @@ attributed, unaltered, with the URL and the date checked.
 | `guideline_open` | WHO publications | quotable, CC BY-NC-SA 3.0 IGO, non-commercial, WHO credited. Exceptions: third-party material, figures/tables/photos, ICD/ICF/ICHI (CC BY-ND) | https://www.who.int/about/policies/publishing/copyright |
 | `abstract` | abstracts of peer-reviewed papers that describe or summarise a guideline | short quote (<= 250 chars) with attribution (title, PMID); licence `publisher-abstract` (abstracts stay the publishers' copyright; the basis is short attributed quotation / fair use, not a grant, so keep it to one sentence). Prefer a CC BY/NC licence when `oa_article` is available | https://www.nlm.nih.gov/web_policies.html (copying copyrighted items beyond fair use needs the holder's permission; the page has no PubMed-abstract-specific grant) |
 | `guideline_link_only` | AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society | link-only (table above); never quoted | as above |
+| `restricted` | group A sources listed in the records repo's private source list | `private-research`, private mode only (section 4a) | the source's own notice; the owner's access |
 
 A secondary source never changes a link-only verdict: a journal or PubMed copy of the guideline itself is still
 link-only. Only an independent article, chapter or abstract that reports the recommendation is a secondary source.
@@ -243,12 +292,15 @@ Two files in the records repo, plus question rows:
   - a table per item type (statement, person's facts with KB ids, source with quote, evidence, applicability,
     clinician, question id);
   - **Questions for the doctor**;
+  - **You read it**: one row per `read_checklist[]` entry (body, guideline, version, link, section to read, facts
+    to compare, recheck after) with an empty "Your note (own words)" cell;
   - **Limitations**;
   - **Search log**;
   - **Revisit**.
 - `docs/health/<ns>/research/YYYY-MM-DD-crossref.json`: the sidecar, valid against
   [`saturn.research_crossref.output.schema.json`](../../agent-tasks/saturn.research_crossref.output.schema.json).
   The verifier reads it.
+- Private mode: the same two files under `docs/health/<ns>/research/private/` (section 4a).
 - New rows in `docs/health/<ns>/questions.md`, with the next free ids. The cross-reference never keeps its own
   question list.
 
@@ -357,7 +409,9 @@ The run records `revisit.next_due` (the run date plus 6 months) and the triggers
 - [ ] Grades are the source's own, and nothing weaker than a guideline or systematic review is framed as
       established.
 - [ ] Applicability is stated; Western-only evidence is named as such.
-- [ ] Guideline versions are current, and licence-restricted text is not pasted.
+- [ ] Guideline versions are current, and licence-restricted text is not pasted (private mode: only short,
+      attributed quotes from listed group A sources, and no PDF in the diff).
+- [ ] Each "You read it" row has a locator, the facts to compare and a recheck date, and no guideline text.
 - [ ] Each quote's licence was read from the source; every `reports_guideline` item is labelled secondary and graded on the secondary source's own evidence.
 - [ ] Questions are neutral, name a clinician, carry new ids, and do not duplicate open ones.
 - [ ] The search log is complete, and the queries contain no names, ids, dates or places.
@@ -395,6 +449,9 @@ The run records `revisit.next_due` (the run date plus 6 months) and the triggers
   https://www.nice.org.uk/guidance ; ICMR Standard Treatment Workflows: https://stw.icmr.org.in/
 - [S13h] USPSTF prostate cancer screening (2018; update in progress):
   https://www.uspreventiveservicestaskforce.org/uspstf/recommendation/prostate-cancer-screening
+- [L1] Copyright Act 1957 (India), s.52(1)(a)(i), as amended 2012; DPIIT text:
+  https://copyright.gov.in/Copyright_Act_1957/chapter_xi.html (read through search excerpts on 27-Oct-2026; owner
+  to open once)
 - [W1] WHO, Ethics and governance of AI for health: guidance on large multi-modal models (2024):
   https://www.who.int/publications/i/item/9789240084759
 - [W2] FDA, Clinical Decision Support Software guidance (2022, reissued Jan-2026; automation bias):

@@ -128,6 +128,111 @@ class Tiers(unittest.TestCase):
                             self.errs(item("d", url=g, locator="3.1", source_tier="oa_article", license="CC BY"))))
 
 
+PRIV = "/r/docs/health/zed/research/private/2026-10-27-crossref.json"
+PUB = "/r/docs/health/zed/research/2026-10-27-crossref.json"
+
+
+def pdoc(*items, **kw):
+    d = doc(*items)
+    d.update(visibility="private", run_date="2026-10-27", **kw)
+    return d
+
+
+def restricted(iid, url="https://stw.icmr.org.in/x", **kw):
+    return item(iid, url=url, locator="p. 2", source_tier="restricted", license="private-research", **kw)
+
+
+class PrivateMode(unittest.TestCase):
+    def errs(self, d, path=None):
+        return [m for lv, _, m in vc.verify(d, path=path) if lv == "error"]
+
+    def test_private_research_accepted_in_private_dir(self):
+        self.assertEqual(self.errs(pdoc(restricted("a"), restricted("b", url="https://publisher.example.org/p")),
+                                   PRIV), [])
+
+    def test_private_file_outside_private_dir(self):
+        for path in (PUB, None, "/r/docs/health/zed/notresearch/private/x.json"):
+            e = self.errs(pdoc(item("a", pmid="1000001")), path)
+            self.assertTrue(any("must sit under" in m for m in e), path)
+        # and nothing private is accepted there
+        self.assertTrue(any("only in a visibility: private file" in m for m in self.errs(pdoc(restricted("a")), PUB)))
+
+    def test_private_research_rejected_in_public_file(self):
+        for path in (PUB, PRIV, None):
+            e = self.errs(doc(restricted("a")), path)
+            self.assertTrue(any("only in a visibility: private file" in m for m in e), path)
+            self.assertTrue(any("link-only source: no quote" in m for m in e), path)
+
+    def test_licence_and_tier_go_together(self):
+        a = item("a", pmid="1000001", source_tier="restricted", license="CC BY")
+        b = item("b", pmid="1000001", source_tier="abstract", license="private-research")
+        e = self.errs(pdoc(a, b), PRIV)
+        self.assertEqual(sum("go together" in m for m in e), 2)
+
+    def test_no_ai_bodies_link_only_in_both_modes(self):
+        for host in ("https://uroweb.org/g", "https://www.auanet.org/g", "https://www.nice.org.uk/g",
+                     "https://www.escardio.org/g", "https://diabetesjournals.org/care/g"):
+            e = self.errs(pdoc(restricted("a", url=host)), PRIV)
+            self.assertTrue(any("link-only source: no quote" in m for m in e), host)
+            self.assertTrue(any("link-only in both modes" in m for m in e), host)
+            # a link with no quote, but private-research licence, is still rejected
+            c = restricted("b", url=host, quote="")
+            self.assertTrue(any("link-only in both modes" in m for m in self.errs(pdoc(c), PRIV)), host)
+
+    def test_link_only_statement_says_no_recommendation(self):
+        link = {"url": "https://uroweb.org/g", "locator": "4.2", "accessed": "2026-10-27"}
+        bad = {"id": "a", "statement": "EAU recommends an example-marker test.", "citations": [link]}
+        ok = {"id": "b", "statement": "EAU addresses example-marker testing (section 4.2).", "citations": [link]}
+        for d, path in ((doc(bad, ok), PUB), (pdoc(bad, ok), PRIV)):
+            res = vc.verify(d, path=path)
+            self.assertEqual([w for lv, w, m in res if lv == "error"], ["item a"], path)
+
+    def test_copyright_only_host_still_link_only_in_public(self):
+        e = self.errs(doc(item("a", url="https://stw.icmr.org.in/x", locator="p. 2", source_tier="oa_article",
+                               license="CC BY")), PUB)
+        self.assertTrue(any("link-only source: no quote" in m for m in e))
+
+    def test_cli_derives_path(self):
+        with tempfile.TemporaryDirectory() as t:
+            for sub, rc in (("research/private", 0), ("research", 1)):
+                d = pathlib.Path(t, sub); d.mkdir(parents=True, exist_ok=True)
+                f = d / "2026-10-27-crossref.json"
+                f.write_text(json.dumps(pdoc(restricted("a"))))
+                r = subprocess.run([sys.executable, "-I", str(HERE / "verify_citations.py"), str(f), "--offline"],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, rc, r.stdout)
+
+
+def check(**kw):
+    r = {"body": "EAU", "title": "Example guideline", "version": "2026", "url": "https://uroweb.org/guidelines/x",
+         "locator": "Section 5.3", "kb_ids": ["zed:fact:2026-01-01-example-lab.psa"], "recheck_after": "2027-03-31",
+         "own_words_note": ""}
+    r.update(kw)
+    return r
+
+
+class ReadChecklist(unittest.TestCase):
+    def errs(self, *rows):
+        d = doc(item("a", pmid="1000001"))
+        d.update(run_date="2026-10-27", read_checklist=list(rows))
+        return [m for lv, _, m in vc.verify(d) if lv == "error"]
+
+    def test_clean(self):
+        self.assertEqual(self.errs(check(), check(url="https://www.nice.org.uk/guidance/ng1")), [])
+
+    def test_no_quote_or_recommendation_fields(self):
+        for k in ("quote", "recommendation", "summary"):
+            e = self.errs(check(**{k: "text"}))
+            self.assertTrue(any("no quote or recommendation content" in m for m in e), k)
+
+    def test_required_and_dates(self):
+        e = " | ".join(self.errs(check(locator="", kb_ids=[], recheck_after="2026-01-01",
+                                       url="https://example.org/g", own_words_note="filled by agent")))
+        for frag in ("locator required", "kb_ids required", "recheck_after", "link-only guideline body",
+                     "own_words_note stays blank"):
+            self.assertIn(frag, e)
+
+
 class Online(unittest.TestCase):
     def test_pmid_resolves_and_missing(self):
         net = FakeNet()

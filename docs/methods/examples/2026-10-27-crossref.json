@@ -1,5 +1,6 @@
 {
   "schema": "saturn.research_crossref/v1",
+  "visibility": "public",
   "ns": "bob",
   "run_date": "2026-10-27",
   "data_as_of": "2026-10-12",
@@ -279,6 +280,21 @@
       "AUA or EAU LUTS update"
     ]
   },
+  "read_checklist": [
+    {
+      "body": "AUA",
+      "title": "Management of Lower Urinary Tract Symptoms Attributed to Benign Prostatic Hyperplasia (BPH)",
+      "version": "2023 amendment",
+      "url": "https://www.auanet.org/guidelines/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
+      "locator": "Diagnostic evaluation section",
+      "kb_ids": [
+        "bob:fact:2024-06-01-example-clinic-note.bph",
+        "bob:fact:2026-09-10-example-lab-psa.psa"
+      ],
+      "recheck_after": "2027-10-27",
+      "own_words_note": ""
+    }
+  ],
   "limitations": [
     "Synthetic example: the person, KB ids and dates are fictional; the citations are real.",
     "Indian package inserts were not available; US labels used as proxies.",
