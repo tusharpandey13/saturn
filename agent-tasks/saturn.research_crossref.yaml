@@ -1,0 +1,62 @@
+# Saturn task. PHI: refs-only params (a namespace id and topic words; no names, no record text), claude tier only,
+# output as a PR on jobs/<id> in the records repo (the env sets the repo; see README.md).
+# Method: docs/methods/research-crossref.md. Output contract: saturn.research_crossref.output.schema.json.
+# Phase 1: enabled, but the dispatcher does not implement git_pr delivery yet, so a submitted job fails as a
+# contract error (dead). Do not submit until phase 2.
+name: saturn.research_crossref
+description: Cross-reference one person's recorded data against the literature and labels (record and flag only).
+enabled: true
+tiers: [deep]                 # claude harness, opus (agent-server src/policy.ts)
+model: opus
+max_class: phi
+min_class: phi                # runs against records: a client that labels it lower is rejected
+subscription: owner_use
+tools: [Read, Grep, Glob, Write, Edit, WebSearch, WebFetch, "Bash(python3 -I */tools/research/verify_citations.py *)"]
+outputs: [git_pr]
+max_attempts: 2
+budget: { max_usd: 15, max_turns: 150, timeout_s: 3600 }
+params_schema:
+  type: object
+  additionalProperties: false
+  required: [ns]
+  properties:
+    ns: { type: string, pattern: "^[a-z][a-z0-9-]*$", maxLength: 40 }
+    focus:
+      type: array
+      maxItems: 5
+      items: { type: string, maxLength: 80, pattern: "^[A-Za-z0-9 ,()/+-]+$" }
+    previous: { type: string, maxLength: 200, pattern: "^docs/health/[a-z0-9-]+/research/[0-9]{4}-[0-9]{2}-[0-9]{2}-crossref\\.md$" }
+    reason: { enum: [scheduled, new-labs, new-medicine, new-condition, new-guideline, on-request] }
+output_schema:
+  type: object
+  required: [summary, crossref_md, crossref_json, question_ids, red_flags, verifier]
+  additionalProperties: false
+  properties:
+    summary: { type: string, maxLength: 600 }
+    crossref_md: { type: string, pattern: "^docs/health/[a-z0-9-]+/research/[0-9]{4}-[0-9]{2}-[0-9]{2}-crossref\\.md$" }
+    crossref_json: { type: string, pattern: "^docs/health/[a-z0-9-]+/research/[0-9]{4}-[0-9]{2}-[0-9]{2}-crossref\\.json$" }
+    question_ids: { type: array, items: { type: string, pattern: "^[a-z][a-z0-9-]*:q:[0-9]{4}$" } }
+    red_flags: { type: integer, minimum: 0 }
+    verifier: { type: object, required: [errors, warnings], properties: { errors: { const: 0 }, warnings: { type: integer } } }
+prompt: |
+  You are running the Saturn research cross-reference for namespace {{ns}} in a records repo checkout.
+  Follow docs/methods/research-crossref.md in the Saturn product checkout exactly (the product is pinned by the
+  environment; its path is in SATURN_PRODUCT_DIR). Focus areas (may be empty = all): {{focus}}.
+  Previous cross-reference to revisit (may be empty): {{previous}}. Reason: {{reason}}.
+
+  Non-negotiable:
+  1. Record and flag only. Never diagnose. Never suggest starting, stopping or changing a medicine or dose.
+     Associations, never causation. Every concern becomes a question for the named clinician.
+  2. Red flags first (method step 2). If a recorded finding matches a red-flag rule, write it at the top as
+     "seek urgent care now" and do not research it.
+  3. No PHI leaves the repo. Web queries use generic clinical terms only: no names, ids, dates, places, facility
+     or doctor names, and no record text pasted verbatim.
+  4. Every item cites a resolvable PMID, DOI or URL with a verbatim quote of at most 400 characters. Never cite
+     from memory: fetch it, then quote it. Do not paste or bulk-fetch licence-restricted guideline text
+     (method, "Source priority"); link and cite the recommendation number instead.
+  5. Write docs/health/{{ns}}/research/<today>-crossref.md (the template in the method) and its JSON sidecar
+     (saturn.research_crossref.output.schema.json); add new questions to docs/health/{{ns}}/questions.md with
+     the next free {{ns}}:q:NNNN ids. Edit nothing else; never touch data/ or generated blocks.
+  6. Run python3 -I "$SATURN_PRODUCT_DIR/tools/research/verify_citations.py" <sidecar> --check-quotes and fix
+     every error (drop the item if its citation cannot be verified). Record the verifier result in the sidecar.
+  Return the output_schema JSON only.

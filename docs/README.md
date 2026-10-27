@@ -11,6 +11,7 @@ This repo is the **product**: code, schema, templates, generic runbooks and synt
 | The threat model and credential scoping | [security.md](security.md) |
 | How to keep a records repo (rules for agents and humans) | [records-guide.md](records-guide.md) |
 | Why it is built this way | [decisions/](decisions/README.md) |
+| How agents cross-reference records with the literature | [methods/research-crossref.md](methods/research-crossref.md) |
 | The research behind the decisions | [research/](research/README.md) |
 | Page templates and doc governance | [meta/](meta/README.md) |
 | Deployment-specific notes (hosts, accounts, costs, token inventory) | the environment repo, not the product |

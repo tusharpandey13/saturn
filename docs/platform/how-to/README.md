@@ -26,6 +26,7 @@ The step-by-step guides live next to the code they drive. This page links to the
 | Work a hard-read | [tools/ocr/HARD-READ.md](../../../tools/ocr/HARD-READ.md); queues live in the records repo | each item is resolved or `ask-user` |
 | Digitise paper records from video | [tools/doc-scan/README.md](../../../tools/doc-scan/README.md) | one PDF per document |
 | Publish the sanitised docs site | [tools/docs-site/DEPLOY.md](../../../tools/docs-site/DEPLOY.md) | the build passes the denylist gate |
+| Run or review a research cross-reference | [methods/research-crossref.md](../../methods/research-crossref.md) | `verify_citations.py` reports 0 errors and the reviewer checklist is ticked |
 | Ingest a new health document | [records-guide.md](../../records-guide.md), ingest fan-out and definition of done | the definition of done is met |
 
 Back to the [platform hub](../README.md).

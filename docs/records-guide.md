@@ -46,7 +46,7 @@ Format: `<ns>:<class>:<local>`. `ns` is one of the `namespaces` in `records.yaml
 |---|---|
 | Raw inputs | `sources/<ns>/{documents,media/<channel>}/` (ADR 003; raw videos stay out of git, in `<media-dir>`) |
 | Structured facts | `data/<ns>/docs/<source-id>.ndjson`; run the build (section 9) before committing |
-| Current health state (curated) | `docs/health/<ns>/` only: `summary`, `medications`, `problems`, `timeline`, `care-team`, `questions`, `briefs/` |
+| Current health state (curated) | `docs/health/<ns>/` only: `summary`, `medications`, `problems`, `timeline`, `care-team`, `questions`, `briefs/`, `research/` (dated cross-references, [method](methods/research-crossref.md)) |
 | Household to-dos | `docs/health/family/actions.md` |
 | Extraction notes, hard-reads, chat triage, analyses | `docs/log/…` (dated, append-only) |
 | Records-local config | `records.yaml`, `config/thresholds.yaml` (optional red-flag thresholds, below), `meta/stt-vocab.txt` (optional STT vocabulary), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
