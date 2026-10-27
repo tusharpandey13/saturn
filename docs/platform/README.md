@@ -22,6 +22,7 @@ This folder carries **no health data** and no environment values: concrete resou
 2. [deploy.md](deploy.md): the generic deploy runbook (values come from the env repo).
 3. [decisions/](../decisions/README.md): why things are the way they are.
 4. Current deployment status, go-live state and blockers: env repo.
+5. [split-status.md](split-status.md): the product / env / records split, step by step (generic).
 
 ## Design docs
 
