@@ -149,7 +149,7 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     // finish: rows done, digest to the family group, nothing pruned yet
     const before = t.sent().length;
     const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: d, retentionDays: 14 });
-    expect(f).toEqual({ done: 7, pruned: 0, sentTo: 1, opsTo: 0 });
+    expect(f).toEqual({ done: 7, pruned: 0, sentTo: 1, opsTo: 0, skipped: false });
     expect(t.sent().slice(before).map((c) => [c.body.chat_id, c.body.text])).toEqual([[GROUP, d]]);
     expect((await db.prepare("SELECT count(*) AS n FROM inbox WHERE status = 'new'").first<any>()).n).toBe(0);
 
@@ -277,11 +277,48 @@ describe("batch details", () => {
     expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", DIGEST_FAILED]]);
   });
 
-  it("no admin reachable (DM fails): the failure notice falls back to the family group", async () => {
+  it("no admin reachable (DM fails): the failure notice is NOT posted to the family group", async () => {
     const { store, repo } = await ingestAll([]);
     const t = fakeTelegram({}, { failSendTo: "222" });
-    expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 })).toMatchObject({ sentTo: 1, opsTo: 0 });
-    expect(t.sent().filter((c) => c.ok).map((c) => [String(c.body.chat_id), c.body.text])).toEqual([[GROUP, DIGEST_FAILED]]);
+    expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 })).toMatchObject({ sentTo: 0, opsTo: 0 });
+    expect(t.sent().filter((c) => c.ok)).toEqual([]);
+    expect(repo.digestsSent()).toEqual([]);
+  });
+
+  it("failed or delayed run (27-Oct regression): admin DM only, no family digest, nothing logged", async () => {
+    const { store, r2, t, repo } = await ingestAll([textUpdate("aaj chakkar aaya")]);
+    await pull({ store, r2, tg: t.tg, repo });
+    const r = await run(repo, new MockExtractor(new ClaudeCliError(401, "auth_failed")));
+    expect(r.delayed).toBe(1); // batch/run.ts writes no digest file for a delayed run, so finish gets null
+    const before = t.sent().length;
+    const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: null, alerts: ["webhook moved"], retentionDays: 14 });
+    expect(f).toMatchObject({ sentTo: 0, opsTo: 1, skipped: false });
+    const sent = t.sent().slice(before).map((c) => [String(c.body.chat_id), c.body.text]);
+    expect(sent).toEqual([["222", `${DIGEST_FAILED}\n\n⚠ webhook moved`]]);
+    expect(sent.some(([chat]) => chat === String(GROUP))).toBe(false);
+    expect(repo.digestsSent()).toEqual([]);
+    // A full run later the same day still sends that day's one digest.
+    expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: "ok", retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
+  });
+
+  it("one family digest per IST day: a second run is skipped, force_digest resends, the next day sends", async () => {
+    const { store, t, repo } = await ingestAll([]);
+    const group = () => t.sent().filter((c) => c.ok && String(c.body.chat_id) === String(GROUP)).length;
+    expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: "d1", retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
+    expect(repo.digestsSent()).toEqual([{ date: "2026-10-25", message_ids: [1], sent_at: NOW, forced: false }]);
+    // 23:59 IST the same day (18:29Z): skipped, admins not bothered, no new log row
+    expect(await finish({ store, tg: t.tg, repo, now: "2026-10-25T18:29:00.000Z", digest: "d2", retentionDays: 14 })).toMatchObject({ sentTo: 0, opsTo: 0, skipped: true });
+    expect(group()).toBe(1);
+    expect(repo.digestsSent()).toHaveLength(1);
+    // explicit force_digest
+    expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: "d3", force: true, retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
+    expect(repo.digestsSent().at(-1)).toMatchObject({ date: "2026-10-25", forced: true });
+    // 00:01 IST the next day (18:31Z): a new day
+    expect(await finish({ store, tg: t.tg, repo, now: "2026-10-25T18:31:00.000Z", digest: "d4", retentionDays: 14 })).toMatchObject({ sentTo: 1, skipped: false });
+    expect(repo.digestsSent().at(-1)).toMatchObject({ date: "2026-10-26", forced: false });
+    expect(group()).toBe(3);
+    // the log is a .jsonl: tools/kb/build (reads *.ndjson) never sees it
+    expect(readFileSync(join(root, "data/telegram/digests.jsonl"), "utf8").trim().split("\n")).toHaveLength(3);
   });
 
   it("a message about another member stays with the sender and is flagged (subject_hint) for human review", async () => {

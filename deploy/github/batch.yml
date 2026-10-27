@@ -20,6 +20,10 @@ on:
         description: "Send the digest"
         type: boolean
         default: true
+      force_digest:
+        description: "Send the digest even if today's was already sent"
+        type: boolean
+        default: false
 
 concurrency:
   group: records-write # batch and records-pages both write the records repo
@@ -142,9 +146,10 @@ jobs:
         env:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           NO_DIGEST: ${{ (github.event_name == 'workflow_dispatch' && !inputs.send_digest) && '--no-digest' || '' }}
+          FORCE_DIGEST: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_digest) && '--force-digest' || '' }}
         run: |
           # shellcheck disable=SC2086
-          scripts/ci run $SECRETS_FINISH -- product/deploy/batch.sh finish --records records ${NO_DIGEST:+"$NO_DIGEST"}
+          scripts/ci run $SECRETS_FINISH -- product/deploy/batch.sh finish --records records ${NO_DIGEST:+"$NO_DIGEST"} ${FORCE_DIGEST:+"$FORCE_DIGEST"}
 
       - name: Validate records after the batch
         if: always() && env.SKIP != '1'

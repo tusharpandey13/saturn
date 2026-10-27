@@ -10,7 +10,7 @@
 //       KB build ok; finish -> rows done, digest sent to the group.
 //   npm run e2e:local
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -184,7 +184,7 @@ async function main() {
   console.log("7/9 extract with Claude auth failing -> exit 3, extraction delayed, rows stay new");
   const delayed = await batch(["extract"], { FAKE_CLAUDE_MODE: "auth" });
   check(delayed.code === 3, `expected exit 3, got ${delayed.code}: ${delayed.out}`);
-  check(readFileSync(digest, "utf8").includes("extraction delayed"), "digest lacks the delayed line");
+  check(!existsSync(digest), "a delayed run wrote a digest file (the family would get it)");
   const waiting = (await proxy.env.DB.prepare("SELECT status FROM inbox").all()).results;
   check(waiting.every((r) => r.status === "new"), `rows not left new: ${JSON.stringify(waiting)}`);
 
@@ -206,6 +206,14 @@ async function main() {
   check(done.length === 2 && done.every((r) => r.status === "done"), `inbox not done: ${JSON.stringify(done)}`);
   const digests = sent().slice(before);
   check(digests.length >= 1 && digests.every((c) => String(c.body.chat_id) === String(GROUP)), "digest not sent to the group");
+  check(readFileSync(join(root, "data", "telegram", "digests.jsonl"), "utf8").includes('"date":'), "digest not logged");
+
+  console.log("    second full run the same day -> digest skipped (one per day)");
+  check((await batch(["extract"])).code === 0, "re-extract failed");
+  const before2 = sent().length;
+  const again = await batch(["finish"]);
+  check(again.code === 0 && again.out.includes("digest skipped"), `second finish: ${again.out}`);
+  check(sent().slice(before2).every((c) => String(c.body.chat_id) !== String(GROUP)), "a second digest reached the group");
 
   console.log("\nE2E PASS: secret check, idempotent inbox insert, deterministic ack, media to R2, batch pull/extract/KB/finish, delayed path");
 }

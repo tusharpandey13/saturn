@@ -18,7 +18,7 @@ import { SARVAM_REST_MAX_SEC, SttJobFailedError } from "../../../adapters/stt/sa
 import type { Media, Person, Reading, SpeechToText, Symptom, Transcript } from "../types.js";
 import { parseVitals } from "../vitals.js";
 import { buildDigest, type DigestEntry, STT_PENDING_NOTE } from "./digest.js";
-import { MIME_OF_EXT, type RawRow, Repo, type Row, type SubjectOverride } from "./repo.js";
+import { dayOf, MIME_OF_EXT, type RawRow, Repo, type Row, type SubjectOverride } from "./repo.js";
 import { type Alias, displayOf, splitSubject } from "../subject.js";
 
 export const LOW_CONFIDENCE = 0.8; // same bar as v_needs_human in data/schema.sql
@@ -426,17 +426,21 @@ export interface FinishDeps {
   tg: TelegramAdapter;
   repo: Repo;
   now: string;
+  /** The digest text, or null when the run was not fully successful (pull/extract failed or delayed, KB build or
+   *  commit failed): then the family gets nothing and the admins get DIGEST_FAILED by DM. */
   digest: string | null;
   retentionDays: number;
   /** false: mark and prune only (manual re-runs). */
   send?: boolean;
+  /** Send even if today's digest (IST day, data/telegram/digests.jsonl) was already sent (dispatch input force_digest). */
+  force?: boolean;
   /** Operator alerts (e.g. the webhook assertion): sent to the admins by private DM as ⚠ lines. */
   alerts?: string[];
 }
 
 export const DIGEST_FAILED = `⚠ ${PRODUCT_NAME}: आज की प्रोसेसिंग पूरी नहीं हुई। सभी संदेश सुरक्षित हैं; कल दोबारा कोशिश होगी।`;
 
-export async function finish(d: FinishDeps): Promise<{ done: number; pruned: number; sentTo: number; opsTo: number }> {
+export async function finish(d: FinishDeps): Promise<{ done: number; pruned: number; sentTo: number; opsTo: number; skipped: boolean }> {
   // Only rows that are in git (the raw files of this checkout, which the workflow has pushed) are marked done.
   // Last ~2 months only, to keep the statement small; older rows were marked by earlier runs.
   const since = Date.parse(d.now) - 62 * DAY;
@@ -449,11 +453,14 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
   const { done, pruned, persons, chats } = await d.store.finishSnapshot(ids, d.now, pruneBefore);
   let sentTo = 0;
   let opsTo = 0;
+  let skipped = false;
   if (d.send !== false) {
     const family = chats.filter((c) => c.label === "family");
     // Ops lines (digest failure, webhook alerts) go to the admins by private DM (chat id = their Telegram user id; the
-    // admin must have started a private chat with the bot). No admin reachable: they fall back to the family group.
-    const ops = [...(d.digest === null ? [DIGEST_FAILED] : []), ...(d.alerts ?? []).map((a) => `⚠ ${a}`)];
+    // admin must have started a private chat with the bot). The digest-failure notice never goes to the family group
+    // (the failed workflow emails the owner); webhook alerts (security) fall back to it when no admin is reachable.
+    const alerts = (d.alerts ?? []).map((a) => `⚠ ${a}`);
+    const ops = [...(d.digest === null ? [DIGEST_FAILED] : []), ...alerts];
     if (ops.length) {
       const text = ops.join("\n\n");
       for (const a of persons.filter((p) => p.role === "admin")) {
@@ -464,12 +471,30 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
           console.error(`ops DM to an admin failed: ${(err as Error).name}`); // no ids or content in the log
         }
       }
+      if (!opsTo) console.log("::warning::no admin reachable by DM; the digest-failure notice was not delivered");
     }
-    const familyText = [d.digest, ...(opsTo ? [] : ops)].filter((x): x is string => !!x).join("\n\n");
-    if (familyText) for (const c of family) for (const part of splitMessage(familyText)) await d.tg.sendText(c.chat_id, part);
-    sentTo = familyText ? family.length : 0;
+    const fallback = opsTo ? [] : alerts;
+    // The family digest: fully successful runs only (digest !== null), at most once per IST day unless forced.
+    const day = dayOf(d.now);
+    skipped = d.digest !== null && !d.force && d.repo.digestsSent().some((r) => r.date === day);
+    const familyText = [...(d.digest !== null && !skipped ? [d.digest] : []), ...fallback].join("\n\n");
+    if (familyText && family.length) {
+      const messageIds: number[] = [];
+      try {
+        for (const c of family) {
+          for (const part of splitMessage(familyText)) {
+            const id = await d.tg.sendText(c.chat_id, part);
+            if (typeof id === "number") messageIds.push(id);
+          }
+          sentTo++;
+        }
+      } finally {
+        // Logged even after a partial send, so a re-run does not post a second digest the same day.
+        if (d.digest !== null && !skipped && (sentTo || messageIds.length)) d.repo.logDigest({ date: day, message_ids: messageIds, sent_at: d.now, forced: !!d.force });
+      }
+    }
   }
-  return { done, pruned, sentTo, opsTo };
+  return { done, pruned, sentTo, opsTo, skipped };
 }
 
 /** Telegram caps a message at 4096 characters. Split on line boundaries. */

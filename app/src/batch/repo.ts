@@ -3,6 +3,7 @@
 //   data/telegram/YYYY-MM.ndjson      extracted rows ("rt": "d1.messages|d1.readings|d1.symptoms"), read by tools/kb/build
 //   data/telegram/directory.ndjson    persons and chats ("rt": "d1.persons|d1.chats")
 //   data/queue/needs_deep.jsonl       work for the offline Opus agent (append-only)
+//   data/telegram/digests.jsonl       family digests sent (IST date, message ids): one digest per day (append-only)
 //   sources/<person>/media/telegram/<file_unique_id>.<ext>   photos, PDFs, voice notes (ADR 003)
 // .jsonl files are deliberately not *.ndjson: tools/kb/build only reads *.ndjson.
 // Months are Asia/Kolkata calendar months of the message's send time. Output is sorted and stable: re-running on
@@ -60,6 +61,19 @@ export interface SubjectOverride {
 export type Row = Record<string, unknown> & { rt: string };
 
 const TABLE_ORDER = ["d1.persons", "d1.chats", "d1.messages", "d1.readings", "d1.symptoms"];
+
+/** Asia/Kolkata calendar day (YYYY-MM-DD) of an instant: the digest's "today". */
+export function dayOf(iso: string): string {
+  return new Date(Date.parse(iso) + 330 * 60_000).toISOString().slice(0, 10);
+}
+
+/** data/telegram/digests.jsonl: one row per family digest sent. message_ids are the family-chat Telegram message ids. */
+export interface DigestSent {
+  date: string;
+  message_ids: number[];
+  sent_at: string;
+  forced: boolean;
+}
 
 export function monthOf(iso: string): string {
   const ist = new Date(Date.parse(iso) + 330 * 60_000); // Asia/Kolkata has no DST
@@ -223,5 +237,18 @@ export class Repo {
     const prev = existsSync(path) ? readFileSync(path, "utf8") : "";
     writeIfChanged(path, prev + add.map((e) => JSON.stringify(e) + "\n").join(""));
     return add.length;
+  }
+
+  // ---------- digest log ----------
+
+  digestsSent(): DigestSent[] {
+    return readLines(this.p("data/telegram/digests.jsonl"));
+  }
+
+  /** Append one sent digest (append-only). */
+  logDigest(row: DigestSent): void {
+    const path = this.p("data/telegram/digests.jsonl");
+    const prev = existsSync(path) ? readFileSync(path, "utf8") : "";
+    writeIfChanged(path, prev + line(row as unknown as Record<string, unknown>) + "\n");
   }
 }
