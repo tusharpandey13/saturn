@@ -381,8 +381,9 @@ def main(argv):
                 if not kind_of.get(v, "").startswith(want):
                     errors.append(f"{t} {rid}: {col} {v!r} does not resolve to a {want}")
     for where, rid, path, v, k in data_refs:
-        if kind_of.get(v) != f"ref:{k}":
-            errors.append(f"{where}: {rid} {path} {v!r} does not resolve to a ref:{k}")
+        want = k if k in ("source", "fact") else f"ref:{k}"  # x-ref "source"/"fact": a citation, not a ref
+        if kind_of.get(v) != want:
+            errors.append(f"{where}: {rid} {path} {v!r} does not resolve to a {want}")
     q = """SELECT n.id, n.status, o.id, o.status, n.kind = o.kind FROM {t} n JOIN {t} o ON o.id = n.supersedes"""
     for t in ("fact", "source", "ref"):
         for nid, nst, oid, ost, same in con.execute(q.format(t=t)):

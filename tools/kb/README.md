@@ -40,10 +40,11 @@ source path/page. A block whose content has not changed keeps its old date line,
 | Block | Page | From |
 |---|---|---|
 | `timeline` | `timeline.md` | `v_timeline` plus superseded rows from `fact`; oldest first, by year and month; marks uncertain, family/patient-reported, recollection, conflict |
-| `meds-current`, `meds-history` | `medications.md` | `v_meds_current`; every medication fact (superseded included) |
+| `meds-current`, `meds-history` | `medications.md` | `v_meds_current` (split into "current" and "not in the current list" when the ns has a `med-list-complete` event); every medication fact (superseded included); the prescriber column shows role, specialty, registration and public-check status |
 | `labs` | `labs.md` | `v_trend` key series (per person in `<records-dir>/data/meta/gen-views.json`; a person without a list gets every code), printed or computed flags, ranges |
 | `quality` | `data-quality.md` | `v_conflicts`, `v_internal_contradictions`, `v_needs_human` counts by reason, open hard reads, corrections |
 | `glance`, `asof` | `summary.md` | recent `v_meds_current` rows, `v_latest` key values; the "Data as of" line |
+| `care-team` | `care-team.md` | every party linked to the person's facts (or printed on their documents): `data.credentials` as printed + public checks, first/last seen, medicine instructions per prescriber. Display only |
 
 Add a block by placing the two marker lines in a page and running the script; an unknown NAME is an error.
 CI: the records repo runs `gen-views --records . --check` so a stale page fails; the batch runs `gen-views` after the build step.
@@ -62,6 +63,10 @@ uncertain_ref, status, supersedes, recorded_by, created_at, tags`; `data` is che
 
 **External raw files:** a source whose raw file is kept outside git on purpose (e.g. `<media-dir>/`)
 sets `"external": true` and says where in `note`; the build then skips the path check. Without a note it is an error.
+
+**Credentials (party refs).** `data.credentials` holds what the documents print (each field cited in `printed[]`: source id, page, quote) and the public checks (`verified[]` / `accreditation[]`: URL, date, matched / not found / mismatch / not checked). Display only, never a rank ([AGENTS.md](../../AGENTS.md) section 6; [method](../../docs/log/research/2026-10-27-clinician-credentials.md)). Inside `data`, `x-ref: source` marks a citation that must resolve to a source.
+
+**Folding a per-task ref that adds to an existing ref.** A row in `data/ref/<kind>-<TASK>.ndjson` with the id of an existing ref replaces it on fold only if it keeps every value and just adds (data keys, tags, text appended to the note); any changed value stops the run.
 
 **Merging duplicate refs (alias, not rewrite).** Facts are never edited (ADR 007), so a duplicate ref is merged by
 setting `supersedes: <duplicate id>` on the kept ref and `status: superseded` on the duplicate. Facts keep the id they

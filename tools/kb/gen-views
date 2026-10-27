@@ -8,7 +8,7 @@ Every <records>/docs/health/<ns>/*.md (ns = the namespaces in <records>/records.
   <!-- gen:NAME start --> ... <!-- gen:NAME end -->
 and only the text between the markers is replaced. Text outside the markers is never touched. Blocks:
   timeline (timeline.md), meds-current + meds-history (medications.md), labs (labs.md), quality (data-quality.md),
-  glance + asof (summary.md).
+  glance + asof (summary.md), care-team (care-team.md: credentials, first/last seen, instructions).
 A block whose content is unchanged apart from its "Generated ... on <date>" line is left as it is, so a second run (or
 a run on a later day with the same data) gives no diff. --check writes nothing and exits 1 if any page would change.
 Python stdlib + sqlite3 only. Record and flag only: the blocks show rows as stored, never a judgement.
@@ -107,8 +107,8 @@ class KB:
         page = f" p.{f['page']}" if f["page"] is not None else ""
         return code(fid), f"{code(path)}{page}"
 
-    def party(self, fid):
-        """Who/where: the fact's own party refs, else its context event's, else its source's."""
+    def party_ids(self, fid):
+        """Who/where: the fact's own party refs, else its context event's, else its source's (current ids, unique)."""
         f = self.facts[fid]
         d = j(f["data"])
         ids = [d.get("practitioner_id"), d.get("prescriber_id"), d.get("org_id")]
@@ -119,11 +119,47 @@ class KB:
             s = self.sources.get(f["source_id"])
             if s:
                 ids = [s["practitioner_id"], s["org_id"]]
-        seen = []
+        out = []
         for i in ids:
-            if i and self.name(i) not in seen:
-                seen.append(self.name(i))
-        return "; ".join(seen)
+            i = self.current.get(i, i) if i else None
+            if i and i not in out:
+                out.append(i)
+        return out
+
+    def party(self, fid):
+        return "; ".join(dict.fromkeys(self.name(i) for i in self.party_ids(fid)))
+
+    def cred(self, ref_id):
+        """data.credentials of a party ref ({} if none)."""
+        r = self.refs.get(self.current.get(ref_id, ref_id))
+        return j(r["data"]).get("credentials") or {} if r else {}
+
+    def who(self, ref_id):
+        """Name + role, specialty and public-check status, as recorded. Display only: never a rank (AGENTS.md 6)."""
+        r = self.refs.get(self.current.get(ref_id, ref_id))
+        if not r:
+            return ref_id or ""
+        c, kind = self.cred(ref_id), j(r["data"]).get("kind")
+        if kind == "practitioner":
+            reg = c.get("registration")
+            bits = [c.get("role"), c.get("specialty"),
+                    f"reg {reg['number']}" if reg else "reg not printed",
+                    f"public check: {c['verification_summary']}" if c.get("verification_summary") else "not checked"]
+        else:
+            acc = [a for a in c.get("accreditation", []) if a.get("result") == "matched"]
+            bits = [c.get("type")] + ([", ".join(f"{a['body']} {a.get('level') or ''}".strip() for a in acc)]
+                                      if acc else ["no accreditation found" if c else "not checked"])
+        return f"{r['name']} ({'; '.join(b for b in bits if b)})"
+
+    def authors(self, fid):
+        """Who wrote or issued it, with credentials; says so when no prescriber/practitioner is recorded."""
+        ids = self.party_ids(fid)
+        if not ids:
+            return "not recorded"
+        people = [i for i in ids if j(self.refs[i]["data"]).get("kind") == "practitioner"] if all(
+            i in self.refs for i in ids) else []
+        out = " / ".join(self.who(i) for i in ids)
+        return out if people else out + " (no named doctor recorded)"
 
     def marks(self, fid):
         """Uncertain / family-reported / recollection / conflict flags for one fact (shown, never resolved)."""
@@ -261,23 +297,50 @@ def med_cols(kb, fid):
     return f, d, drug, generic
 
 
-def b_meds_current(kb, ns):
-    rows = kb.q("SELECT id FROM v_meds_current WHERE ns = ? ORDER BY at DESC, drug", ns)
-    if not rows:
-        return no_rows(ns)
-    out = [f"{len(rows)} drugs: the **latest statement per drug** in the KB (`v_meds_current`), newest first. "
-           "Status is what that statement says (prescribed / dispensed / taking / stopped); verification is how well "
-           "it was read (unverified / agent / human / patient / clinician). A drug is listed here even when a later "
-           "prescription leaves it out; \"latest\" does not mean \"taken now\".", ""]
+MEDS_COLS = ["Drug", "Brand (as written)", "Generic", "Strength", "Schedule (as written)", "Status", "Verification",
+             "Latest date", "Prescriber (role; specialty; reg check)", "Marks", "Fact id · source"]
+
+
+def meds_table(kb, rows, status_col):
     body = []
-    for (fid,) in rows:
+    for fid, status in rows:
         f, d, drug, generic = med_cols(kb, fid)
         fact_id, src = kb.cite(fid)
-        body.append([drug, d.get("brand"), generic, d.get("strength"), d.get("schedule_raw"), d.get("status"),
-                     f["verification"], fdate(f["at"], f["at_precision"]), kb.party(fid), kb.marks(fid),
+        body.append([drug, d.get("brand"), generic, d.get("strength"), d.get("schedule_raw"), status_col(d, status),
+                     f["verification"], fdate(f["at"], f["at_precision"]), kb.authors(fid), kb.marks(fid),
                      f"{fact_id} · {src}"])
-    return out + table(["Drug", "Brand (as written)", "Generic", "Strength", "Schedule (as written)", "Status",
-                        "Verification", "Latest date", "Prescriber", "Marks", "Fact id · source"], body)
+    return table(MEDS_COLS, body)
+
+
+def b_meds_current(kb, ns):
+    rows = kb.q("SELECT id, list_status, display_status, list_id, list_at FROM v_meds_current WHERE ns = ? "
+                "ORDER BY at DESC, drug", ns)
+    if not rows:
+        return no_rows(ns)
+    legend = ("Status is what that statement says (prescribed / dispensed / taking / stopped); verification is how well "
+              "it was read (unverified / agent / human / patient / clinician).")
+    if rows[0][3] is None:  # no complete-list snapshot for this ns
+        out = [f"{len(rows)} drugs: the **latest statement per drug** in the KB (`v_meds_current`), newest first. "
+               f"{legend} A drug is listed here even when a later prescription leaves it out; \"latest\" does not mean "
+               "\"taken now\".", ""]
+        return out + meds_table(kb, [(r[0], None) for r in rows], lambda d, s: d.get("status"))
+    list_id, day = rows[0][3], fdate(rows[0][4][:10])
+    cur = [(r[0], r[2]) for r in rows if r[1] == "on-list" or (r[1] == "after-list" and r[2] != "stopped")]
+    rest = [(r[0], r[2]) for r in rows if (r[0], r[2]) not in cur]
+    n_old = sum(1 for r in rows if r[1] == "not-in-current-list")
+    out = [f"#### Current ({day} complete list)", "",
+           f"{len(cur)} drugs: the drugs on the complete list confirmed on {day} ({code(list_id)}), plus any drug first "
+           f"stated after it, each with its **latest statement** in the KB (`v_meds_current`), newest first. {legend}",
+           ""]
+    out += meds_table(kb, cur, lambda d, s: s) if cur else ["None."]
+    out += ["", f"#### Not in the current list ({day} complete list)", "",
+            f"{len(rest)} drugs: {n_old} whose latest statement predates the {day} list and are not on it (status "
+            "`not-in-current-list`; derived for display, no fact changed), and those stated as `stopped` on or after "
+            "it. The status as written is in brackets. Ask the treating doctor before reading any of these as stopped "
+            "or current.", ""]
+    out += meds_table(kb, rest, lambda d, s: s if s == d.get("status") else f"{s} ({d.get('status')})") \
+        if rest else ["None."]
+    return out
 
 
 def b_meds_history(kb, ns):
@@ -285,16 +348,20 @@ def b_meds_history(kb, ns):
                 "ORDER BY at, id", ns)
     if not rows:
         return no_rows(ns)
-    out = [f"{len(rows)} medicine statements, oldest first, including superseded rows.", ""]
+    out = [f"{len(rows)} medicine statements, oldest first, including superseded rows. The prescriber column shows "
+           "each author's role, specialty and public-register check as recorded "
+           "([care team](care-team.md)). Where two statements differ, both stand; seniority does not settle it. "
+           "Ask the treating doctor.", ""]
     body = []
     for (fid,) in rows:
         f, d, drug, generic = med_cols(kb, fid)
         fact_id, src = kb.cite(fid)
         body.append([fdate(f["at"], f["at_precision"]), drug, d.get("brand"), d.get("strength"),
                      d.get("schedule_raw"), d.get("duration_text"), d.get("status"), f["verification"],
-                     kb.party(fid), kb.marks(fid), kb.record_status(fid), f"{fact_id} · {src}"])
+                     kb.authors(fid), kb.marks(fid), kb.record_status(fid), f"{fact_id} · {src}"])
     return out + table(["Date", "Drug", "Brand (as written)", "Strength", "Schedule", "Duration", "Status",
-                        "Verification", "Prescriber", "Marks", "Record", "Fact id · source"], body)
+                        "Verification", "Prescriber (role; specialty; reg check)", "Marks", "Record",
+                        "Fact id · source"], body)
 
 
 def series_rows(kb, ns, codes):
@@ -343,16 +410,19 @@ def b_quality(kb, ns):
     out += [f"### Conflicts between sources ({len(conf)})", "",
             "Two sources give different values for the same test on the same day (`v_conflicts`). Both are shown; "
             "neither is chosen. **To resolve:** check both page images; if one is a misread, add a corrected fact with "
-            "`supersedes` (never edit the old row); if both are as printed, leave both and ask the doctor which applies.",
+            "`supersedes` (never edit the old row); if both are as printed, leave both and ask the doctor which applies. "
+            "Each side shows who issued it, with role, specialty and register/accreditation check as recorded; this is "
+            "context for the doctor, never a way to pick a side.",
             ""]
     if conf:
         rows = []
         for r in conf:
             a_id, a_src = kb.cite(r["id_a"])
             b_id, b_src = kb.cite(r["id_b"])
-            rows.append([r["day"], kb.name(r["code"]), r["method"], r["value_a"], f"{a_id} · {a_src}", r["value_b"],
-                         f"{b_id} · {b_src}"])
-        out += table(["Day", "Test", "Method", "Value A", "Fact A · source", "Value B", "Fact B · source"], rows)
+            rows.append([r["day"], kb.name(r["code"]), r["method"], r["value_a"], kb.authors(r["id_a"]),
+                         f"{a_id} · {a_src}", r["value_b"], kb.authors(r["id_b"]), f"{b_id} · {b_src}"])
+        out += table(["Day", "Test", "Method", "Value A", "Issued by A", "Fact A · source", "Value B", "Issued by B",
+                      "Fact B · source"], rows)
     else:
         out.append("None.")
     ic = kb.q("SELECT * FROM v_internal_contradictions WHERE ns = ? ORDER BY day, id", ns)
@@ -439,7 +509,80 @@ def b_asof(kb, ns):
             "[timeline](timeline.md), [medications](medications.md), [labs](labs.md), [data quality](data-quality.md)."]
 
 
-RENDER = {"timeline": b_timeline, "meds-current": b_meds_current, "meds-history": b_meds_history, "labs": b_labs,
+def b_care_team(kb, ns):
+    """Every party linked to this person's facts: credentials as printed + public checks, first/last seen, and the
+    medicine statements each prescriber wrote. Display only; no ranking (AGENTS.md section 6)."""
+    seen, meds = {}, {}
+    for fid, f in kb.facts.items():
+        if f["ns"] != ns or f["status"] == "retracted":
+            continue
+        day = f["at"][:10]
+        for i in kb.party_ids(fid):
+            lo, hi = seen.get(i, (day, day))
+            seen[i] = (min(lo, day), max(hi, day))
+        if f["kind"] == "medication":
+            p = j(f["data"]).get("prescriber_id")
+            meds.setdefault(kb.current.get(p, p) if p else None, []).append(fid)
+    for i, r in kb.refs.items():  # printed on this person's documents but not linked to a fact (e.g. letterhead names)
+        for pr in (kb.cred(i).get("printed") or []) if i == kb.current.get(i, i) else []:
+            s = kb.sources.get(pr["source_id"])
+            if s and s["ns"] == ns and s["issued_at"]:
+                day = s["issued_at"][:10]
+                lo, hi = seen.get(i, (day, day))
+                seen[i] = (min(lo, day), max(hi, day))
+    if not seen:
+        return no_rows(ns)
+    people = sorted((i for i in seen if j(kb.refs[i]["data"]).get("kind") == "practitioner"), key=lambda i: seen[i][1],
+                    reverse=True)
+    places = sorted((i for i in seen if i not in people), key=lambda i: seen[i][1], reverse=True)
+    out = ["Credentials as printed on this person's documents (cited in `data/ref/party.ndjson` → `credentials.printed`) and "
+           "what public registers and official pages showed when checked (`credentials.verified`; method: "
+           "[credentials note](../../log/research/2026-10-27-clinician-credentials.md)). **Display only.** Nobody is "
+           "ranked: where instructions differ, both stand and the treating doctor decides. \"Not found\" means a public "
+           "register did not show it, not that anything is wrong. First/last seen = dates of KB facts linked to them, or of the documents that print their name.",
+           "", "**Doctors**", ""]
+
+    def instr(pid):
+        by = {}
+        for fid in sorted(meds.get(pid, []), key=lambda x: (kb.facts[x]["at"], x)):
+            f = kb.facts[fid]
+            d = j(f["data"])
+            by.setdefault((fdate(f["at"], f["at_precision"]), f["source_id"]), []).append(
+                " ".join(dict.fromkeys(b for b in [d.get("brand") or kb.name(d.get("drug_id")), d.get("strength"),
+                                                   d.get("schedule_raw")] if b)))
+        return "; ".join(f"{dt}: {', '.join(v)} ({code(src)})" for (dt, src), v in by.items()) or "none recorded"
+
+    rows = []
+    for i in people:
+        c, r = kb.cred(i), kb.refs[i]
+        reg = c.get("registration")
+        regs = f"{reg.get('as_printed') or reg['number']}" if reg else "not printed"
+        degrees = "; ".join(c["degrees"]) if "degrees" in c else j(r["data"]).get("qualification", "")
+        rows.append([r["name"], degrees or "not printed",
+                     c.get("role"), c.get("specialty"), kb.name(c["institution_id"]) if c.get("institution_id") else "",
+                     regs, c.get("verification_summary", "not checked"), fdate(seen[i][0]), fdate(seen[i][1]),
+                     instr(i), code(i)])
+    out += table(["Name", "Degrees (as printed)", "Role (as printed)", "Specialty", "Institution",
+                  "Registration (as printed)", "Public check", "First seen", "Last seen",
+                  "Medicine instructions on record", "Ref id"], rows)
+    out += ["", "**Hospitals, labs and centres**", ""]
+    rows = []
+    for i in places:
+        c, r = kb.cred(i), kb.refs[i]
+        acc = "; ".join(f"{a['body']}{' ' + a['level'] if a.get('level') else ''}: {a['result']}"
+                        + (f" ({a['id']}, to {fdate(a['valid_to'])})" if a.get("id") else "")
+                        for a in c.get("accreditation", [])) or "not checked"
+        rows.append([r["name"], c.get("type") or j(r["data"]).get("kind"), c.get("city") or j(r["data"]).get("city"),
+                     acc, fdate(seen[i][0]), fdate(seen[i][1]), code(i)])
+    out += table(["Name", "Type", "City", "Accreditation (public register)", "First seen", "Last seen", "Ref id"], rows)
+    n = len(meds.get(None, []))
+    if n:
+        out += ["", f"{n} medicine statements have no named prescriber in the KB; [medications](medications.md) shows "
+                "the facility they came from."]
+    return out
+
+
+RENDER = {"care-team": b_care_team, "timeline": b_timeline, "meds-current": b_meds_current, "meds-history": b_meds_history, "labs": b_labs,
           "quality": b_quality, "glance": b_glance, "asof": b_asof}
 
 

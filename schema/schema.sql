@@ -188,16 +188,38 @@ ORDER BY ns, at, kind, id;
 
 -- Current medicines: the latest active statement per ns and drug (brand when no drug_id). Same day: stopped > taking
 -- > dispensed > prescribed. med_status says what the statement is; verification says how well it was read.
+-- Complete-list snapshot: an active event fact with data.type 'med-list-complete' (latest per ns) lists data.drug_ids.
+-- When one exists, list_status is 'on-list' (drug in the snapshot; its latest statement stands), 'not-in-current-list'
+-- (latest statement predates the snapshot day and the drug is not in it) or 'after-list' (not in it; stated on or after
+-- the snapshot day); NULL when the ns has no snapshot. display_status = 'not-in-current-list' for those, else
+-- med_status. Derived for display only; no fact is edited.
 CREATE VIEW v_meds_current AS
-SELECT ns, drug, generic, brand, med_status, strength, schedule_raw, at, verification, uncertain_ref, id, source_id FROM (
-  SELECT f.ns, coalesce(json_extract(f.data, '$.drug_id'), 'brand:' || lower(json_extract(f.data, '$.brand'))) AS drug,
-         json_extract(d.data, '$.generic') AS generic, json_extract(f.data, '$.brand') AS brand,
-         json_extract(f.data, '$.status') AS med_status, json_extract(f.data, '$.strength') AS strength,
-         json_extract(f.data, '$.schedule_raw') AS schedule_raw, f.at, f.verification, f.uncertain_ref, f.id, f.source_id,
-         ROW_NUMBER() OVER (PARTITION BY f.ns, coalesce(json_extract(f.data, '$.drug_id'), lower(json_extract(f.data, '$.brand')))
-           ORDER BY f.at DESC, CASE json_extract(f.data, '$.status') WHEN 'stopped' THEN 0 WHEN 'taking' THEN 1
-                                   WHEN 'dispensed' THEN 2 ELSE 3 END, f.created_at DESC) AS rn
-  FROM fact f LEFT JOIN ref d ON d.id = json_extract(f.data, '$.drug_id')
-  WHERE f.kind = 'medication' AND f.status = 'active')
-WHERE rn = 1
+WITH snap AS (
+  SELECT ns, id, at, data FROM (
+    SELECT f.*, ROW_NUMBER() OVER (PARTITION BY f.ns ORDER BY f.at DESC, f.created_at DESC, f.id DESC) AS rn
+    FROM fact f WHERE f.kind = 'event' AND f.status = 'active' AND json_extract(f.data, '$.type') = 'med-list-complete')
+  WHERE rn = 1),
+latest AS (
+  SELECT ns, drug, generic, brand, med_status, strength, schedule_raw, at, verification, uncertain_ref, id, source_id FROM (
+    SELECT f.ns, coalesce(json_extract(f.data, '$.drug_id'), 'brand:' || lower(json_extract(f.data, '$.brand'))) AS drug,
+           json_extract(d.data, '$.generic') AS generic, json_extract(f.data, '$.brand') AS brand,
+           json_extract(f.data, '$.status') AS med_status, json_extract(f.data, '$.strength') AS strength,
+           json_extract(f.data, '$.schedule_raw') AS schedule_raw, f.at, f.verification, f.uncertain_ref, f.id, f.source_id,
+           ROW_NUMBER() OVER (PARTITION BY f.ns, coalesce(json_extract(f.data, '$.drug_id'), lower(json_extract(f.data, '$.brand')))
+             ORDER BY f.at DESC, CASE json_extract(f.data, '$.status') WHEN 'stopped' THEN 0 WHEN 'taking' THEN 1
+                                     WHEN 'dispensed' THEN 2 ELSE 3 END, f.created_at DESC) AS rn
+    FROM fact f LEFT JOIN ref d ON d.id = json_extract(f.data, '$.drug_id')
+    WHERE f.kind = 'medication' AND f.status = 'active')
+  WHERE rn = 1),
+tagged AS (
+  SELECT l.*, s.id AS list_id, s.at AS list_at,
+         CASE WHEN s.id IS NULL THEN NULL
+              WHEN EXISTS (SELECT 1 FROM json_each(s.data, '$.drug_ids') WHERE value = l.drug) THEN 'on-list'
+              WHEN substr(l.at, 1, 10) < substr(s.at, 1, 10) THEN 'not-in-current-list'
+              ELSE 'after-list' END AS list_status
+  FROM latest l LEFT JOIN snap s ON s.ns = l.ns)
+SELECT ns, drug, generic, brand, med_status, strength, schedule_raw, at, verification, uncertain_ref, id, source_id,
+       list_status, CASE list_status WHEN 'not-in-current-list' THEN list_status ELSE med_status END AS display_status,
+       list_id, list_at
+FROM tagged
 ORDER BY ns, drug;

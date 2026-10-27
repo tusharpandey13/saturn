@@ -16,7 +16,7 @@ if "--records" in sys.argv:
     RECORDS = pathlib.Path(sys.argv[i + 1]).resolve()
     del sys.argv[i:i + 2]
 GEN = HERE / "gen-views"
-BLOCKS = ["asof", "timeline", "meds-current", "meds-history", "labs", "quality", "glance"]
+BLOCKS = ["asof", "timeline", "meds-current", "meds-history", "labs", "quality", "glance", "care-team"]
 PAGE = "---\ntitle: test\n---\n\n# Test page\n\nHand-written text stays.\n\n" + "\n\n".join(
     f"<!-- gen:{b} start -->\n<!-- gen:{b} end -->" for b in BLOCKS) + "\n\nTrailing narrative stays.\n"
 
@@ -32,7 +32,9 @@ def make_fixture_db(path):
     con.execute("INSERT INTO person (id, name) VALUES ('alice', 'Test Person')")
     refs = [("ref:code:potassium", "code", "Potassium", {}), ("ref:code:lvef", "code", "LV ejection fraction", {}),
             ("ref:drug:testol", "drug", "Testol", {"generic": "testolol"}),
-            ("ref:party:dr-test", "party", "Dr Test", {"kind": "practitioner"})]
+            ("ref:party:dr-test", "party", "Dr Test", {"kind": "practitioner", "credentials": {
+                "degrees": ["MBBS"], "role": "Resident", "specialty": "Cardiology",
+                "registration": {"number": "123", "as_printed": "Reg 123 (Test)"}, "verification_summary": "matched"}})]
     for i, k, n, d in refs:
         con.execute("INSERT INTO ref (id, ns, kind, name, data, recorded_by, created_at) VALUES (?, 'ref', ?, ?, ?, ?, ?)",
                     (i, k, n, json.dumps(d), env["recorded_by"], env["created_at"]))
@@ -94,7 +96,7 @@ class FixtureTest(unittest.TestCase):
 
     def test_run_ok(self):
         self.assertEqual(self.first.returncode, 0, self.first.stdout + self.first.stderr)
-        self.assertIn("ok: 7 blocks, 1 pages updated", self.first.stdout)
+        self.assertIn("ok: 8 blocks, 1 pages updated", self.first.stdout)
 
     def test_outside_text_untouched(self):
         self.assertTrue(self.text.startswith("---\ntitle: test\n---\n\n# Test page\n\nHand-written text stays.\n\n"))
@@ -121,6 +123,14 @@ class FixtureTest(unittest.TestCase):
         self.assertIn("| Testol | Testol | testolol | 5 mg |  | stopped |", cur)
         self.assertNotIn("lab-a.testol` ", cur)  # the superseded row is not current
         self.assertIn("superseded by", self.block("meds-history"))
+        self.assertIn("Dr Test (Resident; Cardiology; reg 123; public check: matched)", self.block("meds-history"))
+
+    def test_care_team(self):
+        ct = self.block("care-team")
+        self.assertIn("| Dr Test | MBBS | Resident | Cardiology |  | Reg 123 (Test) | matched | 01-Jan-2026 | 01-Jan-2026 |", ct)
+        self.assertIn("01-Jan-2026: Testol 5 mg (`alice:src:2026-01-01-lab-a`)", ct)
+        self.assertIn("Display only.", ct)
+        self.assertNotIn("score", ct.lower())
 
     def test_labs_and_quality(self):
         labs = self.block("labs")
@@ -152,6 +162,43 @@ class FixtureTest(unittest.TestCase):
             self.assertIn("unknown block gen:nope", r.stderr)
         finally:
             stale.unlink()
+
+
+class MedListSnapshotTest(unittest.TestCase):
+    """A med-list-complete event splits meds-current: listed drugs vs older drugs not on the list (display only)."""
+
+    def test_two_sections(self):
+        with tempfile.TemporaryDirectory() as t:
+            t = pathlib.Path(t)
+            db = t / "kb.sqlite"
+            make_fixture_db(db)
+            con = sqlite3.connect(db)
+            con.execute("INSERT INTO ref (id, ns, kind, name, data, recorded_by, created_at) VALUES "
+                        "('ref:drug:newol', 'ref', 'drug', 'Newol', '{}', 'test', '2026-01-01')")
+            ins = ("INSERT INTO fact (id, ns, kind, at, at_precision, data, source_id, verification, recorded_by, "
+                   "created_at) VALUES (?, 'alice', ?, ?, 'day', ?, 'alice:src:2026-02-01-recall', 'patient', 'test', "
+                   "'2026-02-01')")
+            con.execute(ins, ("alice:fact:2026-02-01-recall.newol", "medication", "2026-02-01",
+                              json.dumps({"status": "taking", "brand": "Newol", "drug_id": "ref:drug:newol"})))
+            con.execute(ins, ("alice:fact:2026-02-01-recall.list", "event", "2026-02-01",
+                              json.dumps({"type": "med-list-complete", "drug_ids": ["ref:drug:newol"]})))
+            con.commit()
+            st = dict(con.execute("SELECT drug, list_status || '/' || display_status FROM v_meds_current").fetchall())
+            con.close()
+            self.assertEqual(st, {"ref:drug:newol": "on-list/taking",
+                                  "ref:drug:testol": "not-in-current-list/not-in-current-list"})
+            page = t / "docs" / "health" / "alice" / "medications.md"
+            page.parent.mkdir(parents=True)
+            page.write_text("<!-- gen:meds-current start -->\n<!-- gen:meds-current end -->\n")
+            shutil.copy(EXAMPLE / "records.yaml", t / "records.yaml")
+            r = gen("--db", str(db), "--records", str(t), "--today", "2026-03-01")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            s = page.read_text()
+            cur, rest = s.split("#### Not in the current list (01-Feb-2026 complete list)")
+            self.assertIn("#### Current (01-Feb-2026 complete list)", cur)
+            self.assertIn("| Newol |", cur)
+            self.assertNotIn("| Testol |", cur)
+            self.assertIn("| Testol | Testol | testolol | 5 mg |  | not-in-current-list (stopped) |", rest)
 
 
 class StalenessTest(unittest.TestCase):

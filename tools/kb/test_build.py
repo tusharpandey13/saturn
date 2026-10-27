@@ -94,7 +94,12 @@ class TelegramMappingTest(unittest.TestCase):
                          self.q("SELECT id FROM v_trend WHERE ns = 'alice' AND code = 'ref:code:potassium' "
                                 "ORDER BY at DESC, CASE rank WHEN 'original' THEN 0 ELSE 1 END LIMIT 1"))
         meds = dict(self.q("SELECT drug, med_status FROM v_meds_current WHERE ns = 'alice'"))
-        self.assertEqual(meds.get("ref:drug:examplezole"), "dispensed")
+        self.assertEqual(meds.get("ref:drug:examplezole"), "taking")  # the 10-Jun family list supersedes the 20-May Rx
+        snap = self.q("SELECT drug, list_status, display_status FROM v_meds_current WHERE ns = 'alice'")
+        self.assertEqual(snap, [("ref:drug:examplezole", "on-list", "taking")])
+        self.assertEqual(self.q("SELECT count(*) FROM v_meds_current WHERE ns = 'bob' AND list_status IS NOT NULL"), [(0,)])
+        cred = self.q("SELECT json_extract(data, '$.credentials.verification_summary') FROM ref WHERE id = 'ref:party:dr-example'")
+        self.assertEqual(cred, [("matched",)])
         kinds = {k for (k,) in self.q("SELECT DISTINCT kind FROM v_timeline WHERE ns = 'alice'")}
         self.assertEqual(kinds, {"event", "medication", "observation"})
         self.assertEqual(self.q("SELECT count(*) FROM v_needs_human WHERE uncertain_ref = 'G-01'"), [(2,)])
