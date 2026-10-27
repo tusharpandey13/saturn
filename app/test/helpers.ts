@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { TelegramAdapter, type TgUpdate } from "../src/channel/telegram.js";
 import { openSqlite } from "../src/dev/sqlite-d1.js";
-import type { IngestIO } from "../src/ingest.js";
+import type { AckMode, IngestIO } from "../src/ingest.js";
 import { Store } from "../src/store.js";
 
 export const TOKEN = "123:SECRET-BOT-TOKEN";
@@ -12,8 +12,8 @@ export const GROUP = "-1001234567890";
 
 export const fixture = (name: string): TgUpdate => JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "fixtures", "app", "telegram", `${name}.json`), "utf8"));
 
-export function fakeTelegram(files: Record<string, Uint8Array> = {}, opts: { failFile?: boolean; failSend?: boolean } = {}) {
-  const calls: { method: string; body: any }[] = [];
+export function fakeTelegram(files: Record<string, Uint8Array> = {}, opts: { failFile?: boolean; failSend?: boolean; failSendTo?: string } = {}) {
+  const calls: { method: string; body: any; ok?: boolean }[] = [];
   const fetchFn = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
     const url = String(input);
     const file = url.match(/\/file\/bot[^/]+\/(.+)$/);
@@ -24,9 +24,10 @@ export function fakeTelegram(files: Record<string, Uint8Array> = {}, opts: { fai
     }
     const method = url.split("/").pop()!;
     const body = init.body ? JSON.parse(String(init.body)) : {};
-    calls.push({ method, body });
+    const fail = method === "sendMessage" && (opts.failSend || (opts.failSendTo !== undefined && String(body.chat_id) === opts.failSendTo));
+    calls.push({ method, body, ok: !fail });
     if (method === "getFile") return Response.json({ ok: true, result: { file_path: body.file_id } });
-    if (method === "sendMessage" && opts.failSend) return Response.json({ ok: false }, { status: 500 });
+    if (fail) return Response.json({ ok: false, description: "Forbidden: bot can't initiate conversation with a user" }, { status: 403 });
     return Response.json({ ok: true, result: { message_id: 1 } });
   }) as typeof fetch;
   return { calls, fetchFn, tg: new TelegramAdapter(TOKEN, fetchFn, "https://tg.test"), sent: () => calls.filter((c) => c.method === "sendMessage") };
@@ -52,14 +53,25 @@ export async function seededStore() {
   const db = openSqlite();
   const store = new Store(db);
   await store.addChat(GROUP, "telegram", "family");
-  await store.addPerson({ id: "alice", name: "Alice", role: "patient", senderId: "111" });
-  await store.addPerson({ id: "bob", name: "Bob", role: "patient", senderId: "333" });
-  await store.addPerson({ id: "caregiver", name: "Carol", role: "caregiver", senderId: "222" });
+  await store.addPerson({ id: "alice", name: "Alice", role: "member", senderId: "111" });
+  await store.addPerson({ id: "bob", name: "Bob", role: "member", senderId: "333" });
+  // An admin is a member too. D1 id differs from the KB namespace (records d1_person_map: carol-tg -> carol).
+  await store.addPerson({ id: "carol-tg", name: "Carol", role: "admin", senderId: "222" });
+  await store.replaceAliases(ALIASES);
   return { db, store };
 }
 
-export function ingestIO(store: Store, tg: TelegramAdapter, r2 = memR2()): IngestIO & { r2: ReturnType<typeof memR2> } {
-  return { secret: SECRET, store, tg, putMedia: (k, b, m) => r2.put(k, b, m), r2 };
+/** Synthetic name prefixes (as the batch syncs them from records.yaml aliases), keyed by D1 person id. */
+export const ALIASES = [
+  { alias: "alice", personId: "alice", display: "Alice" },
+  { alias: "ali", personId: "alice", display: "Alice" },
+  { alias: "एलिस", personId: "alice", display: "Alice" },
+  { alias: "bob", personId: "bob", display: "Bob" },
+  { alias: "carol", personId: "carol-tg", display: "Carol" },
+];
+
+export function ingestIO(store: Store, tg: TelegramAdapter, r2 = memR2(), ackMode: AckMode = "all"): IngestIO & { r2: ReturnType<typeof memR2> } {
+  return { ackMode, secret: SECRET, store, tg, putMedia: (k, b, m) => r2.put(k, b, m), r2 };
 }
 
 export const webhook = (update: unknown, secret = SECRET) =>

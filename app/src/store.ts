@@ -1,6 +1,7 @@
 // D1 access, over the D1 API subset. The same SQL runs on Cloudflare D1 in the Worker, on the D1 REST API in the
 // daily batch (src/batch/cloudflare.ts) and on node:sqlite in tests (src/dev/sqlite-d1.ts).
 
+import type { Alias } from "./subject.js";
 import type { Person } from "./types.js";
 
 export interface Stmt {
@@ -28,6 +29,17 @@ export interface InboxRow {
   media_key: string | null;
   media_status: MediaStatus;
   ack: string | null;
+  /** Who the message is about (D1 person id); the sender unless a name prefix or a /for correction says otherwise. */
+  subject_id: string | null;
+}
+
+export interface SubjectCorrection {
+  id: number;
+  update_id: number;
+  subject_id: string;
+  set_by: string;
+  set_at: string;
+  reason: string | null;
 }
 
 const rowToPerson = (r: any): Person => ({ id: r.id, name: r.name, role: r.role, senderId: r.sender_id });
@@ -67,13 +79,57 @@ export class Store {
     await this.db.prepare("UPDATE OR IGNORE chats SET chat_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE chat_id = ?").bind(toId, fromId).run();
   }
 
+  // ---------- subjects (aliases, /for corrections) ----------
+
+  async aliases(): Promise<Alias[]> {
+    return (await this.db.prepare("SELECT alias, person_id, display FROM aliases ORDER BY alias").all<any>()).results
+      .map((r) => ({ alias: r.alias, personId: r.person_id, display: r.display }));
+  }
+
+  /** Replace the alias table with the records' aliases (the batch, each pull). Two statements: no D1 REST transaction. */
+  async replaceAliases(list: Alias[]): Promise<void> {
+    const rows = list.map((a) => ({ a: a.alias.normalize("NFC").toLocaleLowerCase("en"), p: a.personId, d: a.display }));
+    await this.db.prepare("DELETE FROM aliases WHERE alias NOT IN (SELECT json_extract(value, '$.a') FROM json_each(?))").bind(JSON.stringify(rows)).run();
+    await this.db
+      .prepare("INSERT OR REPLACE INTO aliases (alias, person_id, display) SELECT json_extract(value, '$.a'), json_extract(value, '$.p'), json_extract(value, '$.d') FROM json_each(?)")
+      .bind(JSON.stringify(rows))
+      .run();
+  }
+
+  /** The inbox row a reply points at: the bot's echo of it, or the message itself. */
+  async rowForReply(chatId: string, messageId: number): Promise<{ update_id: number; person_id: string; subject_id: string | null } | null> {
+    return this.db
+      .prepare("SELECT update_id, person_id, subject_id FROM inbox WHERE chat_id = ? AND (ack_message_id = ? OR message_id = ?) ORDER BY update_id DESC LIMIT 1")
+      .bind(chatId, messageId, messageId)
+      .first();
+  }
+
+  /** Record a /for correction (idempotent on the command's update_id) and move the row's subject. */
+  async correctSubject(c: SubjectCorrection): Promise<boolean> {
+    const res = await this.db
+      .prepare("INSERT OR IGNORE INTO subject_corrections (id, update_id, subject_id, set_by, set_at, reason) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(c.id, c.update_id, c.subject_id, c.set_by, c.set_at, c.reason)
+      .run();
+    if (!res.meta.changes) return false;
+    await this.db.prepare("UPDATE inbox SET subject_id = ? WHERE update_id = ?").bind(c.subject_id, c.update_id).run();
+    return true;
+  }
+
+  async corrections(): Promise<SubjectCorrection[]> {
+    return (await this.db.prepare("SELECT id, update_id, subject_id, set_by, set_at, reason FROM subject_corrections ORDER BY id").all<SubjectCorrection>()).results;
+  }
+
+  async setAckMessage(updateId: number, messageId: number): Promise<void> {
+    await this.db.prepare("UPDATE inbox SET ack_message_id = ? WHERE update_id = ?").bind(messageId, updateId).run();
+  }
+
   // ---------- inbox (Worker side) ----------
 
   /** Idempotent on update_id. Returns false if the update was already stored (a Telegram redelivery). */
   async insertInbox(r: InboxRow): Promise<boolean> {
     const res = await this.db
-      .prepare("INSERT OR IGNORE INTO inbox (update_id, chat_id, message_id, sender_id, person_id, kind, received_at, raw, media_key, media_status, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .bind(r.update_id, r.chat_id, r.message_id, r.sender_id, r.person_id, r.kind, r.received_at, r.raw, r.media_key, r.media_status, r.ack)
+      .prepare("INSERT OR IGNORE INTO inbox (update_id, chat_id, message_id, sender_id, person_id, kind, received_at, raw, media_key, media_status, ack, subject_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(r.update_id, r.chat_id, r.message_id, r.sender_id, r.person_id, r.kind, r.received_at, r.raw, r.media_key, r.media_status, r.ack, r.subject_id)
       .run();
     return res.meta.changes > 0;
   }
@@ -86,7 +142,7 @@ export class Store {
 
   async newInbox(): Promise<InboxRow[]> {
     return (await this.db
-      .prepare("SELECT update_id, chat_id, message_id, sender_id, person_id, kind, received_at, raw, media_key, media_status, ack FROM inbox WHERE status = 'new' ORDER BY update_id")
+      .prepare("SELECT update_id, chat_id, message_id, sender_id, person_id, kind, received_at, raw, media_key, media_status, ack, subject_id FROM inbox WHERE status = 'new' ORDER BY update_id")
       .all<InboxRow>()).results;
   }
 

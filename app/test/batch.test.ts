@@ -2,6 +2,7 @@
 // fake Telegram updates -> real Worker fetch handler -> D1 inbox (node:sqlite) + R2 (memory)
 // -> pull -> extract (LLM mocked, STT stubbed) -> NDJSON -> tools/kb/build -> digest text -> finish.
 import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,8 +22,9 @@ const NOW = "2026-10-25T15:30:00.000Z"; // 21:00 IST
 // Example thresholds from the synthetic records (example values for tests; not clinical guidance).
 const THRESHOLDS = loadThresholds(join(import.meta.dirname, "..", "..", "fixtures", "records-example"));
 const PERSONS = new Map<string, Person>([
-  ["alice", { id: "alice", name: "Alice", role: "patient", senderId: "111" }],
-  ["bob", { id: "bob", name: "Bob", role: "patient", senderId: "333" }],
+  ["alice", { id: "alice", name: "Alice", role: "member", senderId: "111" }],
+  ["bob", { id: "bob", name: "Bob", role: "member", senderId: "333" }],
+  ["carol-tg", { id: "carol-tg", name: "Carol", role: "admin", senderId: "222" }],
 ]);
 const JPEG_BP = new Uint8Array([0xff, 0xd8, 0x01]);
 const JPEG_GLUCO = new Uint8Array([0xff, 0xd8, 0x02]);
@@ -45,6 +47,8 @@ class MockExtractor implements Extractor {
     if (input.media && input.media.data[2] === 0x01)
       return { ...none, media_kind: "device_reading", confidence: 0.95, readings: [{ type: "bp", value: 78, value2: 50, value3: 38, unit: "mmHg", measured_at: null }] };
     if (input.media) return { ...none, media_kind: "device_reading", confidence: 0.3, unreadable_reason: "display blurred" };
+    if (/^Maa ka BP/.test(input.text ?? ""))
+      return { ...none, confidence: 0.9, subject_hint: "Maa", readings: [{ type: "bp", value: 130, value2: 85, value3: null, unit: "mmHg", measured_at: null }] };
     if (/seene/.test(input.text ?? ""))
       return { ...none, confidence: 0.85, symptoms: [{ symptom_type: "chest_pain", location: "chest", side: "unknown", character: [], severity: null, duration_min: 20, at_rest: null, associated: [], triggers: [], onset_at: null, free_text: input.text }] };
     if (/sugar/.test(input.text ?? "")) return { ...none, readings: [{ type: "glucose_fasting", value: 1100, value2: null, value3: null, unit: "mg/dL", measured_at: null }] };
@@ -67,7 +71,7 @@ async function ingestAll(updates: unknown[], files: Record<string, Uint8Array> =
   const t = fakeTelegram(files);
   vi.stubGlobal("fetch", t.fetchFn);
   const env = {
-    DB: db, TELEGRAM_BOT_TOKEN: "123:SECRET-BOT-TOKEN", TELEGRAM_WEBHOOK_SECRET: SECRET, TELEGRAM_API_BASE: "https://tg.test",
+    DB: db, ACK_MODE: "all", TELEGRAM_BOT_TOKEN: "123:SECRET-BOT-TOKEN", TELEGRAM_WEBHOOK_SECRET: SECRET, TELEGRAM_API_BASE: "https://tg.test",
     MEDIA: { put: (k: string, b: any, o: any) => r2.put(k, b, o.httpMetadata.contentType) },
   } as any;
   for (const u of updates) expect((await worker.fetch(webhook(u) as any, env)).status).toBe(200);
@@ -91,10 +95,10 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     const voice = fixture("voice"); // alice, 7 s voice note
     const pdf = fixture("document-pdf"); // alice, prescription PDF
     const gluco = { update_id: 2001, message: { message_id: 31, date: 1792814460, chat: { id: Number(GROUP) }, from: { id: 333 }, photo: [{ file_id: "g1", file_unique_id: "u-g1", width: 900, height: 1200, file_size: 50000 }] } };
-    const updates = [textUpdate("120/80 72", 111, {}, 1792814000), photo, voice, pdf, gluco, textUpdate("sugar 1100 khali pet", 333), textUpdate("main kal aaunga", 222)];
+    const updates = [textUpdate("120/80 72", 111, {}, 1792814000), photo, voice, pdf, gluco, textUpdate("sugar 1100 khali pet", 333), textUpdate("wajan 70", 222)];
     const { db, store, r2, t, repo } = await ingestAll(updates, { large: JPEG_BP, g1: JPEG_GLUCO, voice1: new TextEncoder().encode("aaj seene mein dard hua 20 minute"), doc1: new Uint8Array([0x25, 0x50]) });
     expect(r2.objects.size).toBe(4);
-    expect(t.sent().map((c) => c.body.text)[0]).toBe("BP 120/80, pulse 72 ✓");
+    expect(t.sent().map((c) => c.body.text)[0]).toBe("Alice: BP 120/80, pulse 72 ✓");
 
     // pull: raw first
     const p1 = await pull({ store, r2, tg: t.tg, repo });
@@ -105,7 +109,7 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     // extract
     const llm = new MockExtractor();
     const r = await extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
-    expect(r).toMatchObject({ extracted: 6, pending: 0, queued: 3 });
+    expect(r).toMatchObject({ extracted: 7, pending: 0, queued: 3 });
     expect(llm.calls).toHaveLength(5); // "120/80 72" is recorded by the deterministic parser
     expect(llm.batches).toBe(1); // the day's messages go to the extractor together
     const rows = ndjson(repo);
@@ -113,7 +117,8 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     expect(reading(`${GROUP}:${(updates[0] as any).message.message_id}:r0`)).toMatchObject({ rt: "d1.readings", type: "bp", value: 120, value2: 80, value3: 72, extracted_by: "vitals-parser", confirmed: 0 });
     expect(reading(`${GROUP}:12:r0`)).toMatchObject({ type: "bp", value: 78, extracted_by: "claude-haiku-5-5" });
     expect(rows.find((x) => x.rt === "d1.messages" && x.id === `${GROUP}:13`)).toMatchObject({ kind: "audio", transcript: "aaj seene mein dard hua 20 minute" });
-    expect(rows.filter((x) => x.person_id === "caregiver")).toEqual([]); // the caregiver's messages are never patient data
+    // the admin is a member: their message is extracted into their own records (D1 id carol-tg -> KB ns carol)
+    expect(rows.find((x) => x.rt === "d1.readings" && x.person_id === "carol-tg")).toMatchObject({ type: "weight", value: 70, extracted_by: "vitals-parser" });
 
     // the KB build accepts the batch output
     expect(kbBuild()).toMatch(/^ok:/);
@@ -139,12 +144,12 @@ describe("end-to-end (local): update -> inbox -> batch -> NDJSON -> digest", () 
     expect(d.indexOf("BP 120/80")).toBeLessThan(d.indexOf("BP 78/50")); // by time, not by arrival
     expect(d).toContain(ANNOTATION_NOTE);
     expect(d).toMatch(/T1 PULSE_VERY_LOW/);
-    expect(d).not.toContain("main kal aaunga");
+    expect(d).toContain("👤 Carol");
 
     // finish: rows done, digest to the family group, nothing pruned yet
     const before = t.sent().length;
     const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: d, retentionDays: 14 });
-    expect(f).toEqual({ done: 7, pruned: 0, sentTo: 1 });
+    expect(f).toEqual({ done: 7, pruned: 0, sentTo: 1, opsTo: 0 });
     expect(t.sent().slice(before).map((c) => [c.body.chat_id, c.body.text])).toEqual([[GROUP, d]]);
     expect((await db.prepare("SELECT count(*) AS n FROM inbox WHERE status = 'new'").first<any>()).n).toBe(0);
 
@@ -266,10 +271,35 @@ describe("batch details", () => {
     expect(readFileSync(join(root, "sources/alice/media/telegram/u-voice1.ogg"), "utf8")).toBe("wajan 60");
   });
 
-  it("no digest file (extract failed) sends the failure notice", async () => {
+  it("no digest file (extract failed): the failure notice goes to the admins by private DM, not the family group", async () => {
     const { store, t, repo } = await ingestAll([]);
-    await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 });
-    expect(t.sent().map((c) => c.body.text)).toEqual([DIGEST_FAILED]);
+    expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 })).toMatchObject({ sentTo: 0, opsTo: 1 });
+    expect(t.sent().map((c) => [String(c.body.chat_id), c.body.text])).toEqual([["222", DIGEST_FAILED]]);
+  });
+
+  it("no admin reachable (DM fails): the failure notice falls back to the family group", async () => {
+    const { store, repo } = await ingestAll([]);
+    const t = fakeTelegram({}, { failSendTo: "222" });
+    expect(await finish({ store, tg: t.tg, repo, now: NOW, digest: null, retentionDays: 14 })).toMatchObject({ sentTo: 1, opsTo: 0 });
+    expect(t.sent().filter((c) => c.ok).map((c) => [String(c.body.chat_id), c.body.text])).toEqual([[GROUP, DIGEST_FAILED]]);
+  });
+
+  it("a message about another member stays with the sender and is flagged (subject_hint) for human review", async () => {
+    const u = textUpdate("Maa ka BP 130/85 tha", 222);
+    const { store, r2, t, repo } = await ingestAll([u]);
+    await pull({ store, r2, tg: t.tg, repo });
+    const r = await run(repo, new MockExtractor());
+    const key = `${GROUP}:${u.message!.message_id}`;
+    const rows = ndjson(repo);
+    expect(rows.find((x) => x.id === key)).toMatchObject({ rt: "d1.messages", person_id: "carol-tg", subject_hint: "Maa" });
+    expect(rows.find((x) => x.rt === "d1.readings")).toMatchObject({ person_id: "carol-tg", type: "bp", value: 130 }); // never auto-reassigned
+    expect(repo.queue().map((e) => [e.message_id, e.reasons])).toEqual([[key, ["subject_hint"]]]);
+    expect(r.digest).toMatch(/Carol .*"Maa" के बारे में .*\(Carol\)/);
+    expect(kbBuild()).toMatch(/^ok:/);
+    const kb = new DatabaseSync(join(root, "kb.sqlite"));
+    const tags = kb.prepare("SELECT ns, tags FROM fact WHERE id LIKE '%tg.%'").all() as { ns: string; tags: string }[];
+    expect(tags).toEqual([{ ns: "carol", tags: JSON.stringify(["subject-hint"]) }]);
+    kb.close();
   });
 
   it("transient vs permanent errors", () => {

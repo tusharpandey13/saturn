@@ -47,7 +47,7 @@ export function check(env: any, manifest: any): string[] {
     const ok = type === "map" ? typeof v === "object" && !Array.isArray(v) : type === "int" ? Number.isInteger(v) : type === "bool" ? typeof v === "boolean" : typeof v === "string";
     if (!ok) errs.push(`${p}: expected ${type}`);
   }
-  for (const [k, list] of [["batch.llm_adapter", manifest.adapters.llm], ["batch.stt_adapter", manifest.adapters.stt]] as const) {
+  for (const [k, list] of [["batch.llm_adapter", manifest.adapters.llm], ["batch.stt_adapter", manifest.adapters.stt], ["ack_mode", manifest.ack_modes ?? []]] as const) {
     const v = get(env, k);
     if (!empty(v) && !list.includes(v)) errs.push(`${k}: ${v} is not one of ${list.join(", ")}`);
   }

@@ -33,7 +33,7 @@ export class ExtractorStopError extends Error {
 /** Extractor alias used by the split plan. */
 export type LlmAdapter = Extractor;
 
-export const DEFAULT_CONTEXT = "Senders are patients or their caregivers.";
+export const DEFAULT_CONTEXT = "Senders are family members. Each message is recorded for its sender.";
 
 /** The extraction system prompt. `context` (who the senders are) comes from the records repo
  *  (meta/extraction-context.md); the product default names nobody. */
@@ -56,6 +56,8 @@ Rules:
 - duration_min: how long it lasted ("10 minute tak", "aadha ghanta" = 30). triggers: what brought it on (chalte hue -> walking, seedhi -> stairs, kaam karte -> exertion, khane ke baad -> after_meal, gussa/tension -> emotion).
 - Map: behosh / aankhon ke aage andhera -> syncope; dil tez dhadakna -> palpitations; seene mein dard/dabav -> chest_pain;
   saans phoolna -> breathlessness; lete hue saans -> orthopnea; chakkar -> dizziness; sujan -> swelling; ulti/dast -> vomiting_diarrhoea.
+- subject_hint: only when the message is clearly about someone other than the sender ("Maa ka BP 120/80", "Papa ko chakkar aaya"):
+  who it is about, as written ("Maa"). Else null. Still extract the values; a human decides whose they are.
 - Never diagnose, never advise. If the image is unreadable, set unreadable_reason.`;
 }
 

@@ -1,1 +1,1 @@
-Senders are the synthetic patients alice and bob, or their caregiver carol.
+Senders are the synthetic members alice, bob and carol (carol is also the admin). Each message is recorded for its sender.

@@ -36,13 +36,15 @@ The batch against real services: `npx tsx batch/run.ts pull|extract|finish --rec
 `npm run batch -- …`) with the env vars listed in `batch/run.ts`. Per-records inputs, both optional:
 - `<records-dir>/meta/stt-vocab.txt`: STT vocabulary (one term per line, e.g. the household's medicine names); the
   product ships only generic device and vital words.
-- `<records-dir>/meta/extraction-context.md`: patient context passed to the extraction prompt.
+- `<records-dir>/meta/extraction-context.md`: who the senders are, passed to the extraction prompt.
 
 ## Safety behaviour
 
-- The ack is deterministic: the numbers the sender sees are parsed by code, and vitals-only messages are stored from that same parse (no LLM), so the stored values equal the echoed ones. Implausible values are echoed with "?".
-- No medical advice and no real-time alerts (ADR 005: in an emergency people phone a caregiver or emergency services directly). Rule results appear in the daily digest as annotations marked "unverified; doctor sign-off pending".
-- Caregivers' messages (`role = caregiver`) are stored raw but never acked or extracted as patient data. Unknown senders and chats are dropped.
+- Acks are optional (`ack_mode`: `off` default, `vitals-only`, `all`; Worker var `ACK_MODE`). When on, the ack is deterministic and names who the message was logged for ("Maa: BP 116/47 ✓"): the numbers the sender sees are parsed by code, and vitals-only messages are stored from that same parse (no LLM), so the stored values equal the echoed ones. Implausible values are echoed with "?".
+- No medical advice and no real-time alerts (ADR 005: in an emergency people phone family or emergency services directly). Rule results appear in the daily digest as annotations marked "unverified; doctor sign-off pending".
+- Roles (ADR 009): everyone in `persons` is a `member`; each member's messages are stored, acked and extracted into their own namespace. An `admin` is a member plus ops privileges: ops alerts (webhook assertion) and digest failures go to the admins by private DM (falling back to the family group when no admin is reachable), and admins manage the allowlist and settings. Unknown senders and chats are dropped.
+- Subject attribution (ADR 009): a leading name from the records' `aliases:` ("maa 116/47") records the message for that member; the sender is kept as provenance. An admin re-attributes a message by replying `/for <name>` to it; corrections land in the records' `data/telegram/subject-overrides.ndjson`, which the batch honours. The digest shows "(X ने भेजा, Y के लिए दर्ज)" for every such line.
+- Known limitation: an unprefixed message about another member (e.g. "Maa's BP 120/80" sent by her son) is attributed to the **sender**. The extractor sets `subject_hint` (who it seems to be about, as written); the batch then asks in the digest ❓ list, queues the message (`subject_hint` reason) and the KB tags its facts `subject-hint`. Nothing is reassigned automatically: a human moves the facts (KB superseding) if needed. Vitals-only texts read by the deterministic parser carry no hint.
 - Logs carry counts and error classes only: no message text, transcripts, values or Telegram file URLs (they contain the bot token).
 - Extraction validates untrusted LLM output in code (`parseExtraction`: schema, plausible ranges, units, times). Low-confidence, unreadable or rejected items go to the digest's ❓ list and to `<records-dir>/data/queue/needs_deep.jsonl` for an offline deep read.
 

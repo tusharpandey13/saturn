@@ -28,7 +28,8 @@ export interface RawRow {
   message_id: number;
   sender_id: string;
   person_id: string;
-  role: "patient" | "caregiver";
+  /** The sender's role at pull time (member or admin; rows pulled before v0.3.0 say patient or caregiver). Not used to filter. */
+  role: string;
   kind: InboxKind;
   received_at: string;
   media_key: string | null;
@@ -37,7 +38,23 @@ export interface RawRow {
   /** Repo-relative path of the media copy, null until copied. */
   media_path: string | null;
   ack: string | null;
+  /** Who the message is about (D1 person id), as the Worker set it; absent on rows pulled before v0.3.0. */
+  subject_id?: string | null;
   update: TgUpdate;
+}
+
+/** data/telegram/subject-overrides.ndjson: re-attributes one Telegram update (by update_id) to a subject namespace.
+ *  Written by hand in the records repo, or copied from an admin's /for correction (id tg-for:<update_id>) by pull.
+ *  Append-only; for one update_id the latest set_at wins. The original sender is never changed. */
+export interface SubjectOverride {
+  update_id: number;
+  /** KB namespace of the subject. */
+  subject: string;
+  /** KB namespace (or name) of who set it. */
+  set_by: string;
+  set_at: string;
+  reason: string;
+  id?: string;
 }
 
 export type Row = Record<string, unknown> & { rt: string };
@@ -74,6 +91,38 @@ export class Repo {
 
   personDir(id: string): string {
     return this.personMap[id] ?? id;
+  }
+
+  /** KB namespace -> D1 person id (inverse d1_person_map, same id otherwise). */
+  d1Id(ns: string): string {
+    return Object.entries(this.personMap).find(([, v]) => v === ns)?.[0] ?? ns;
+  }
+
+  // ---------- subject overrides ----------
+
+  subjectOverrides(): SubjectOverride[] {
+    return readLines<SubjectOverride>(this.p("data/telegram/subject-overrides.ndjson"));
+  }
+
+  /** Effective override per update_id (latest set_at; file order breaks ties). */
+  overrideMap(): Map<number, SubjectOverride> {
+    const out = new Map<number, SubjectOverride>();
+    for (const o of this.subjectOverrides()) {
+      const prev = out.get(Number(o.update_id));
+      if (!prev || String(o.set_at) >= String(prev.set_at)) out.set(Number(o.update_id), o);
+    }
+    return out;
+  }
+
+  /** Append overrides whose id is not in the file yet. Returns the changed path, if any. */
+  appendOverrides(rows: SubjectOverride[]): string[] {
+    const seen = new Set(this.subjectOverrides().map((o) => o.id).filter(Boolean));
+    const add = rows.filter((r) => r.id && !seen.has(r.id));
+    if (!add.length) return [];
+    const path = this.p("data/telegram/subject-overrides.ndjson");
+    const prev = existsSync(path) ? readFileSync(path, "utf8") : "";
+    writeIfChanged(path, prev + add.map((r) => line(r as unknown as Record<string, unknown>) + "\n").join(""));
+    return ["subject-overrides.ndjson"];
   }
 
   private p(...parts: string[]) {
@@ -130,7 +179,7 @@ export class Repo {
   // ---------- extracted rows ----------
 
   kbRows(): Row[] {
-    return this.files("data/telegram", ".ndjson").filter((f) => !f.endsWith("directory.ndjson")).flatMap((f) => readLines<Row>(f));
+    return this.files("data/telegram", ".ndjson").filter((f) => !f.endsWith("directory.ndjson") && !f.endsWith("subject-overrides.ndjson")).flatMap((f) => readLines<Row>(f));
   }
 
   /**

@@ -1,9 +1,9 @@
 -- D1 for the ingest-only Worker (ADR 005). D1 is a short-lived inbox, not a store of record: the daily batch
 -- copies every row to git (data/telegram/raw/) and rows are pruned N days after that. Timestamps: ISO-8601 UTC.
 
--- Who may write. Seeded by hand at deploy (docs/platform/deploy.md). role caregiver = observer: stored, never acked or extracted.
+-- Who may write. Seeded by hand at deploy (docs/platform/deploy.md). Roles: 0002_member_admin_roles.sql replaces patient/caregiver with member/admin.
 CREATE TABLE persons (
-  id          TEXT PRIMARY KEY,                -- person id, e.g. alice | bob | caregiver (records.yaml d1_person_map maps it to a KB namespace)
+  id          TEXT PRIMARY KEY,                -- person id, e.g. alice | bob | carol (records.yaml d1_person_map maps it to a KB namespace)
   name        TEXT NOT NULL,
   role        TEXT NOT NULL CHECK (role IN ('patient', 'caregiver')),
   sender_id   TEXT NOT NULL UNIQUE,            -- Telegram user id

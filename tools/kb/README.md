@@ -25,8 +25,8 @@ schema_version: 7          # checked: the build refuses a version it does not su
 namespaces:                # person namespaces (plus the shared `family`)
   alice: {display: Alice}
   bob: {display: Bob}
-d1_person_map:             # D1 role -> namespace, for Telegram rows
-  patient: alice
+d1_person_map:             # D1 person id -> namespace, where they differ (same id otherwise), for Telegram rows
+  alice-tg: alice
 ```
 The JSON Schemas and DDL live in the product [`schema/`](../../schema/). A synthetic example records repo that passes
 the same validation is at `fixtures/records-example/`.
@@ -79,7 +79,7 @@ identities are not merged: both rows get the tag `possible_same_as:<other id>` a
 |---|---|
 | `schema/schema.sql` (product) | the DDL and views (authoritative envelope and enums) |
 | `schema/<kind>.schema.json` (product) | JSON Schema for `fact.data` (observation, medication, condition, event) and `ref.data` (drug, code, party); `x-ref` marks ref-valued fields |
-| `records.yaml` | the namespace registry (`namespaces:`), the D1 role map (`d1_person_map:`) and `schema_version` (`family` is a shared ns without an entry) |
+| `records.yaml` | the namespace registry (`namespaces:`), the D1 person map (`d1_person_map:`) and `schema_version` (`family` is a shared ns without an entry) |
 | `data/ref/{code,drug,party}.ndjson` | refs. Parallel tasks may add `data/ref/<kind>-<TASK>.ndjson`; fold them afterwards into the per-kind files (merges and deletes them; already-folded rows are skipped) |
 | `data/<ns>/docs/<source-local>.ndjson` | one file per source: its `source` row plus every fact from it |
 | `data/telegram/YYYY-MM.ndjson`, `directory.ndjson` | Telegram rows (`rt = d1.<table>`, the bot's D1 shape) written by the daily batch (ADR 005); the build maps messages → `source`, readings and symptoms → `fact` observation, falls → `fact` event (ids `<ns>:src:<date>-tg.<id>`) |

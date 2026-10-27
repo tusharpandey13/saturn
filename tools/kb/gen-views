@@ -21,7 +21,7 @@ import records_config  # noqa: E402
 BLOCK = re.compile(r"(<!-- gen:([a-z-]+) start -->\n)(.*?)(<!-- gen:\2 end -->)", re.S)
 FAMILY_TAGS = ("family-reported", "patient-reported", "user-report", "secondhand")
 FLAG_TAGS = ("low-confidence", "internal-contradiction", "text-table-mismatch", "written-stopped", "owner-unconfirmed",
-             "identity-unconfirmed")
+             "identity-unconfirmed", "subject-hint")
 MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 GLANCE_DAYS = 180
 

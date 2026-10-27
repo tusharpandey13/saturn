@@ -1,3 +1,3 @@
-{"rt": "person", "id": "alice", "name": "Alice Example", "relation": "patient", "sex": "F", "note": "synthetic"}
-{"rt": "person", "id": "bob", "name": "Bob Example", "relation": "patient", "sex": "M", "note": "synthetic"}
-{"rt": "person", "id": "carol", "name": "Carol Example", "relation": "caregiver", "note": "synthetic"}
+{"rt": "person", "id": "alice", "name": "Alice Example", "relation": "member", "sex": "F", "note": "synthetic"}
+{"rt": "person", "id": "bob", "name": "Bob Example", "relation": "member", "sex": "M", "note": "synthetic"}
+{"rt": "person", "id": "carol", "name": "Carol Example", "relation": "member", "note": "synthetic"}

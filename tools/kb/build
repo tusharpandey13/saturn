@@ -73,14 +73,26 @@ def _envelope(row, msg, quote, ns, src_id):
     # confirmed: 1 = patient confirmed, -1 = rejected, 0 = not confirmed (ADR 005 has no confirm step: always 0 now).
     confirmed = row.get("confirmed", 0)
     conf = row.get("confidence")
+    # subject-hint: the message seems to be about another member; the fact stays with the sender until a human decides.
+    tags = (["low-confidence"] if conf is not None and conf < 0.8 else []) + (["subject-hint"] if (msg or {}).get("subject_hint") else [])
+    if _reporter(msg):
+        tags.append("family-reported")  # sent by another member for this subject
     return {
         "ns": ns, "source_id": src_id, "quote": quote[:200] if quote else None,
         "recorded_by": row.get("extracted_by") or (msg or {}).get("extracted_by") or "telegram-bot",
         "created_at": row.get("extracted_at") or (msg or {}).get("extracted_at") or (msg or {}).get("received_at"),
         "verification": "patient" if confirmed == 1 else "unverified",
         "status": "retracted" if confirmed == -1 else "active",
-        "tags": ["low-confidence"] if conf is not None and conf < 0.8 else [],
+        "tags": tags,
     }
+
+
+def _reporter(msg):
+    """KB ns of the member who sent a message about someone else (subject attribution, ADR 009), else None."""
+    sender = (msg or {}).get("sender_person_id")
+    if not sender or sender == (msg or {}).get("person_id"):
+        return None
+    return D1_PERSON.get(sender, sender)
 
 
 def telegram_records(rows, root):
@@ -98,14 +110,19 @@ def telegram_records(rows, root):
                 ex = _jl(r.get("extraction_json")) if r.get("extraction_json") else None
                 kind = ex.get("media_kind") if isinstance(ex, dict) else None
                 parts = [f"telegram {r['kind']}", kind and kind != "none" and f"media_kind={kind}",
-                         r.get("transcript") and f"transcript: {r['transcript'][:500]}"]
+                         r.get("transcript") and f"transcript: {r['transcript'][:500]}",
+                         r.get("subject_hint") and f"subject_hint: {r['subject_hint'][:80]} (attributed to the sender; human review)",
+                         _reporter(r) and f"reported by {_reporter(r)} for {ns}"
+                         + (f" (subject set by {r['subject_set_by']})" if r.get("subject_set_by") else "")]
                 sid = src_ids[r["id"]] = f"{ns}:src:{tg_local(r['received_at'], r['id'])}"
                 out.append((where, "source", {
                     "id": sid, "ns": ns, "kind": "telegram_msg", "path": media.get(r.get("media_ref") or ""),
                     "received_at": ist(r["received_at"]), "sender": r.get("sender_id"), "rank": "original",
-                    "identifiers": {"d1_id": r["id"], **{k: r[k] for k in ("external_id", "chat_id", "media_ref") if r.get(k)}},
+                    "identifiers": {"d1_id": r["id"], **{k: r[k] for k in ("external_id", "chat_id", "media_ref") if r.get(k)},
+                                    **({"reported_by": _reporter(r)} if _reporter(r) else {})},
                     "recorded_by": r.get("extracted_by") or "telegram-bot",
-                    "created_at": r.get("extracted_at") or r["received_at"], "status": "active", "tags": [],
+                    "created_at": r.get("extracted_at") or r["received_at"], "status": "active",
+                    "tags": ["subject-hint"] if r.get("subject_hint") else [],
                     "note": "; ".join(x for x in parts if x),
                 }))
         except KeyError as e:
@@ -274,7 +291,20 @@ def main(argv):
     errors, warns, records, tg_rows = [], [], {t: [] for t in ORDER}, []
     files = sorted(f for f in data_dir.rglob("*.ndjson")
                    if f.parent != data_dir / "telegram" and (data_dir / "meta") not in f.parents)
-    files += sorted(tg_dir.glob("*.ndjson"))
+    overrides = tg_dir / "subject-overrides.ndjson"  # read by the batch (app/src/batch/repo.ts), only checked here
+    files += sorted(f for f in tg_dir.glob("*.ndjson") if f != overrides)
+    if overrides.is_file():
+        for n, line in enumerate(overrides.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError as e:
+                errors.append(f"{show(overrides)}:{n}: bad JSON ({e})"); continue
+            miss = [k for k in ("update_id", "subject", "set_by", "set_at", "reason") if o.get(k) in (None, "")]
+            if miss or not isinstance(o.get("update_id"), int) or o.get("subject") not in NAMESPACES:
+                errors.append(f"{show(overrides)}:{n}: subject override needs update_id (int), subject (a namespace), "
+                              f"set_by, set_at, reason")
     for f in files:
         rel = show(f)
         is_tg = f.parent == tg_dir

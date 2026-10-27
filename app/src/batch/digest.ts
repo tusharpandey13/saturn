@@ -21,7 +21,13 @@ export interface DigestEntry {
   deep: string | null;
   /** Fixed status lines shown under the person (e.g. STT_PENDING_NOTE). */
   notes?: string[];
+  /** Who sent it, when that is not the person it is about (subject attribution), so a wrong one is easy to spot. */
+  via?: string;
 }
+
+/** Attribution line suffix: who sent it and who it was logged for (with acks off, the digest is where mistakes show). */
+export const VIA = (sender: string, subject: string) => ` (${sender} ने भेजा, ${subject} के लिए दर्ज)`;
+export const FOR_HINT = "ℹ नाम गलत हो तो admin उस मूल संदेश पर reply करके लिखें: /for <नाम>";
 
 export const STT_PENDING_NOTE = "🎤 voice note saved; transcription pending";
 export const DELAYED_LINE = (n: number) => `⚠ extraction delayed: ${n} संदेश सुरक्षित हैं, अगले रन में अपने-आप प्रोसेस होंगे।`;
@@ -58,7 +64,7 @@ export function buildDigest(o: {
   for (const p of people) {
     out.push("", `👤 ${p}`);
     for (const e of recorded.filter((x) => x.person === p))
-      for (const l of [...e.readings.map(readingHi), ...e.symptoms.map(symptomHi), ...(e.notes ?? [])]) out.push(`• ${time(e.ts)} ${l}`);
+      for (const l of [...e.readings.map(readingHi), ...e.symptoms.map(symptomHi), ...(e.notes ?? [])]) out.push(`• ${time(e.ts)} ${l}${e.via ? VIA(e.via, e.person) : ""}`);
   }
 
   const deep = o.entries.filter((e) => e.deep && DEEP_HI[e.deep]);
@@ -76,6 +82,7 @@ export function buildDigest(o: {
     for (const e of flagged) for (const a of e.annotations) out.push(`- ${e.person} ${time(e.ts)}: T${a.tier} ${a.code}: ${a.detail}`);
   }
 
+  if (recorded.some((e) => e.via)) out.push("", FOR_HINT);
   if (o.thresholdsStatus === "disabled") out.push("", THRESHOLDS_OFF_LINE);
 
   const delayed = o.delayed ?? 0;

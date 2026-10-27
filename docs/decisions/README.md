@@ -16,6 +16,7 @@ Architecture decision records (ADRs). Each file is one decision: the context, wh
 | [006-unified-platform.md](006-unified-platform.md) | One platform for Saturn and the agent router. | Superseded in part by the HLD (2026-10-25); rest proposed | engineer |
 | [007-simplified-clinical-data-model.md](007-simplified-clinical-data-model.md) | Three row types (source, fact, ref) with typed JSON data and namespaced ids; the KB is the source of truth. | Accepted 2026-10-26; amends 004 | engineer |
 | [008-product-environment-pii.md](008-product-environment-pii.md) | Split into product (public-ready), environment and PII units joined by `env.manifest.yaml`, `product.lock` and `records.yaml`. | Accepted 2026-10-26 | engineer, maintainer |
+| [009-member-admin-roles.md](009-member-admin-roles.md) | Everyone is a `member` (extracted into their own namespace); `admin` adds ops DMs and allowlist/settings. `subject_hint` flags messages about another member. | Accepted 2026-10-27 | engineer, maintainer |
 
 ## Reading order
 

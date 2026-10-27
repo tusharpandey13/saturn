@@ -13,6 +13,14 @@ namespaces:
     display: Family
     shared: true           # household-level rows; not a person
 
-# Telegram batch (D1) person id -> KB namespace, where they differ (same id otherwise).
+# Telegram batch (D1) person id -> KB namespace, where they differ (same id otherwise). Every D1 person is a member
+# (role member or admin); each member's messages are extracted into their own namespace.
 d1_person_map:
-  caregiver: carol
+  carol-tg: carol
+
+# Name prefixes per namespace (ADR 009): a message that starts with one ("ali 116/47", "Ali ka BP ...") is recorded
+# for that namespace, whoever sent it; the echo and the digest name who it was logged for. Matched case-insensitively.
+aliases:
+  alice: [alice, ali, एलिस]
+  bob: [bob]
+  carol: [carol]

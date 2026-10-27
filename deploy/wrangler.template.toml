@@ -19,3 +19,7 @@ migrations_dir = "migrations"
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "${cloudflare.r2_bucket}"
+
+# Plain vars (not secrets). ACK_MODE: off (default when unset) | vitals-only | all (ADR 009).
+[vars]
+ACK_MODE = "${?ack_mode}"

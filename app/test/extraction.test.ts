@@ -48,6 +48,13 @@ describe("parseExtraction", () => {
     expect(parseExtraction(null, NOW).readings).toEqual([]);
   });
 
+  it("subject_hint: kept as written (trimmed, capped); absent, empty or a self/none placeholder is null", () => {
+    expect(parseExtraction({ readings: [], symptoms: [], subject_hint: "  Maa " }, NOW).subjectHint).toBe("Maa");
+    expect(parseExtraction({ readings: [], symptoms: [], subject_hint: "x".repeat(200) }, NOW).subjectHint).toHaveLength(80);
+    for (const v of [undefined, null, "", "none", "self", "null", 3]) expect(parseExtraction({ readings: [], symptoms: [], subject_hint: v }, NOW).subjectHint).toBeNull();
+    expect(EXTRACTION_SCHEMA.required).toContain("subject_hint");
+  });
+
   it("schema is strict-compatible: every object lists all properties as required", () => {
     const walk = (s: any): void => {
       if (s?.type === "object") {

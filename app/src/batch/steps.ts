@@ -18,7 +18,8 @@ import { SARVAM_REST_MAX_SEC, SttJobFailedError } from "../../../adapters/stt/sa
 import type { Media, Person, Reading, SpeechToText, Symptom, Transcript } from "../types.js";
 import { parseVitals } from "../vitals.js";
 import { buildDigest, type DigestEntry, STT_PENDING_NOTE } from "./digest.js";
-import { MIME_OF_EXT, type RawRow, Repo, type Row } from "./repo.js";
+import { MIME_OF_EXT, type RawRow, Repo, type Row, type SubjectOverride } from "./repo.js";
+import { type Alias, displayOf, splitSubject } from "../subject.js";
 
 export const LOW_CONFIDENCE = 0.8; // same bar as v_needs_human in data/schema.sql
 const DAY = 86_400_000;
@@ -30,9 +31,12 @@ export interface PullDeps {
   r2: { get(key: string): Promise<Media> };
   tg: TelegramAdapter;
   repo: Repo;
+  /** records.yaml aliases (keyed by D1 person id), synced into D1 for the Worker's name prefixes. Omitted: left as is. */
+  aliases?: Alias[];
 }
 
-export async function pull(d: PullDeps): Promise<{ pulled: number; mediaCopied: number; mediaMissing: number; changed: string[] }> {
+export async function pull(d: PullDeps): Promise<{ pulled: number; mediaCopied: number; mediaMissing: number; overrides: number; changed: string[] }> {
+  if (d.aliases) await d.store.replaceAliases(d.aliases);
   const [rows, persons, chats] = [await d.store.newInbox(), await d.store.persons(), await d.store.chats()];
   const role = new Map(persons.map((p) => [p.id, p.role]));
   d.repo.writeDirectory([
@@ -45,9 +49,9 @@ export async function pull(d: PullDeps): Promise<{ pulled: number; mediaCopied: 
     const ev = parseUpdate(update);
     return {
       update_id: r.update_id, chat_id: r.chat_id, message_id: r.message_id, sender_id: r.sender_id, person_id: r.person_id,
-      role: role.get(r.person_id) ?? "caregiver", kind: r.kind, received_at: r.received_at, media_key: r.media_key,
+      role: role.get(r.person_id) ?? "member", kind: r.kind, received_at: r.received_at, media_key: r.media_key,
       media_status: r.media_status, media_mime: ev?.type === "message" ? ev.msg.file?.mimeType ?? null : null,
-      media_path: null, ack: r.ack, update,
+      media_path: null, ack: r.ack, subject_id: r.subject_id ?? r.person_id, update,
     };
   });
   // Media for the new rows, plus any older raw row whose copy failed before (retry from git, by file_id).
@@ -69,7 +73,14 @@ export async function pull(d: PullDeps): Promise<{ pulled: number; mediaCopied: 
     }
   }
   const changed = d.repo.writeRaw([...fresh, ...retry.filter((r) => r.media_path)]);
-  return { pulled: fresh.length, mediaCopied, mediaMissing, changed };
+  // Admins' /for corrections -> the records' auditable override file (namespaces, not D1 ids).
+  const fromD1: SubjectOverride[] = (await d.store.corrections()).map((c) => ({
+    id: `tg-for:${c.id}`, update_id: c.update_id, subject: d.repo.personDir(c.subject_id), set_by: d.repo.personDir(c.set_by),
+    set_at: c.set_at, reason: c.reason ?? "telegram /for",
+  }));
+  const before = d.repo.subjectOverrides().length;
+  changed.push(...d.repo.appendOverrides(fromD1));
+  return { pulled: fresh.length, mediaCopied, mediaMissing, overrides: d.repo.subjectOverrides().length - before, changed };
 }
 
 async function fetchMedia(d: PullDeps, r: RawRow): Promise<Media> {
@@ -105,6 +116,23 @@ export interface ExtractDeps {
   retryFailed?: boolean;
   /** Operator warnings for the digest (e.g. Claude token expiry). */
   warnings?: string[];
+  /** records.yaml aliases (keyed by D1 person id): name prefixes for rows the Worker did not attribute (pre-v0.3.0). */
+  aliases?: Alias[];
+}
+
+/** Who a message is about: a records override (or an admin's /for), else the Worker's subject_id, else a name prefix,
+ *  else the sender. The sender (raw.person_id) is never changed. */
+export interface Subject {
+  id: string;
+  source: "override" | "prefix" | "sender";
+  setBy: string | null;
+}
+export function subjectOf(raw: RawRow, text: string | undefined, overrides: Map<number, SubjectOverride>, repo: Repo, aliases: Alias[]): Subject {
+  const o = overrides.get(raw.update_id);
+  if (o) return { id: repo.d1Id(o.subject), source: "override", setBy: o.set_by };
+  if (raw.subject_id) return { id: raw.subject_id, source: raw.subject_id === raw.person_id ? "sender" : "prefix", setBy: null };
+  const p = splitSubject(text, aliases).subject;
+  return p && p.personId !== raw.person_id ? { id: p.personId, source: "prefix", setBy: null } : { id: raw.person_id, source: "sender", setBy: null };
 }
 
 export interface ExtractResult {
@@ -126,11 +154,12 @@ export function isTransient(err: unknown): boolean {
   return /Connection|Timeout|network/i.test(`${e?.name} ${(err as Error)?.message}`);
 }
 
-/** Latest version per message (edits share chat:message_id), patients only, kinds the extractor reads. */
-function toExtract(repo: Repo, retryFailed: boolean, sttAvailable: boolean): { raw: RawRow; msg: ParsedMessage }[] {
+/** Latest version per message (edits share chat:message_id), every member (admins too), kinds the extractor reads. */
+function toExtract(repo: Repo, retryFailed: boolean, sttAvailable: boolean, aliases: Alias[] = []): { raw: RawRow; msg: ParsedMessage; subject: Subject }[] {
   const latest = new Map<string, { raw: RawRow; msg: ParsedMessage }>();
+  const overrides = repo.overrideMap();
   for (const raw of repo.rawRows()) {
-    if (raw.role !== "patient" || raw.kind === "other") continue;
+    if (raw.kind === "other") continue;
     const ev = parseUpdate(raw.update);
     if (ev?.type !== "message") continue;
     const prev = latest.get(ev.msg.key);
@@ -139,9 +168,11 @@ function toExtract(repo: Repo, retryFailed: boolean, sttAvailable: boolean): { r
   }
   const done = new Map(repo.kbRows().filter((r) => r.rt === "d1.messages").map((r) => [r.id as string, r]));
   return [...latest.values()]
-    .filter(({ msg }) => {
+    .map((t) => ({ ...t, subject: subjectOf(t.raw, t.msg.text, overrides, repo, aliases) }))
+    .filter(({ msg, subject }) => {
       const prev = done.get(msg.key);
       if (!prev) return true;
+      if (prev.person_id !== subject.id) return true; // re-attributed (override or /for): re-extract into the new subject
       if (retryFailed && prev.extraction_status === "failed") return true;
       if (sttAvailable && prev.extraction_status === "stt_pending") return true; // backfill once a key exists
       return Number(prev.edit_date ?? 0) < msg.editDate;
@@ -155,14 +186,18 @@ export function unprocessedUpdateIds(repo: Repo): Set<number> {
 }
 
 type Base = {
-  rt: string; id: string; person_id: string; chat_id: string; kind: string; media_ref: string | null; raw_text: string | null;
+  /** person_id = the SUBJECT (whose records these are); sender_person_id = who sent it (provenance). */
+  rt: string; id: string; person_id: string; sender_person_id: string; subject_source: Subject["source"]; subject_set_by: string | null; chat_id: string; kind: string; media_ref: string | null; raw_text: string | null;
   received_at: string; external_id: string; edit_date: number; transcript: string | null; transcript_language: string | null;
   transcript_confidence: number | null; extraction_json: string | null; extracted_by: string | null; extracted_at: string;
   extraction_status: string; confidence: number | null;
+  /** Who the message seems to be about when that is not the sender (extraction hint, for human review). Never reassigns. */
+  subject_hint: string | null;
 };
 interface Item {
   raw: RawRow;
   msg: ParsedMessage;
+  subject: Subject;
   entry: DigestEntry;
   base: Base;
   input?: ExtractInput;
@@ -173,7 +208,8 @@ interface Item {
 
 export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   const tz = d.timeZone ?? "Asia/Kolkata";
-  const todo = toExtract(d.repo, !!d.retryFailed, !!d.stt);
+  const aliases = d.aliases ?? [];
+  const todo = toExtract(d.repo, !!d.retryFailed, !!d.stt, aliases);
   const history = d.repo.kbRows();
   const out: Row[] = [];
   const replaced = new Set<string>();
@@ -185,14 +221,18 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   let sttPending = 0;
 
   // 1. Per message: skip/park what cannot be read, transcribe voice, take vitals-only texts from the deterministic parser.
-  for (const { raw, msg } of todo) {
-    const person = d.persons.get(raw.person_id) ?? { id: raw.person_id, name: raw.person_id, role: "patient", senderId: raw.sender_id };
-    const entry: DigestEntry = { person: person.name, ts: msg.ts, snippet: snippet(msg.text), kind: msg.kind, questions: [], annotations: [], deep: null, readings: [], symptoms: [], notes: [] };
+  const nameOf = (id: string) => d.persons.get(id)?.name ?? displayOf(id, aliases) ?? id;
+  for (const { raw, msg, subject } of todo) {
+    const entry: DigestEntry = {
+      person: nameOf(subject.id), ts: msg.ts, snippet: snippet(msg.text), kind: msg.kind, questions: [], annotations: [], deep: null, readings: [], symptoms: [], notes: [],
+      ...(subject.id !== raw.person_id && { via: nameOf(raw.person_id) }),
+    };
     const base: Base = {
-      rt: "d1.messages", id: msg.key, person_id: raw.person_id, chat_id: msg.chatId, kind: msg.kind, media_ref: raw.media_key,
+      rt: "d1.messages", id: msg.key, person_id: subject.id, sender_person_id: raw.person_id, subject_source: subject.source,
+      subject_set_by: subject.setBy, chat_id: msg.chatId, kind: msg.kind, media_ref: raw.media_key,
       raw_text: msg.text ?? null, received_at: msg.ts, external_id: `tg:${raw.update_id}`, edit_date: msg.editDate,
       transcript: null, transcript_language: null, transcript_confidence: null,
-      extraction_json: null, extracted_by: null, extracted_at: d.now, extraction_status: "ok", confidence: null,
+      extraction_json: null, extracted_by: null, extracted_at: d.now, extraction_status: "ok", confidence: null, subject_hint: null,
     };
 
     if (raw.media_key && raw.media_status === "too_big") {
@@ -207,7 +247,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       continue;
     }
 
-    const item: Item = { raw, msg, entry, base };
+    const item: Item = { raw, msg, subject, entry, base };
     items.push(item);
     try {
       let transcript: Transcript | null = null;
@@ -227,10 +267,11 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
         Object.assign(base, { transcript: transcript.text, transcript_language: transcript.languageCode ?? null, transcript_confidence: transcript.languageProbability ?? null });
       }
       const text = transcript?.text ?? msg.text;
-      const vit = msg.kind === "text" ? parseVitals(text, msg.ts) : null;
+      // The name prefix is not part of the values (the Worker echoed the text without it).
+      const vit = msg.kind === "text" ? parseVitals(splitSubject(text, aliases).rest, msg.ts) : null;
       if (vit?.complete && vit.plausible) {
         // Exactly what the Worker echoed to the patient; no LLM call.
-        item.ex = { readings: vit.readings, symptoms: [], confidence: 1, mediaKind: null, unreadableReason: null, rejected: [], outOfRange: [] };
+        item.ex = { readings: vit.readings, symptoms: [], confidence: 1, mediaKind: null, unreadableReason: null, subjectHint: null, rejected: [], outOfRange: [] };
         item.extractedBy = "vitals-parser";
       } else {
         item.input = { text, media: msg.kind === "audio" ? undefined : media, now: msg.ts, replyTo: msg.replyToText };
@@ -255,7 +296,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   });
 
   // 3. Records, questions, deep-read queue, annotations.
-  for (const { raw, msg, entry, base, ex, extractedBy, error } of items) {
+  for (const { raw, msg, subject, entry, base, ex, extractedBy, error } of items) {
     if (error !== undefined || !ex) {
       const err = error as Error;
       if (isTransient(err)) {
@@ -268,7 +309,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       out.push({ ...base, extraction_status: "failed", note: `extraction failed: ${err?.name}` });
       replaced.add(msg.key);
       entry.questions.push("यह संदेश प्रोसेस नहीं हो पाया — कृपया दोबारा भेजें या लिखकर भेजें");
-      deep.push(deepEntry(d.now, raw, msg, base.transcript, ["extraction_failed"], null));
+      deep.push(deepEntry(d.now, { ...raw, subject_id: subject.id }, msg, base.transcript, ["extraction_failed"], null));
       entry.deep = "extraction_failed";
       entries.push(entry);
       continue;
@@ -276,7 +317,10 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
 
     base.extracted_by = extractedBy!;
     base.confidence = ex.confidence;
-    out.push(base, ...recordRows(msg.key, raw.person_id, ex, extractedBy!, d.now));
+    // Only a message attributed to its sender by default is checked: a prefix or an override is explicit.
+    const hint = subject.source === "sender" ? ex.subjectHint ?? usualSubject(history, raw.person_id, nameOf) : null;
+    base.subject_hint = hint;
+    out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now));
     replaced.add(msg.key);
     entry.readings = ex.readings;
     entry.symptoms = ex.symptoms;
@@ -296,18 +340,23 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       const what = ex.outOfRange.map((o) => (o.type === "bp" ? `BP ${o.value}` : readingHi({ type: o.type, value: o.value, value2: null, value3: null, unit: "", measuredAt: msg.ts }))).join(", ");
       entry.questions.push(`${what ? `"${what}"` : "एक संख्या"} सही नहीं लगती — कृपया दोबारा जाँचकर लिखें`);
     }
+    if (hint) {
+      // Records stay with the sender (never auto-reassigned); a human checks who the message is about (admin: /for <name>).
+      reasons.push("subject_hint");
+      entry.questions.push(`यह संदेश शायद "${hint.slice(0, 40)}" के बारे में है — अभी भेजने वाले (${entry.person}) के नाम दर्ज है; कृपया बताएँ किसका है`);
+    }
     if (!nothing && ex.confidence < LOW_CONFIDENCE) {
       reasons.push("low_confidence");
       entry.questions.push("पक्का नहीं पढ़ पाया — कृपया ऊपर लिखी संख्याएँ जाँचें");
     }
     if (reasons.length) {
-      deep.push(deepEntry(d.now, raw, msg, base.transcript, [...new Set(reasons)], ex));
+      deep.push(deepEntry(d.now, { ...raw, subject_id: subject.id }, msg, base.transcript, [...new Set(reasons)], ex));
       entry.deep = docKind ?? (msg.kind === "document" ? "document" : reasons[0]);
     }
 
     // Red-flag rules: digest annotations only (ADR 005).
     const weights = [...history, ...out]
-      .filter((r) => r.rt === "d1.readings" && r.type === "weight" && r.person_id === raw.person_id && r.source_message_id !== msg.key && r.confirmed !== -1)
+      .filter((r) => r.rt === "d1.readings" && r.type === "weight" && r.person_id === subject.id && r.source_message_id !== msg.key && r.confirmed !== -1)
       .map((r) => ({ type: "weight", value: r.value, value2: null, value3: null, unit: "kg", measuredAt: r.measured_at }) as Reading)
       .filter((r) => Date.parse(r.measuredAt) >= Date.parse(msg.ts) - 8 * DAY);
     entry.annotations = evaluate({ readings: ex.readings, symptoms: ex.symptoms, weightHistory: weights, thresholds: d.thresholds, timeZone: tz });
@@ -332,6 +381,18 @@ async function transcribe(stt: SpeechToText, d: ExtractDeps, media: Media, durat
   }
 }
 
+/** A sender who usually logs for someone else (2+ earlier messages, most of them about one other member): that
+ *  member's name, so an unprefixed message from them is checked. Deterministic; a hint for review only. */
+export function usualSubject(history: Row[], sender: string, nameOf: (id: string) => string): string | null {
+  const counts = new Map<string, number>();
+  for (const r of history)
+    if (r.rt === "d1.messages" && r.sender_person_id === sender) counts.set(r.person_id as string, (counts.get(r.person_id as string) ?? 0) + 1);
+  const self = counts.get(sender) ?? 0;
+  counts.delete(sender);
+  const [top, n] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0] ?? [null, 0];
+  return top && n >= 2 && n > self ? nameOf(top) : null;
+}
+
 function recordRows(messageId: string, personId: string, ex: Extraction, by: string, at: string): Row[] {
   const common = { person_id: personId, source_message_id: messageId, confidence: ex.confidence, confirmed: 0, extracted_by: by, extracted_at: at };
   const json = (v: unknown) => JSON.stringify(v);
@@ -350,9 +411,9 @@ function recordRows(messageId: string, personId: string, ex: Extraction, by: str
 
 function deepEntry(now: string, raw: RawRow, msg: ParsedMessage, transcript: string | null, reasons: string[], ex: Extraction | null) {
   return {
-    id: `deep:${msg.key}`, status: "open", created_at: now, person_id: raw.person_id, message_id: msg.key, update_id: raw.update_id,
+    id: `deep:${msg.key}`, status: "open", created_at: now, person_id: raw.subject_id ?? raw.person_id, sender_person_id: raw.person_id, message_id: msg.key, update_id: raw.update_id,
     kind: msg.kind, received_at: msg.ts, reasons, media_path: raw.media_path, text: msg.text?.slice(0, 500) ?? null, transcript,
-    haiku: ex && { confidence: ex.confidence, media_kind: ex.mediaKind, unreadable_reason: ex.unreadableReason, rejected: ex.rejected.slice(0, 5) },
+    haiku: ex && { confidence: ex.confidence, media_kind: ex.mediaKind, unreadable_reason: ex.unreadableReason, subject_hint: ex.subjectHint, rejected: ex.rejected.slice(0, 5) },
   };
 }
 
@@ -369,13 +430,13 @@ export interface FinishDeps {
   retentionDays: number;
   /** false: mark and prune only (manual re-runs). */
   send?: boolean;
-  /** Operator alerts (e.g. the webhook assertion), appended to the digest as ⚠ lines. */
+  /** Operator alerts (e.g. the webhook assertion): sent to the admins by private DM as ⚠ lines. */
   alerts?: string[];
 }
 
 export const DIGEST_FAILED = `⚠ ${PRODUCT_NAME}: आज की प्रोसेसिंग पूरी नहीं हुई। सभी संदेश सुरक्षित हैं; कल दोबारा कोशिश होगी।`;
 
-export async function finish(d: FinishDeps): Promise<{ done: number; pruned: number; sentTo: number }> {
+export async function finish(d: FinishDeps): Promise<{ done: number; pruned: number; sentTo: number; opsTo: number }> {
   // Only rows that are in git (the raw files of this checkout, which the workflow has pushed) are marked done.
   // Last ~2 months only, to keep the statement small; older rows were marked by earlier runs.
   const since = Date.parse(d.now) - 62 * DAY;
@@ -383,11 +444,30 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
   const open = unprocessedUpdateIds(d.repo);
   const ids = d.repo.rawRows().filter((r) => Date.parse(r.received_at) >= since && !open.has(r.update_id)).map((r) => r.update_id);
   const done = await d.store.markDone(ids, d.now);
-  const family = d.send === false ? [] : (await d.store.chats()).filter((c) => c.label === "family");
-  const text = [d.digest ?? DIGEST_FAILED, ...(d.alerts ?? []).map((a) => `\n⚠ ${a}`)].join("\n");
-  for (const c of family) for (const part of splitMessage(text)) await d.tg.sendText(c.chat_id, part);
+  let sentTo = 0;
+  let opsTo = 0;
+  if (d.send !== false) {
+    const family = (await d.store.chats()).filter((c) => c.label === "family");
+    // Ops lines (digest failure, webhook alerts) go to the admins by private DM (chat id = their Telegram user id; the
+    // admin must have started a private chat with the bot). No admin reachable: they fall back to the family group.
+    const ops = [...(d.digest === null ? [DIGEST_FAILED] : []), ...(d.alerts ?? []).map((a) => `⚠ ${a}`)];
+    if (ops.length) {
+      const text = ops.join("\n\n");
+      for (const a of (await d.store.persons()).filter((p) => p.role === "admin")) {
+        try {
+          for (const part of splitMessage(text)) await d.tg.sendText(a.senderId, part);
+          opsTo++;
+        } catch (err) {
+          console.error(`ops DM to an admin failed: ${(err as Error).name}`); // no ids or content in the log
+        }
+      }
+    }
+    const familyText = [d.digest, ...(opsTo ? [] : ops)].filter((x): x is string => !!x).join("\n\n");
+    if (familyText) for (const c of family) for (const part of splitMessage(familyText)) await d.tg.sendText(c.chat_id, part);
+    sentTo = familyText ? family.length : 0;
+  }
   const pruned = await d.store.prune(new Date(Date.parse(d.now) - d.retentionDays * DAY).toISOString());
-  return { done, pruned, sentTo: family.length };
+  return { done, pruned, sentTo, opsTo };
 }
 
 /** Telegram caps a message at 4096 characters. Split on line boundaries. */

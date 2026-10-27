@@ -43,10 +43,10 @@ describe("webhook", () => {
     expect((await handleWebhook(webhook(u), io)).status).toBe(200); // Telegram redelivery
     const rows = await inbox(db);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ update_id: u.update_id, person_id: "alice", kind: "text", status: "new", media_status: "none", ack: "BP 120/80, pulse 72 ✓" });
+    expect(rows[0]).toMatchObject({ update_id: u.update_id, person_id: "alice", kind: "text", status: "new", media_status: "none", ack: "Alice: BP 120/80, pulse 72 ✓", subject_id: "alice" });
     expect(JSON.parse(rows[0].raw)).toEqual(u);
     expect(t.sent()).toHaveLength(1);
-    expect(t.sent()[0].body).toMatchObject({ chat_id: GROUP, text: "BP 120/80, pulse 72 ✓", reply_parameters: { message_id: u.message!.message_id } });
+    expect(t.sent()[0].body).toMatchObject({ chat_id: GROUP, text: "Alice: BP 120/80, pulse 72 ✓", reply_parameters: { message_id: u.message!.message_id } });
   });
 
   it("plain text gets a short ack; an edit is marked as a correction", async () => {
@@ -54,7 +54,7 @@ describe("webhook", () => {
     const t = fakeTelegram();
     await handleWebhook(webhook(textUpdate("aaj thoda chakkar aaya")), ingestIO(store, t.tg));
     await handleWebhook(webhook({ update_id: 77, edited_message: { message_id: 76, date: 1792814400, edit_date: 1792814460, chat: { id: Number(GROUP) }, from: { id: 111 }, text: "wajan 61" } }), ingestIO(store, t.tg));
-    expect(t.sent().map((c) => c.body.text)).toEqual([ACK.text, `${ACK.editPrefix}weight 61 kg ✓`]);
+    expect(t.sent().map((c) => c.body.text)).toEqual([`Alice: ${ACK.text}`, `${ACK.editPrefix}Alice: weight 61 kg ✓`]);
   });
 
   it("copies media to R2 at ingest and acks", async () => {
@@ -64,7 +64,7 @@ describe("webhook", () => {
     await handleWebhook(webhook(fixture("photo")), io);
     expect(io.r2.objects.get("telegram/u-large")).toEqual({ data: new Uint8Array([0xff, 0xd8, 0xff]), mimeType: "image/jpeg" });
     expect((await inbox(db))[0]).toMatchObject({ kind: "image", media_key: "telegram/u-large", media_status: "stored" });
-    expect(t.sent()[0].body.text).toBe(ACK.image);
+    expect(t.sent()[0].body.text).toBe(`Alice: ${ACK.image}`);
   });
 
   it("a failed media copy still answers 200 and leaves media_status pending for the batch", async () => {
@@ -73,7 +73,7 @@ describe("webhook", () => {
     const res = await handleWebhook(webhook(fixture("voice")), ingestIO(store, t.tg));
     expect(res.status).toBe(200);
     expect((await inbox(db))[0]).toMatchObject({ kind: "audio", media_status: "pending" });
-    expect(t.sent()[0].body.text).toBe(ACK.audio);
+    expect(t.sent()[0].body.text).toBe(`Alice: ${ACK.audio}`);
   });
 
   it("files over 20 MB are not downloaded; the sender is told", async () => {
@@ -87,15 +87,15 @@ describe("webhook", () => {
     expect(t.sent()[0].body.text).toBe(ACK.tooBig);
   });
 
-  it("ignores other chats and strangers; stores the caregiver's messages without an ack", async () => {
+  it("ignores other chats and strangers; an admin's messages are stored and acked like any member's", async () => {
     const { db, store } = await seededStore();
     const t = fakeTelegram();
     const io = ingestIO(store, t.tg);
     await handleWebhook(webhook(fixture("other-chat")), io);
     await handleWebhook(webhook(fixture("stranger")), io);
     await handleWebhook(webhook(textUpdate("main kal aa raha hoon", 222)), io);
-    expect((await inbox(db)).map((r) => r.person_id)).toEqual(["caregiver"]);
-    expect(t.sent()).toEqual([]);
+    expect((await inbox(db)).map((r) => r.person_id)).toEqual(["carol-tg"]);
+    expect(t.sent().map((c) => c.body.text)).toEqual([`Carol: ${ACK.text}`]);
   });
 
   it("stickers and other files are stored raw but not acked", async () => {

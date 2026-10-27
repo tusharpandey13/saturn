@@ -96,11 +96,15 @@ export interface Symptom {
 export const MEDIA_KINDS = ["device_reading", "medicine", "prescription", "report", "other"] as const;
 export type MediaKind = (typeof MEDIA_KINDS)[number];
 
+/** Everyone is a member: each member's messages are recorded, acked and extracted into their own namespace.
+ *  admin = a member plus ops privileges (ops alerts and digest failures by private DM; manages the allowlist and settings). */
+export const ROLES = ["member", "admin"] as const;
+export type Role = (typeof ROLES)[number];
+
 export interface Person {
   id: string;
   name: string;
-  /** caregiver = observer (e.g. a family member who helps): messages are kept raw, never acked or extracted as patient data. */
-  role: "patient" | "caregiver";
+  role: Role;
   senderId: string;
 }
 

@@ -38,6 +38,9 @@ export const ExtractionOutput = z.strictObject({
   media_kind: z.enum([...MEDIA_KINDS, "none"]).describe("what a photo/PDF shows; none for text/voice"),
   confidence: z.number().describe("0-1 overall confidence"),
   unreadable_reason: z.string().nullable(),
+  subject_hint: z.string().nullable().describe(
+    "only when the message is clearly about someone other than the sender (e.g. \"Maa's BP 120/80\" sent by her son): who, as written; else null",
+  ),
 });
 
 /** JSON Schema for structured output (`claude --json-schema`), generated from the Zod contract. */
@@ -70,6 +73,9 @@ export interface Extraction {
   /** What a photo/PDF shows (null for text/voice or when not reported). */
   mediaKind: MediaKind | null;
   unreadableReason: string | null;
+  /** The message seems to be about someone other than the sender (as written, e.g. "Maa"). A flag for human review only:
+   *  records stay attributed to the sender. */
+  subjectHint: string | null;
   /** Human-readable reasons items were dropped. */
   rejected: string[];
   /** Well-formed readings outside the plausible range (misread, or a real extreme). */
@@ -176,7 +182,7 @@ export function parseExtraction(raw: unknown, now: string): Extraction {
     try {
       obj = JSON.parse(raw);
     } catch {
-      return { readings: [], symptoms: [], confidence: 0, mediaKind: null, unreadableReason: "invalid JSON from extractor", rejected: ["invalid JSON"], outOfRange: [] };
+      return { readings: [], symptoms: [], confidence: 0, mediaKind: null, unreadableReason: "invalid JSON from extractor", subjectHint: null, rejected: ["invalid JSON"], outOfRange: [] };
     }
   }
   if (!obj || typeof obj !== "object") obj = {};
@@ -186,5 +192,7 @@ export function parseExtraction(raw: unknown, now: string): Extraction {
   const confidence = isNum(obj.confidence) ? Math.min(1, Math.max(0, obj.confidence)) : 0;
   const unreadableReason = typeof obj.unreadable_reason === "string" ? obj.unreadable_reason : null;
   const mediaKind = MEDIA_KINDS.includes(obj.media_kind) ? (obj.media_kind as MediaKind) : null;
-  return { readings, symptoms, confidence, mediaKind, unreadableReason, rejected, outOfRange };
+  const hint = typeof obj.subject_hint === "string" ? obj.subject_hint.trim().slice(0, 80) : "";
+  const subjectHint = hint && !/^(null|none|self|sender)$/i.test(hint) ? hint : null;
+  return { readings, symptoms, confidence, mediaKind, unreadableReason, subjectHint, rejected, outOfRange };
 }

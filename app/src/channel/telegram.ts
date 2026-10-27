@@ -1,5 +1,5 @@
 // Telegram Bot API: the parts the ingest Worker and the daily batch need (ADR 005).
-// Family group (patients + caregivers + bot; the bot is a group admin so it receives photos and voice notes).
+// Family group (members + bot; the bot is a group admin so it receives photos and voice notes).
 // Never log or forward Telegram file URLs: they contain the bot token.
 
 export const MAX_FILE_BYTES = 20 * 1024 * 1024; // Bot API getFile limit
@@ -41,6 +41,8 @@ export interface ParsedMessage {
   text?: string;
   /** Text of the message this one replies to (e.g. a digest question), when Telegram includes it. */
   replyToText?: string;
+  /** Id of the message this one replies to (e.g. a bot echo, for the admin's /for correction). */
+  replyToMessageId?: number;
   /** ISO time the message was sent (for an edit: the original send time). */
   ts: string;
   /** Unix seconds of the latest edit; 0 for an unedited message. */
@@ -64,6 +66,7 @@ export function parseUpdate(u: TgUpdate): TgEvent | null {
     updateId: u.update_id, key: `${chatId}:${m.message_id}`, chatId, messageId: m.message_id, sender: String(m.from.id),
     text: m.text ?? m.caption, ts: new Date(m.date * 1000).toISOString(), editDate: m.edit_date ?? 0,
     ...(reply && (reply.text ?? reply.caption) ? { replyToText: reply.text ?? reply.caption } : {}),
+    ...(reply ? { replyToMessageId: reply.message_id } : {}),
   };
   const file = (f: TgFile, mimeType: string): ParsedFile => ({ fileId: f.file_id, uniqueId: f.file_unique_id, mimeType, size: f.file_size });
   const msg = (kind: Kind, extra: Partial<ParsedMessage> = {}): TgEvent => ({ type: "message", msg: { ...base, kind, ...extra } });
@@ -104,11 +107,13 @@ export class TelegramAdapter {
     return json.result;
   }
 
-  async sendText(chatId: string, text: string, replyTo?: number): Promise<void> {
-    await this.api("sendMessage", {
+  /** Returns the sent message's id (when Telegram reports it). */
+  async sendText(chatId: string, text: string, replyTo?: number): Promise<number | undefined> {
+    const r = await this.api("sendMessage", {
       chat_id: chatId, text,
       ...(replyTo && { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } }),
     });
+    return typeof r?.message_id === "number" ? r.message_id : undefined;
   }
 
   /** Where Telegram delivers updates. The batch asserts it (src/batch/webhook.ts) to detect a setWebhook hijack. */

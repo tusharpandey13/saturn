@@ -78,10 +78,30 @@ async function main() {
   rmSync(STATE, { recursive: true, force: true });
   mkdirSync(STATE, { recursive: true });
 
+  console.log("0/9 role + subject migrations (0002, 0003) on a local D1 at 0001 with 3 persons like production");
+  const MIG_STATE = join(STATE, "migration");
+  const d1m = (args) => JSON.parse(wrangler(["d1", "execute", "DB", "--local", "--persist-to", MIG_STATE, "--json", ...args]))[0]?.results;
+  d1m(["--file", join(APP, "migrations", "0001_init.sql")]);
+  d1m(["--command", `INSERT INTO persons (id, name, role, sender_id) VALUES ('alice', 'Alice', 'patient', '111'), ('bob', 'Bob', 'patient', '333'), ('carol-tg', 'Carol', 'caregiver', '222');`]);
+  d1m(["--command", "INSERT INTO inbox (update_id, chat_id, message_id, sender_id, person_id, kind, received_at, raw) VALUES (1, '-1', 1, '333', 'bob', 'text', '2026-10-27T08:24:00Z', '{}')"]);
+  d1m(["--file", join(APP, "migrations", "0002_member_admin_roles.sql")]);
+  d1m(["--file", join(APP, "migrations", "0003_inbox_subject.sql")]);
+  const sub = d1m(["--command", "SELECT person_id, subject_id FROM inbox"]);
+  check(JSON.stringify(sub) === JSON.stringify([{ person_id: "bob", subject_id: "bob" }]), `subject migration: unexpected ${JSON.stringify(sub)}`);
+  const migrated = d1m(["--command", "SELECT id, role, sender_id FROM persons ORDER BY id"]);
+  check(JSON.stringify(migrated) === JSON.stringify([{ id: "alice", role: "member", sender_id: "111" }, { id: "bob", role: "member", sender_id: "333" }, { id: "carol-tg", role: "admin", sender_id: "222" }]),
+    `role migration: unexpected rows ${JSON.stringify(migrated)}`);
+  let refused = false;
+  try { d1m(["--command", "INSERT INTO persons (id, name, role, sender_id) VALUES ('x', 'X', 'patient', '999')"]); } catch { refused = true; }
+  check(refused, "role migration: the old role 'patient' was accepted");
+  refused = false;
+  try { d1m(["--command", "INSERT INTO persons (id, name, role, sender_id) VALUES ('y', 'Y', 'member', '111')"]); } catch { refused = true; }
+  check(refused, "role migration: sender_id is no longer UNIQUE");
+
   console.log("1/9 local D1: migrations + seed");
   wrangler(["d1", "migrations", "apply", "DB", "--local", "--persist-to", STATE], { input: "y\n" });
   d1(`INSERT INTO chats (chat_id, channel, label) VALUES ('${GROUP}', 'telegram', 'family');
-      INSERT INTO persons (id, name, role, sender_id) VALUES ('alice', 'Alice', 'patient', '${ALICE}');`);
+      INSERT INTO persons (id, name, role, sender_id) VALUES ('alice', 'Alice', 'member', '${ALICE}');`);
 
   console.log("2/9 wrangler dev (local workerd, stub Telegram)");
   const envFile = join(STATE, "e2e.env");
@@ -97,7 +117,7 @@ async function main() {
   check((await post(text)).status === 200, "webhook not 200");
   check((await post(text)).status === 200, "redelivery not 200");
   const ack = await waitFor("ack", () => sent()[0]);
-  check(ack.body.text === "BP 120/80, pulse 72 ✓", `unexpected ack: ${ack.body.text}`);
+  check(ack.body.text === "Alice: BP 120/80, pulse 72 ✓", `unexpected ack: ${ack.body.text}`); // ack_mode all (example env)
 
   console.log("5/9 photo -> R2 copy at ingest");
   const photo = { update_id: 900002, message: { message_id: 2, date: now(), chat: { id: GROUP }, from: { id: ALICE, is_bot: false },
