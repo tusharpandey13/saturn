@@ -37,7 +37,7 @@ LINKS = {"source": {"duplicate_of": "source", "org_id": "ref:party", "practition
          "ref": {"supersedes": "ref"}}
 
 # ---- Telegram (D1 export) -> source + fact ---------------------------------------------------------------------
-D1_TABLES = {"persons", "chats", "messages", "readings", "symptoms", "alerts"}
+D1_TABLES = {"persons", "chats", "messages", "readings", "symptoms", "alerts", "context"}  # context: ADR 010, batch-only
 D1_PERSON = {}  # D1 person id -> KB ns (same id otherwise); records.yaml d1_person_map
 # reading type -> (code local, category, canonical unit)
 D1_READING = {
@@ -130,6 +130,25 @@ def telegram_records(rows, root):
         except KeyError as e:
             errors.append(f"{where}: d1.{t} row missing {e}")
     for where, t, r in rows:
+        if t == "context":  # life-context signal (ADR 010) -> event fact, data.type context; summaries only, no quote
+            try:
+                ns = D1_PERSON.get(r["person_id"], r["person_id"])
+                msg = msgs.get(r["source_message_id"])
+                sender = D1_PERSON.get(r.get("sender_person_id") or "", r.get("sender_person_id"))
+                tags = (["patient-reported"] if sender == ns else ["family-reported"]) \
+                    + (["shadow"] if r.get("mode") == "shadow" else []) + (["low-confidence"] if r.get("confidence") == "low" else [])
+                out.append((where, "fact", {
+                    "id": f"{ns}:fact:{tg_local(r['start'] + 'T12:00:00+05:30', r['id'])}", "kind": "event", "at": r["start"],
+                    "at_precision": "day", "ns": ns, "locator": f"tg:{r['source_message_id']}",
+                    "source_id": src_ids.get(r["source_message_id"], f"{ns}:src:missing-tg.{r['source_message_id']}"),
+                    "data": {"type": "context", "category": r["category"], "summary": r["summary"], "intensity": r.get("intensity"),
+                             "confidence": r["confidence"], "end": r.get("end"), "data_class": "phi"},
+                    "quote": None, "verification": "unverified", "status": "active", "tags": tags,
+                    "recorded_by": r.get("extracted_by") or "telegram-bot",
+                    "created_at": r.get("extracted_at") or (msg or {}).get("received_at") or r["start"]}))
+            except KeyError as e:
+                errors.append(f"{where}: d1.context row missing {e}")
+            continue
         if t not in ("readings", "symptoms"):
             continue
         try:
@@ -393,6 +412,16 @@ def main(argv):
                 data_refs += [(where, rid, p, v, k) for p, v, k in refs]
             if not isinstance(r.get("tags"), list):
                 errors.append(f"{where}: tags must be an array")
+            elif t == "fact" and r["kind"] == "event" and isinstance(r.get("data"), dict) and r["data"].get("type") == "context":
+                # ADR 010: never a quote, always unverified, provenance tagged, day/month precision (a band, not a moment)
+                if r.get("quote") is not None:
+                    errors.append(f"{where}: context fact {rid}: quote must be null (summaries only)")
+                if r["verification"] != "unverified":
+                    errors.append(f"{where}: context fact {rid}: verification must be unverified")
+                if not {"patient-reported", "family-reported"} & set(r["tags"]):
+                    errors.append(f"{where}: context fact {rid}: needs tag patient-reported or family-reported")
+                if r["at_precision"] not in ("day", "month"):
+                    errors.append(f"{where}: context fact {rid}: at_precision must be day or month")
 
     # ---- load -----------------------------------------------------------------------------------------------------
     for t in ORDER:

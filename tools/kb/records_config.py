@@ -4,6 +4,7 @@ A records repo carries `records.yaml` at its root (split plan section 9: namespa
   schema_version: 7
   namespaces: [{id, display, shared?}]   # KB namespaces; ids <ns>:<class>:<local>
   d1_person_map: {<d1 person id>: <ns>}  # optional; Telegram batch person id -> KB namespace
+  context_consent: {<ns>: true|false|pending}  # optional; ADR 010 life-context consent
 Only that YAML subset is parsed (scalars, one nested map, a list of flat maps); anything else is an error.
 """
 import pathlib, re
@@ -94,6 +95,8 @@ def load(records_dir):
         "persons": tuple(ns["id"] for ns in nss if not ns.get("shared")),
         "display": {ns["id"]: ns.get("display") or ns["id"] for ns in nss},
         "d1_person_map": dict(d1),
+        # ADR 010: {ns: True | False | "pending"}; only True lets a view show that member's context bands
+        "context_consent": dict(y.get("context_consent") or {}),
     }
 
 

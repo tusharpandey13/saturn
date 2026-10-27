@@ -50,6 +50,7 @@ case "$cmd" in
       echo "INBOX_RETENTION_DAYS=$(y .batch.inbox_retention_days "$ENV_FILE")"
       echo "CLAUDE_CODE_VERSION=$(y .batch.claude_code_version "$ENV_FILE")"
       echo "CLAUDE_TOKEN_CREATED=$(y .batch.claude_token_created "$ENV_FILE")"
+      echo "CONTEXT_MODE=$(y .context_mode "$ENV_FILE")"
     } >> "${GITHUB_ENV:-/dev/stdout}" ;;
   verify-lock)
     want=$(y .commit "$LOCK_FILE"); got=$(git -C "${1:?dir}" rev-parse HEAD)

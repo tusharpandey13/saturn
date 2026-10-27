@@ -15,7 +15,8 @@
 //          $DIGEST_FILE, else $RUNNER_TEMP or app/.batch/digest.txt), --now ISO.
 // Env: pull/finish CLOUDFLARE_D1_TOKEN (fallback CLOUDFLARE_API_TOKEN), CLOUDFLARE_R2_TOKEN (optional), CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID, R2_BUCKET, TELEGRAM_BOT_TOKEN;
 //      extract CLAUDE_CODE_OAUTH_TOKEN (or a local `claude` login; ANTHROPIC_API_KEY, if set, takes precedence in the CLI),
-//      CLAUDE_TOKEN_CREATED (YYYY-MM-DD, expiry warning), CLAUDE_BIN (default claude), SARVAM_API_KEY (optional);
+//      CLAUDE_TOKEN_CREATED (YYYY-MM-DD, expiry warning), CLAUDE_BIN (default claude), SARVAM_API_KEY (optional),
+//      CONTEXT_MODE (off default | shadow | on; ADR 010 life-context signals);
 //      finish INBOX_RETENTION_DAYS (default 14), GO_LIVE (true after the GO-LIVE GATE), WORKER_URL (webhook assertion). Local e2e only: CLOUDFLARE_API_BASE, TELEGRAM_API_BASE.
 // Output is counts only: no message content reaches the Actions log.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -31,6 +32,7 @@ import { parseVocab, SarvamSpeechToText } from "../../adapters/stt/sarvam.js";
 import { loadRecords } from "../src/batch/records.js";
 import type { Person } from "../src/types.js";
 import { aliasesFromRecords } from "../src/subject.js";
+import { parseContextMode } from "../src/extract/context.js";
 
 const args = process.argv.slice(2);
 const opt = (name: string) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
@@ -70,8 +72,11 @@ async function main(cmd: string | undefined) {
     }
     if (!env.SARVAM_API_KEY) console.log("extract: no SARVAM_API_KEY; voice notes are stored as stt_pending");
     if (records.thresholds.status === "disabled") console.log("extract: rule annotations off (records config/thresholds.yaml not configured)");
+    // Life context (ADR 010): env context_mode -> CONTEXT_MODE; consent from records.yaml context_consent (true only).
+    const contextMode = parseContextMode(env.CONTEXT_MODE);
+    const contextConsented = new Set(Object.entries(records.contextConsent).filter(([, v]) => v === "true").map(([ns]) => repo.d1Id(ns)));
     const r = await extract({
-      repo, persons, now, thresholds: records.thresholds, warnings, aliases,
+      repo, persons, now, thresholds: records.thresholds, warnings, aliases, contextMode, contextConsented,
       extractor: new ClaudeCliExtractor({ bin: env.CLAUDE_BIN || "claude", context: records.extractionContext }),
       stt: env.SARVAM_API_KEY ? new SarvamSpeechToText(env.SARVAM_API_KEY, undefined, undefined, parseVocab(records.sttVocab ?? "")) : null,
       retryFailed: args.includes("--retry-failed"),
@@ -83,6 +88,7 @@ async function main(cmd: string | undefined) {
     if (!r.delayed) writeFileSync(digestPath, r.digest);
     if (r.ops.length) writeFileSync(opsPath, r.ops.join("\n"));
     console.log(`extract: ${r.extracted} messages; pending ${r.pending} (delayed ${r.delayed}); stt_pending ${r.sttPending}; queued for deep read ${r.queued}; changed ${r.changed.join(", ") || "nothing"}`);
+    console.log(`context (${contextMode}; consented ${contextConsented.size}): read ${r.context.read}; signals ${r.context.signals}; dropped ${r.context.dropped}; skipped (daily cap) ${r.context.skippedCap}`);
     // The workflow commits and builds whenever the outputs were written, even when it fails the job for a delay.
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `completed=true\ndelayed=${r.delayed}\n`);
     if (r.delayed) {

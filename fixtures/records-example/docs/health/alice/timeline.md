@@ -39,3 +39,15 @@ _Generated from the KB on 2026-10-27 (data as of 2026-06-10; 9 facts). Don't edi
 | 10-Jun-2026 | medication/taking | Examplezole → examplezole |  | family-reported | active | `alice:fact:2026-06-10-example-family-med-list.examplezole` | `sources/alice/media/family/2026-06-10-example-family-med-list.md` |
 <!-- gen:timeline end -->
 
+
+## Context lane (admin-only)
+
+<!-- gen:context start -->
+_Generated from the KB on 2026-10-27 (data as of 2026-06-10; 9 facts). Don't edit inside this block; see AGENTS.md._
+
+Life-context bands (ADR 010), **admin-only by convention**. Shown alongside, not as a cause. Facts as written; not advice; doctors decide.
+
+Shadow-mode and low-confidence rows are never shown. Summaries are paraphrases, never quotes; `brief-relevant` marks the only rows a doctor brief may use.
+
+No context bands to show.
+<!-- gen:context end -->

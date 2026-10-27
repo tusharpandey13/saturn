@@ -67,6 +67,12 @@ describe("env.manifest.yaml + wrangler template", () => {
     expect(render(tpl, { ...exampleEnv, ack_mode: undefined })).not.toMatch(/^ACK_MODE =/m);
   });
 
+  it("context_mode: one of off | shadow | on (ADR 010); optional", () => {
+    expect(check({ ...exampleEnv, context_mode: "loud" }, manifest)).toEqual(["context_mode: loud is not one of off, shadow, on"]);
+    expect(check({ ...exampleEnv, context_mode: "shadow" }, manifest)).toEqual([]);
+    expect(check({ ...exampleEnv, context_mode: undefined }, manifest)).toEqual([]);
+  });
+
   it("drops the database_id line until the env pins an id (wrangler auto-provisions), then renders it", () => {
     const tpl = readFileSync(join(ROOT, "deploy", "wrangler.template.toml"), "utf8");
     expect(render(tpl, exampleEnv)).not.toMatch(/^database_id =/m);

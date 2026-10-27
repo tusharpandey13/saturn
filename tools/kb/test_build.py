@@ -210,6 +210,73 @@ class ValidationTest(unittest.TestCase):
         self.expect_fail("must have status 'superseded'", a | {"status": "active"}, b, c)
 
 
+def ctx_fact(local, **kw):
+    """A hand-written life-context event (ADR 010) on the example lab source."""
+    return fact(local, kind="event", at="2026-03-12", at_precision="day", quote=None, verification="unverified",
+                tags=["family-reported"], data={"type": "context", "category": "travel", "summary": "away for a few days",
+                                                "confidence": "high", "data_class": "phi"}) | kw
+
+
+class ContextTest(unittest.TestCase):
+    """ADR 010: d1.context rows -> event facts with data.type context; the build's context checks."""
+
+    def test_batch_rows_map_to_context_events(self):
+        msg = {"rt": "d1.messages", "id": "-100:7", "person_id": "alice", "sender_person_id": "carol-tg", "kind": "text",
+               "chat_id": "-100", "received_at": "2026-10-24T05:00:00.000Z", "raw_text": "synthetic", "extraction_status": "ok",
+               "extracted_by": "claude-haiku-5-5", "extracted_at": "2026-10-25T15:30:00.000Z", "context_status": "extracted"}
+        rows = [msg, {"rt": "d1.context", "id": "-100:7:c0", "source_message_id": "-100:7", "person_id": "alice",
+                      "sender_person_id": "carol-tg", "category": "travel", "summary": "Alice away for a few days",
+                      "intensity": None, "confidence": "high", "start": "2026-10-24", "end": "2026-10-27", "mode": "shadow",
+                      "extracted_by": "claude-haiku-5-5", "extracted_at": "2026-10-25T15:30:00.000Z"},
+                {"rt": "d1.context", "id": "-100:7:c1", "source_message_id": "-100:7", "person_id": "carol-tg",
+                 "sender_person_id": "carol-tg", "category": "sleep", "summary": "sleeping poorly", "intensity": "high",
+                 "confidence": "low", "start": "2026-10-24", "end": None, "mode": "on",
+                 "extracted_by": "claude-haiku-5-5", "extracted_at": "2026-10-25T15:30:00.000Z"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            tg = pathlib.Path(tmp) / "telegram"
+            tg.mkdir()
+            (tg / "2026-10.ndjson").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            db = pathlib.Path(tmp) / "kb.sqlite"
+            out = build("--records", str(RECORDS), "--telegram", str(tg), "--db", str(db))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            con = sqlite3.connect(db)
+            got = con.execute("SELECT id, ns, at, at_precision, data, quote, verification, tags, source_id, locator FROM fact "
+                              "WHERE json_extract(data, '$.type') = 'context' ORDER BY id").fetchall()
+            self.assertEqual(con.execute("SELECT count(*) FROM v_context").fetchone(), (0,))  # shadow and low-confidence
+            self.assertEqual(con.execute("SELECT count(*) FROM v_timeline WHERE what = 'context'").fetchone(), (0,))
+            con.close()
+        self.assertEqual([(g[0], g[1], g[2], g[3], json.loads(g[4]), g[5], g[6], json.loads(g[7]), g[8], g[9]) for g in got], [
+            ("alice:fact:2026-10-24-tg.-100.7.c0", "alice", "2026-10-24", "day",
+             {"type": "context", "category": "travel", "summary": "Alice away for a few days", "confidence": "high",
+              "end": "2026-10-27", "data_class": "phi"}, None, "unverified", ["family-reported", "shadow"],
+             "alice:src:2026-10-24-tg.-100.7", "tg:-100:7"),
+            ("carol:fact:2026-10-24-tg.-100.7.c1", "carol", "2026-10-24", "day",
+             {"type": "context", "category": "sleep", "summary": "sleeping poorly", "intensity": "high", "confidence": "low",
+              "data_class": "phi"}, None, "unverified", ["patient-reported", "low-confidence"],
+             "alice:src:2026-10-24-tg.-100.7", "tg:-100:7"),
+        ])
+
+
+class ContextValidationTest(unittest.TestCase):
+    run_case, append, expect_fail = ValidationTest.run_case, ValidationTest.append, ValidationTest.expect_fail
+
+    def test_context_builds(self):
+        out = self.run_case(lambda d: self.append(d, ctx_fact("2026-03-12-ctx")))
+        self.assertEqual(out.returncode, 0, out.stdout)
+
+    def test_context_rules(self):
+        self.expect_fail("quote must be null", ctx_fact("2026-03-12-ctx", quote="I am travelling"))
+        self.expect_fail("verification must be unverified", ctx_fact("2026-03-12-ctx", verification="agent"))
+        self.expect_fail("needs tag patient-reported or family-reported", ctx_fact("2026-03-12-ctx", tags=[]))
+        self.expect_fail("matches none of anyOf", ctx_fact("2026-03-12-ctx", data={"type": "context", "summary": "x",
+                                                                                   "confidence": "high", "data_class": "phi"}))
+        self.expect_fail("not in", ctx_fact("2026-03-12-ctx", data={"type": "context", "category": "other", "summary": "x",
+                                                                    "confidence": "high", "data_class": "phi"}))
+        self.expect_fail("longer than 80", ctx_fact("2026-03-12-ctx", data={"type": "context", "category": "mood",
+                                                                             "summary": "x" * 81, "confidence": "high",
+                                                                             "data_class": "phi"}))
+
+
 class RecordsYamlTest(unittest.TestCase):
     def test_missing_records_yaml(self):
         with tempfile.TemporaryDirectory() as tmp:

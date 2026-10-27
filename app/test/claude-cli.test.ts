@@ -76,6 +76,14 @@ describe("ClaudeCliExtractor (fake claude on PATH)", () => {
     expect((out[0] as any).msg).toBeUndefined();
   });
 
+  it("one combined call: each message header says context: yes|no (ADR 010 pre-filter)", async () => {
+    await cli("ok").extract([{ ...text("aaj bahut tension hai office mein"), context: true }, text("BP 120/80")]);
+    const stdin = String(calls()[0].stdin);
+    expect(stdin).toMatch(/Message 1: [^\n]*context: yes\./);
+    expect(stdin).toMatch(/Message 2: [^\n]*context: no\./);
+    expect(JSON.parse(calls()[0].args[calls()[0].args.indexOf("--json-schema") + 1]).properties.results.items.required).toContain("context");
+  });
+
   it("photos/PDFs go as content blocks over stream-json; chunks of at most MAX_PER_CALL", async () => {
     const photo: ExtractInput = { now: NOW, media: { data: new Uint8Array([0xff, 0xd8, 1]), mimeType: "image/jpeg" } };
     const pdf: ExtractInput = { now: NOW, media: { data: new Uint8Array([0x25, 0x50]), mimeType: "application/pdf" } };

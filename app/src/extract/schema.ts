@@ -5,6 +5,7 @@
 import { z } from "zod";
 import { MEDIA_KINDS, SIDES, SYMPTOM_TYPES } from "../types.js";
 import type { MediaKind, Reading, ReadingType, Side, Symptom, SymptomType } from "../types.js";
+import { ContextItem } from "./context.js";
 
 const READING_TYPES = [
   "weight", "bp", "pulse", "spo2", "potassium", "sodium", "creatinine", "glucose_fasting", "glucose_pp", "glucose_random",
@@ -43,6 +44,7 @@ export const ExtractionOutput = z.strictObject({
   subject_hint: z.string().nullable().describe(
     "only when the message is clearly about someone other than the sender (e.g. \"Maa's BP 120/80\" sent by her son): who, as written; else null",
   ),
+  context: z.array(ContextItem).describe("life-context signals (ADR 010); [] unless the message header says context: yes"),
 });
 
 /** JSON Schema for structured output (`claude --json-schema`), generated from the Zod contract. */

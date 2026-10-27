@@ -1,6 +1,6 @@
 # 010 — Life-context signals from family group conversation
 
-Date: 2026-10-27 · Status: **PROPOSED** · Related: 005 (ingest and batch), 007 (data model), 008 (PII), 009 (members, `ack_mode`), [HLD](../platform/hld.md), [records guide](../records-guide.md)
+Date: 2026-10-27 · Status: **ACCEPTED** (2026-10-27, owner approved the defaults; implemented in v0.5.0; see "Decisions taken", which wins where the text below differs) · Related: 005 (ingest and batch), 007 (data model), 008 (PII), 009 (members, `ack_mode`), [HLD](../platform/hld.md), [records guide](../records-guide.md)
 
 ## Context
 With `ack_mode` off (ADR 009) the family group is also a general conversation and sharing group, not only a reading log. Those chats carry context a doctor may want next to the readings: a bereavement, a week of travel, a fasting festival, poor sleep, a heatwave. The admin states that members are okay with indirect context analysis (the records repo's family consent note). That note is the admin's word, not each member's; this ADR treats it as permission to design and test, not to run on real messages.
@@ -92,7 +92,19 @@ Over a cap: health extraction runs as normal; the remaining messages are marked 
 - Cost stays inside the existing daily call for most days; the caps bound the worst case.
 - The records repo holds more PHI of a softer kind, which git history keeps; retention needs a decision before shadow.
 
-## Open decisions for the user
+## Decisions taken (owner, 2026-10-27)
+1. **Combined pass:** one extraction call returns health facts and `context[]`. Each message header says `context: yes|no`.
+2. **`/private`** covers that single message only, and that message is **never extracted** (no health facts, no context). It is archived raw; the digest line has no snippet. An edit that adds `/private` removes the message's earlier rows.
+3. **Digest:** the group gets nothing (ADR 011). Context appears in the **admin DM digest only, and only in shadow mode** ("Context (shadow)" section).
+4. **Retention:** the raw archive stays as it is; context facts are kept indefinitely like other facts.
+5. **Viewing:** overlays (`gen:context` in `timeline.md`) are for the admin, by convention. A doctor brief includes a context row only when it is tagged `brief-relevant` by a human.
+6. **Budget:** a hard cap of **20 messages read for context per IST day** (`CONTEXT_DAILY_CAP`). Over it, context is skipped for the rest of the day and counted in the log and the shadow digest; no deferral or retry. Health extraction is never blocked.
+7. **Vocabulary:** the eleven categories.
+8. **Consent:** each member confirms with a short group message; the admin records it in the records' consent note and in `records.yaml` as `context_consent: {<ns>: true | false | pending}` (replaces the `context_signals` shape in 5). Only `true` is read. A sender without consent gets no context extraction, and no signal is ever recorded about a member without consent or a non-member.
+
+Implementation notes (v0.5.0): `context_mode` (env.yaml, batch env `CONTEXT_MODE`, default `off`). The pre-filter is consent + not `/private` + >= 4 words + not forwarded + not vitals-only; the lexicon match is deferred (the cap bounds cost). Fields are `category`, `summary`, `intensity` (only when stated), `confidence`, period (`at`, `data.end`) and `data_class: phi`; `sentiment` is dropped. Batch rows are `rt: d1.context` in `data/telegram/` (not a D1 table); `tools/kb/build` maps them to `event` facts and checks `quote` null, `unverified`, a provenance tag and day/month precision. `v_timeline` and `v_needs_human` leave context out; `v_context` excludes `shadow` and `low-confidence` rows. Opt-out retractions and the causal-phrase lint over questions are not built yet (an opted-out member is simply never read again; existing rows can be superseded by hand).
+
+## Open decisions for the user (as proposed; settled above)
 1. **Combined vs separate LLM pass:** combined (proposed, cheaper) vs a separate context-only Haiku call (isolates health extraction from prompt changes, ~2x calls).
 2. **`/private` scope:** context only (proposed) vs also skip health extraction (safer for privacy, but a reading sent with `/private` would be lost to the KB).
 3. **Digest visibility:** none (proposed) vs a per-member count only ("2 context notes for Alice") vs full lines.

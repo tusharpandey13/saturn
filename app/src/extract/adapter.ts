@@ -1,6 +1,7 @@
 // LlmAdapter contract for extraction (split plan section 8: no provider name in the core). Implementations live in
 // adapters/llm/ (claude-cli; a fake for tests and offline dev in app/src/dev/fake-extractor.ts).
 import type { Media } from "../types.js";
+import { CONTEXT_RULES } from "./context.js";
 
 export interface ExtractInput {
   text?: string; // message text, caption or transcript
@@ -8,6 +9,8 @@ export interface ExtractInput {
   now: string;
   /** Text of the message this one replies to (e.g. a digest question), for context only. */
   replyTo?: string;
+  /** Read this message for life-context signals too (ADR 010 pre-filter passed). Header `context: yes|no`. */
+  context?: boolean;
 }
 
 /** Raw (unvalidated) model JSON per input, in input order; an Error for an input that could not be extracted. */
@@ -63,6 +66,7 @@ Rules:
   saans phoolna -> breathlessness; lete hue saans -> orthopnea; chakkar -> dizziness; sujan -> swelling; ulti/dast -> vomiting_diarrhoea.
 - subject_hint: only when the message is clearly about someone other than the sender ("Maa ka BP 120/80", "Papa ko chakkar aaya"):
   who it is about, as written ("Maa"). Else null. Still extract the values; a human decides whose they are.
+${CONTEXT_RULES}
 - Never diagnose, never advise. If a health image is unreadable, set unreadable_reason.`;
 }
 

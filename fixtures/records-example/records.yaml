@@ -24,3 +24,10 @@ aliases:
   alice: [alice, ali, एलिस]
   bob: [bob]
   carol: [carol]
+
+# Life-context signals (ADR 010): each member's own confirmation, recorded by the admin. Only true allows extraction;
+# false (opted out) or pending = nothing is read for that member and nothing is recorded about them.
+context_consent:
+  alice: true
+  bob: pending
+  carol: true

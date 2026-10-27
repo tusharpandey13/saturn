@@ -57,9 +57,9 @@ type Block =
 
 const b64 = (data: Uint8Array) => Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("base64");
 
-function blocksFor(n: number, { text, media, now, replyTo }: ExtractInput): Block[] {
+function blocksFor(n: number, { text, media, now, replyTo, context }: ExtractInput): Block[] {
   const ctx = replyTo ? ` It replies to: """${replyTo.slice(0, 500)}""" (context only; extract from the reply itself).` : "";
-  const head: Block = { type: "text", text: `Message ${n}: received at ${now} (Asia/Kolkata context).${ctx} ${text ? `Text: """${text}"""` : "No text."}${media ? " Attachment follows." : ""}` };
+  const head: Block = { type: "text", text: `Message ${n}: received at ${now} (Asia/Kolkata context). context: ${context ? "yes" : "no"}.${ctx} ${text ? `Text: """${text}"""` : "No text."}${media ? " Attachment follows." : ""}` };
   if (!media) return [head];
   const data = b64(media.data);
   return [head, media.mimeType === "application/pdf" ? { type: "document", source: { type: "base64", media_type: "application/pdf", data } } : { type: "image", source: { type: "base64", media_type: media.mimeType, data } }];

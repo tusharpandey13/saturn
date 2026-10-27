@@ -8,7 +8,8 @@ Every <records>/docs/health/<ns>/*.md (ns = the namespaces in <records>/records.
   <!-- gen:NAME start --> ... <!-- gen:NAME end -->
 and only the text between the markers is replaced. Text outside the markers is never touched. Blocks:
   timeline (timeline.md), meds-current + meds-history (medications.md), labs (labs.md), quality (data-quality.md),
-  glance + asof (summary.md), care-team (care-team.md: credentials, first/last seen, instructions).
+  glance + asof (summary.md), care-team (care-team.md: credentials, first/last seen, instructions),
+  context (timeline.md: life-context bands, ADR 010; admin-only by convention; shadow rows never shown).
 A block whose content is unchanged apart from its "Generated ... on <date>" line is left as it is, so a second run (or
 a run on a later day with the same data) gives no diff. --check writes nothing and exits 1 if any page would change.
 Python stdlib + sqlite3 only. Record and flag only: the blocks show rows as stored, never a judgement.
@@ -24,10 +25,19 @@ FLAG_TAGS = ("low-confidence", "internal-contradiction", "text-table-mismatch", 
              "identity-unconfirmed", "subject-hint")
 MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 GLANCE_DAYS = 180
+# Life-context events (ADR 010) render only in gen:context; every other block and the header count leave them out, so
+# a shadow row changes no page.
+NOT_CONTEXT = "json_extract(data, '$.type') IS NOT 'context'"
+CONTEXT_HEAD = ("Life-context bands (ADR 010), **admin-only by convention**. Shown alongside, not as a cause. Facts as "
+                "written; not advice; doctors decide.")
+# Association only: generated context text never uses causal phrasing (also checked at extraction).
+CAUSAL = re.compile(r"\b(because( of)?|due to|caus(e|ed|es|ing)|trigger(ed|s|ing)?|led to|leads? to|result(ed|s)? (in|from)|"
+                    r"explains?|owing to)\b|के कारण|की वजह से|\bse hua\b|\bki wajah se\b|\bke karan\b", re.I)
 
 # Per-person key series (labs.md) and glance codes (summary.md) live in data/meta/gen-views.json (person-specific
 # choices are clinical detail, so they stay in data/). A person not listed there gets every code they have.
 CONFIG = {"key_series": {}, "glance_codes": {}}
+CONSENT = {}  # records.yaml context_consent (ADR 010): a member's bands render only while their consent is true
 
 
 # ---------------------------------------------------------------------------------------------------------- helpers
@@ -96,7 +106,7 @@ class KB:
         return r["name"] if r else (ref_id or "")
 
     def asof(self, ns):
-        n, latest = self.q("SELECT count(*), max(substr(at, 1, 10)) FROM fact WHERE ns = ?", ns)[0]
+        n, latest = self.q("SELECT count(*), max(substr(at, 1, 10)) FROM fact WHERE ns = ? AND " + NOT_CONTEXT, ns)[0]
         return n, latest
 
     def cite(self, fid):
@@ -252,7 +262,8 @@ def no_rows(ns):
 
 def b_timeline(kb, ns):
     ids = [r[0] for r in kb.q("SELECT id FROM v_timeline WHERE ns = ?", ns)]
-    sup = [r[0] for r in kb.q("SELECT id FROM fact WHERE ns = ? AND status = 'superseded' AND kind != 'condition'", ns)]
+    sup = [r[0] for r in kb.q("SELECT id FROM fact WHERE ns = ? AND status = 'superseded' AND kind != 'condition' AND "
+                              + NOT_CONTEXT, ns)]
     rows = sorted({*ids, *sup}, key=lambda i: (kb.facts[i]["at"], kb.facts[i]["kind"], i))
     if not rows:
         return no_rows(ns)
@@ -286,6 +297,36 @@ def b_timeline(kb, ns):
                     kb.marks(fid), kb.record_status(fid), fact_id, src])
     flush()
     return out[:-1]
+
+
+def b_context(kb, ns):
+    """Context lane (ADR 010): bands from v_context (no shadow, no low-confidence) with the readings and symptoms of the
+    same member on the same dates. Doctor briefs use only rows tagged brief-relevant."""
+    rows = kb.q("SELECT * FROM v_context WHERE ns = ?", ns) if CONSENT.get(ns) is True else []
+    out = [CONTEXT_HEAD, "", "Shadow-mode and low-confidence rows are never shown. Summaries are paraphrases, never "
+           "quotes; `brief-relevant` marks the only rows a doctor brief may use.", ""]
+    if not rows:
+        return out + ["No context bands to show."]
+    body = []
+    for r in rows:
+        start, end = r["at"][:10], r["end_at"][:10]
+        seen = {}
+        for o in kb.q("SELECT json_extract(data, '$.code') AS c, json_extract(data, '$.value_text') AS v, "
+                      "json_extract(data, '$.category') AS cat FROM fact WHERE ns = ? AND kind = 'observation' AND "
+                      "status = 'active' AND substr(at, 1, 10) BETWEEN ? AND ?", ns, start, end):
+            k = f"symptom: {o['v']}" if o["cat"] == "symptom" else kb.name(o["c"])
+            seen[k] = seen.get(k, 0) + 1
+        alongside = "; ".join(f"{k} ×{n}" for k, n in sorted(seen.items())) or "none recorded"
+        tags = [t for t in j(r["tags"]) if t in FAMILY_TAGS or t == "brief-relevant"]
+        fact_id, src = kb.cite(r["id"])
+        dates = fdate(start) + (f" to {fdate(end)}" if end != start else "")
+        body.append([dates, str(r["category"]).replace("_", " "), r["summary"], r["intensity"], alongside, "; ".join(tags),
+                     f"{fact_id} · {src}"])
+    out += table(["Dates", "Signal", "Summary (paraphrase)", "Intensity (as stated)", "Alongside (same dates)",
+                  "Provenance", "Fact id · source"], body)
+    if any(CAUSAL.search(str(b[2] or "")) for b in body):
+        raise SystemExit(f"error: causal phrasing in gen:context for {ns}; fix the summary row (association only)")
+    return out
 
 
 def med_cols(kb, fid):
@@ -582,7 +623,7 @@ def b_care_team(kb, ns):
     return out
 
 
-RENDER = {"care-team": b_care_team, "timeline": b_timeline, "meds-current": b_meds_current, "meds-history": b_meds_history, "labs": b_labs,
+RENDER = {"care-team": b_care_team, "timeline": b_timeline, "context": b_context, "meds-current": b_meds_current, "meds-history": b_meds_history, "labs": b_labs,
           "quality": b_quality, "glance": b_glance, "asof": b_asof}
 
 
@@ -627,7 +668,10 @@ def main(argv=None):
         return 2
     root = pathlib.Path(records).resolve()
     try:
-        namespaces = records_config.load(root)["namespaces"]
+        rc = records_config.load(root)
+        namespaces = rc["namespaces"]
+        CONSENT.clear()
+        CONSENT.update(rc["context_consent"])
     except records_config.RecordsError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

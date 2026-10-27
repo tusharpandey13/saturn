@@ -27,12 +27,17 @@ export interface DigestEntry {
   pending?: string[];
   /** Who sent it, when that is not the person it is about (subject attribution), so a wrong one is easy to spot. */
   via?: string;
+  /** Life-context signals in shadow mode (ADR 010), fixed template "<who>: <category>[, <intensity>]: <summary>".
+   *  Admin digest only; never in a view while context_mode is shadow. */
+  context?: string[];
 }
 
 /** Attribution suffix: who sent it and who it was logged for. */
 export const VIA = (sender: string, subject: string) => ` (sent by ${sender}, logged for ${subject})`;
 export const FOR_HINT = "Wrong member? Reply /for <name> to the original message in the group.";
 
+export const PRIVATE_NOTE = "🔒 private message kept (not read)";
+export const CONTEXT_HEAD = "Context (shadow): life-context notes, unverified, shown to the admin only. Alongside, not as a cause. Facts as written; not advice; doctors decide.";
 export const STT_PENDING_NOTE = "voice note: transcription pending";
 export const ANNOTATION_NOTE = "unverified; doctor sign-off pending";
 export const EMPTY_LINE = "No new messages.";
@@ -50,6 +55,8 @@ export function buildDigest(o: {
   timeZone: string;
   /** Thresholds status: pending_clinician_signoff, signed_off or disabled (not configured). */
   thresholdsStatus: string;
+  /** Messages not read for context this run because the daily cap was reached (shadow mode). */
+  contextSkipped?: number;
 }): string {
   const day = new Intl.DateTimeFormat("en-IN", { timeZone: o.timeZone, day: "numeric", month: "short" }).format(new Date(o.now));
   const dayFmt = (iso: string) => new Intl.DateTimeFormat("en-IN", { timeZone: o.timeZone, day: "numeric", month: "short" }).format(new Date(iso));
@@ -84,6 +91,12 @@ export function buildDigest(o: {
   if (flagged.length) {
     out.push("", `Rule annotations (${ANNOTATION_NOTE}; thresholds: ${o.thresholdsStatus}). Not advice; call the doctor if worried:`);
     for (const e of flagged) for (const a of e.annotations) out.push(`- ${e.person} ${time(e.ts)}: T${a.tier} ${a.code}: ${a.detail}`);
+  }
+
+  const ctx = entries.flatMap((e) => (e.context ?? []).map((l) => `${time(e.ts)} ${l}`));
+  if (ctx.length || o.contextSkipped) {
+    out.push("", CONTEXT_HEAD, ...ctx.map((l) => `• ${l}`));
+    if (o.contextSkipped) out.push(`• ${o.contextSkipped} message(s) not read for context (daily cap reached)`);
   }
 
   const questions = entries.flatMap((e) => e.questions.map((q) => `${e.person} ${time(e.ts)} ${e.snippet ? `"${e.snippet}"` : kindEn(e.kind)}: ${q}`));

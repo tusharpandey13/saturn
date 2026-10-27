@@ -16,6 +16,7 @@ import { ClaudeCliError, type ExtractInput, type Extractor, ExtractorStopError, 
 import { StubSpeechToText } from "../../adapters/stt/sarvam.js";
 import type { Person } from "../src/types.js";
 import worker from "../src/worker.js";
+import { FakeExtractor } from "../src/dev/fake-extractor.js";
 import { fakeTelegram, fixture, GROUP, memR2, SECRET, seededStore, textUpdate, webhook } from "./helpers.js";
 
 const NOW = "2026-10-25T15:30:00.000Z"; // 21:00 IST
@@ -416,5 +417,131 @@ describe("batch details", () => {
     const parts = splitMessage(Array.from({ length: 300 }, (_, i) => `• line ${i} ${"x".repeat(30)}`).join("\n"));
     expect(parts.length).toBeGreaterThan(1);
     expect(parts.every((p) => p.length <= 4000)).toBe(true);
+  });
+});
+
+describe("life-context signals (ADR 010)", () => {
+  /** Mocked combined call: health as MockExtractor, plus context items when the header asked for them (input.context). */
+  class ContextMock extends MockExtractor {
+    override async one(input: ExtractInput): Promise<unknown> {
+      await super.one(input); // records the call
+      const health = (await new FakeExtractor().one(input)) as Record<string, unknown>;
+      const t = input.text ?? "";
+      const context = !input.context ? [] : /tension/.test(t)
+        ? [{ category: "stress", about: "sender", summary: "feeling work pressure before a deadline", intensity: "high", confidence: "high", start: null, end: null },
+           { category: "bereavement", about: "a colleague", summary: "a colleague lost a parent", intensity: null, confidence: "high", start: null, end: null }]
+        : /safar/.test(t) ? [{ category: "travel", about: "sender", summary: "travelling this week", intensity: null, confidence: "low", start: null, end: null }]
+        : [];
+      return { ...health, context };
+    }
+  }
+  const CONSENT = new Set(["alice", "carol-tg"]); // bob: pending
+  const go = (repo: Repo, llm: Extractor, mode: "off" | "shadow" | "on", cap?: number) =>
+    extract({ repo, extractor: llm, stt: new StubSpeechToText(), thresholds: DISABLED_THRESHOLDS, persons: PERSONS, now: NOW, contextMode: mode, contextConsented: CONSENT, contextDailyCap: cap });
+  const msgs = () => [
+    textUpdate("aaj office mein bahut tension hai, bp 130/85 pulse 80", 111), // alice: consented; health + context
+    textUpdate("aaj bahut tension hai ghar par sab theek", 333), // bob: consent pending -> never read for context
+    textUpdate("/private feeling very low today, bp 150/95", 111), // never extracted at all
+    textUpdate("kal se safar par hoon teen din", 222), // carol (admin): low-confidence travel
+    textUpdate("good morning", 111), // too short for context
+  ];
+
+  it("shadow: one combined call; stored with tag shadow, hidden from views, only in the admin digest; /private never extracted", async () => {
+    const u = msgs();
+    const { store, r2, t, repo } = await ingestAll(u);
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new ContextMock();
+    const r = await go(repo, llm, "shadow");
+    expect(llm.batches).toBe(1);
+    expect(llm.calls.map((c) => [c.text?.slice(0, 12), !!c.context])).toEqual([
+      ["aaj office m", true], ["aaj bahut te", false], ["kal se safar", true], ["good morning", false],
+    ]); // the /private message never reaches the extractor
+    expect(r.context).toEqual({ read: 2, signals: 2, dropped: 1, skippedCap: 0 }); // the colleague is dropped
+    const rows = ndjson(repo);
+    const key = (i: number) => `${GROUP}:${u[i].message!.message_id}`;
+    // health is unchanged by the context fields
+    expect(rows.find((x) => x.rt === "d1.readings" && x.source_message_id === key(0))).toMatchObject({ type: "bp", value: 130, value2: 85, value3: 80 });
+    expect(rows.filter((x) => x.rt === "d1.context").map((x) => [x.source_message_id, x.person_id, x.category, x.mode, x.confidence])).toEqual([
+      [key(0), "alice", "stress", "shadow", "high"], [key(3), "carol-tg", "travel", "shadow", "low"],
+    ]);
+    const priv = rows.find((x) => x.id === key(2))!;
+    expect(priv).toMatchObject({ extraction_status: "private", context_status: "private", raw_text: null });
+    expect(rows.filter((x) => x.source_message_id === key(2))).toEqual([]); // no health facts either
+    expect(rows.find((x) => x.id === key(1))!.context_status).toBeUndefined();
+    expect(JSON.stringify(rows.filter((x) => x.rt === "d1.context"))).not.toMatch(/tension|colleague|safar/);
+
+    // the admin digest has the shadow section; the private line has no snippet
+    expect(r.digest).toContain("Context (shadow)");
+    expect(r.digest).toMatch(/• \d\d:\d\d Alice: stress, high: feeling work pressure before a deadline/);
+    expect(r.digest).toMatch(/• \d\d:\d\d Carol: travel: travelling this week \(low confidence\)/);
+    expect(r.digest).not.toMatch(/colleague|Bob: stress/);
+    expect(r.digest).toMatch(/Alice \d\d:\d\d 🔒 private message kept \(not read\)/);
+    expect(r.digest).not.toMatch(/feeling very low|150\/95/);
+
+    // KB: event facts with data.type context, tagged; v_context shows none of them in shadow mode
+    expect(kbBuild()).toMatch(/^ok:/);
+    const kb = new DatabaseSync(join(root, "kb.sqlite"));
+    const facts = (kb.prepare("SELECT ns, at, at_precision, json_extract(data,'$.category') AS c, json_extract(data,'$.data_class') AS dc, quote, verification, tags FROM fact WHERE json_extract(data,'$.type') = 'context' ORDER BY ns").all() as Record<string, unknown>[])
+      .map((f) => ({ ...f, tags: JSON.parse(String(f.tags)) }));
+    expect(facts).toEqual([
+      { ns: "alice", at: "2026-10-24", at_precision: "day", c: "stress", dc: "phi", quote: null, verification: "unverified", tags: ["patient-reported", "shadow"] },
+      { ns: "carol", at: "2026-10-24", at_precision: "day", c: "travel", dc: "phi", quote: null, verification: "unverified", tags: ["patient-reported", "shadow", "low-confidence"] },
+    ]);
+    expect(kb.prepare("SELECT count(*) AS n FROM v_context").get()).toEqual({ n: 0 });
+    expect(kb.prepare("SELECT count(*) AS n FROM v_timeline WHERE what = 'context'").get()).toEqual({ n: 0 });
+    expect(kb.prepare("SELECT count(*) AS n FROM v_needs_human WHERE what = 'context'").get()).toEqual({ n: 0 });
+    kb.close();
+
+    // re-run: idempotent, the cap counts today's reads (nothing re-read)
+    const again = await go(repo, llm, "shadow");
+    expect(again).toMatchObject({ extracted: 0, context: { read: 0, signals: 0, dropped: 0, skippedCap: 0 } });
+  });
+
+  it("an edit that adds /private retracts the message's context and health rows", async () => {
+    const u = textUpdate("aaj office mein bahut tension hai, bp 130/85 pulse 80", 111);
+    const { store, r2, t, repo } = await ingestAll([u]);
+    await pull({ store, r2, tg: t.tg, repo });
+    await go(repo, new ContextMock(), "shadow");
+    expect(ndjson(repo).filter((x) => x.rt === "d1.context")).toHaveLength(1);
+    const edited = { update_id: u.update_id + 900, edited_message: { ...u.message, text: "/private aaj office mein bahut tension hai", edit_date: 1792815000 } };
+    const e = await ingestAll([edited]);
+    await pull({ store: e.store, r2: e.r2, tg: e.t.tg, repo });
+    await go(repo, new ContextMock(), "shadow");
+    const rows = ndjson(repo);
+    expect(rows.filter((x) => x.rt !== "d1.messages")).toEqual([]);
+    expect(rows.find((x) => x.rt === "d1.messages")).toMatchObject({ extraction_status: "private", raw_text: null });
+  });
+
+  it("daily cap: over it, context is skipped and counted; health extraction is never blocked", async () => {
+    const u = [textUpdate("aaj office mein bahut tension hai, bp 130/85 pulse 80", 111), textUpdate("aaj bhi bahut tension hai bp 128/84", 111)];
+    const { store, r2, t, repo } = await ingestAll(u);
+    await pull({ store, r2, tg: t.tg, repo });
+    const r = await go(repo, new ContextMock(), "shadow", 1);
+    expect(r.context).toMatchObject({ read: 1, skippedCap: 1 });
+    const rows = ndjson(repo);
+    expect(rows.filter((x) => x.rt === "d1.readings").map((x) => x.value)).toEqual([130, 128]);
+    expect(rows.filter((x) => x.rt === "d1.messages").map((x) => x.context_status)).toEqual(["extracted", "skipped_cap"]);
+    expect(r.digest).toContain("1 message(s) not read for context (daily cap reached)");
+  });
+
+  it("off (the default): no context header, no rows, no digest section", async () => {
+    const { store, r2, t, repo } = await ingestAll(msgs());
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new ContextMock();
+    const r = await go(repo, llm, "off");
+    expect(llm.calls.some((c) => c.context)).toBe(false);
+    expect(ndjson(repo).filter((x) => x.rt === "d1.context")).toEqual([]);
+    expect(r.digest).not.toContain("Context (shadow)");
+  });
+
+  it("on: shown in the timeline overlay (v_context), not in the digest; low confidence stays hidden", async () => {
+    const { store, r2, t, repo } = await ingestAll(msgs());
+    await pull({ store, r2, tg: t.tg, repo });
+    const r = await go(repo, new ContextMock(), "on");
+    expect(r.digest).not.toContain("Context (shadow)");
+    expect(kbBuild()).toMatch(/^ok:/);
+    const kb = new DatabaseSync(join(root, "kb.sqlite"));
+    expect(kb.prepare("SELECT ns, category, summary FROM v_context").all()).toEqual([{ ns: "alice", category: "stress", summary: "feeling work pressure before a deadline" }]);
+    kb.close();
   });
 });

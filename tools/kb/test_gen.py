@@ -201,6 +201,68 @@ class MedListSnapshotTest(unittest.TestCase):
             self.assertIn("| Testol | Testol | testolol | 5 mg |  | not-in-current-list (stopped) |", rest)
 
 
+class ContextLaneTest(unittest.TestCase):
+    """ADR 010: gen:context shows visible context bands alongside same-date observations; shadow and low-confidence rows,
+    and every context row in the other blocks and the header count, stay out."""
+
+    def render(self, rows, consent="  alice: true"):
+        with tempfile.TemporaryDirectory() as t:
+            t = pathlib.Path(t)
+            db = t / "kb.sqlite"
+            make_fixture_db(db)
+            con = sqlite3.connect(db)
+            for local, data, tags in rows:
+                con.execute("INSERT INTO fact (id, ns, kind, at, at_precision, data, source_id, locator, verification, "
+                            "recorded_by, created_at, tags) VALUES (?, 'alice', 'event', '2026-01-01', 'day', ?, "
+                            "'alice:src:2026-01-01-lab-a', 'tg:-1:1', 'unverified', 'test', '2026-01-02', ?)",
+                            (f"alice:fact:{local}", json.dumps({"type": "context", "data_class": "phi", **data}),
+                             json.dumps(tags)))
+            con.commit()
+            con.close()
+            page = t / "docs" / "health" / "alice" / "timeline.md"
+            page.parent.mkdir(parents=True)
+            page.write_text("<!-- gen:timeline start -->\n<!-- gen:timeline end -->\n\n"
+                            "<!-- gen:context start -->\n<!-- gen:context end -->\n")
+            (t / "records.yaml").write_text((EXAMPLE / "records.yaml").read_text().replace("  alice: true", consent))
+            r = gen("--db", str(db), "--records", str(t), "--today", "2026-03-01")
+            return r, page.read_text() if page.exists() else ""
+
+    def test_lane(self):
+        r, s = self.render([
+            ("2026-01-01-ctx-a", {"category": "festival_fasting", "summary": "fasting for a festival", "confidence": "high",
+                                  "end": "2026-01-03"}, ["patient-reported", "brief-relevant"]),
+            ("2026-01-01-ctx-b", {"category": "stress", "summary": "worried about work", "confidence": "high"},
+             ["patient-reported", "shadow"]),
+            ("2026-01-01-ctx-c", {"category": "sleep", "summary": "sleeping poorly", "confidence": "low"},
+             ["family-reported", "low-confidence"]),
+        ])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        tl, ctx = s.split("<!-- gen:context start -->")
+        self.assertIn("(data as of 2026-02; 6 facts)", tl)  # context rows are not counted
+        self.assertNotIn("context", tl.split("_\n", 1)[1])
+        self.assertIn("Shown alongside, not as a cause. Facts as written; not advice; doctors decide.", ctx)
+        self.assertIn("admin-only by convention", ctx)
+        self.assertIn("| 01-Jan-2026 to 03-Jan-2026 | festival fasting | fasting for a festival |  | "
+                      "LV ejection fraction ×1; Potassium ×2 | patient-reported; brief-relevant | "
+                      "`alice:fact:2026-01-01-ctx-a`", ctx)
+        self.assertNotIn("worried about work", ctx)  # shadow
+        self.assertNotIn("sleeping poorly", ctx)  # low confidence
+
+    def test_no_consent_no_bands(self):
+        r, s = self.render([("2026-01-01-ctx-a", {"category": "travel", "summary": "away for a few days",
+                                                  "confidence": "high"}, ["patient-reported"])], consent="  alice: false")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("No context bands to show.", s)
+
+    def test_empty_and_causal(self):
+        r, s = self.render([])
+        self.assertIn("No context bands to show.", s)
+        r, _ = self.render([("2026-01-01-ctx-a", {"category": "travel", "summary": "tired because of travel",
+                                                  "confidence": "high"}, ["patient-reported"])])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("causal phrasing", r.stdout + r.stderr)
+
+
 class StalenessTest(unittest.TestCase):
     """The committed pages must equal a fresh gen-views run on the committed data/ (of RECORDS)."""
 

@@ -1,6 +1,6 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
- "title": "fact.data for kind=event (ADR 007). Visits/admissions (ADR 004 encounters) are events; other facts point at them with context_id",
+ "title": "fact.data for kind=event (ADR 007). Visits/admissions (ADR 004 encounters) are events; other facts point at them with context_id. type context = a life-context signal (ADR 010)",
  "type": "object",
  "properties": {
   "type": {
@@ -17,6 +17,7 @@
     "missed_dose",
     "hospitalisation",
     "med-list-complete",
+    "context",
     "other"
    ]
   },
@@ -50,10 +51,91 @@
     "x-ref": "drug"
    },
    "description": "med-list-complete only: every drug on the confirmed list"
+  },
+  "category": {
+   "enum": [
+    "stress",
+    "bereavement",
+    "travel",
+    "festival_fasting",
+    "sleep",
+    "diet_change",
+    "activity",
+    "mood",
+    "work_load",
+    "weather_heat",
+    "social_event"
+   ],
+   "description": "context only: the closed ADR 010 vocabulary (a product enum)"
+  },
+  "summary": {
+   "type": "string",
+   "maxLength": 80,
+   "description": "context only: short English paraphrase, never a quote"
+  },
+  "intensity": {
+   "enum": [
+    "low",
+    "med",
+    "high"
+   ],
+   "description": "context only: only when the message states it"
+  },
+  "confidence": {
+   "enum": [
+    "low",
+    "high"
+   ],
+   "description": "context only: low adds the tag low-confidence and is hidden from views"
+  },
+  "data_class": {
+   "enum": [
+    "phi"
+   ],
+   "description": "context only: always phi (ADR 008 rule 1)"
   }
  },
  "additionalProperties": false,
  "required": [
   "type"
+ ],
+ "anyOf": [
+  {
+   "properties": {
+    "type": {
+     "enum": [
+      "opd",
+      "admission",
+      "teleconsult",
+      "test_visit",
+      "in_absentia",
+      "home",
+      "procedure",
+      "travel",
+      "fall",
+      "missed_dose",
+      "hospitalisation",
+      "med-list-complete",
+      "other"
+     ]
+    }
+   }
+  },
+  {
+   "properties": {
+    "type": {
+     "enum": [
+      "context"
+     ]
+    }
+   },
+   "required": [
+    "type",
+    "category",
+    "summary",
+    "confidence",
+    "data_class"
+   ]
+  }
  ]
 }

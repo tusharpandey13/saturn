@@ -18,7 +18,8 @@ import type { Store } from "../store.js";
 import { SARVAM_REST_MAX_SEC, SttJobFailedError } from "../../../adapters/stt/sarvam.js";
 import { HEALTH_MEDIA_KINDS, IMAGE_CLASS, type Media, type Person, type Reading, type SpeechToText, type Symptom, type Transcript } from "../types.js";
 import { parseVitals } from "../vitals.js";
-import { buildDigest, type DigestEntry, STT_PENDING_NOTE } from "./digest.js";
+import { buildDigest, type DigestEntry, PRIVATE_NOTE, STT_PENDING_NOTE } from "./digest.js";
+import { CONTEXT_DAILY_CAP, contextEligible, type ContextMode, type ContextSignal, isPrivate, parseContext } from "../extract/context.js";
 
 /** Ops line (admin DM only): extraction or STT failed for some messages (auth, usage limit, outage). */
 export const DELAYED_OPS = (n: number) => `extraction delayed for ${n} message(s) (auth, usage limit or outage); all kept, retried next run. Check the batch log.`;
@@ -122,6 +123,12 @@ export interface ExtractDeps {
   warnings?: string[];
   /** records.yaml aliases (keyed by D1 person id): name prefixes for rows the Worker did not attribute (pre-v0.3.0). */
   aliases?: Alias[];
+  /** Life-context signals (ADR 010): env context_mode (default off). */
+  contextMode?: ContextMode;
+  /** D1 person ids whose context consent is confirmed (records.yaml context_consent: true). Nobody else is read. */
+  contextConsented?: Set<string>;
+  /** Messages read for context per IST day (default CONTEXT_DAILY_CAP). */
+  contextDailyCap?: number;
 }
 
 /** Who a message is about: a records override (or an admin's /for), else the Worker's subject_id, else a name prefix,
@@ -149,6 +156,8 @@ export interface ExtractResult {
   digest: string;
   /** Short, actionable ops lines for a separate admin DM (warnings, delays). Empty = nothing to say. */
   ops: string[];
+  /** Life context: messages read, signals kept, signals dropped by minimisation, messages skipped by the daily cap. */
+  context: { read: number; signals: number; dropped: number; skippedCap: number };
 }
 
 /** A failure the next run may not repeat (network, auth, 429, 5xx, timeouts, CLI crash). */
@@ -201,6 +210,8 @@ type Base = {
   image_class: string | null;
   /** Who the message seems to be about when that is not the sender (extraction hint, for human review). Never reassigns. */
   subject_hint: string | null;
+  /** Life context (ADR 010): extracted (read with context: yes) | skipped_cap | private; absent = not read. */
+  context_status?: string;
 };
 interface Item {
   raw: RawRow;
@@ -212,6 +223,7 @@ interface Item {
   ex?: Extraction;
   extractedBy?: string;
   error?: unknown;
+  context?: ContextSignal[];
 }
 
 export async function extract(d: ExtractDeps): Promise<ExtractResult> {
@@ -227,6 +239,14 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   let pending = 0;
   let delayed = 0;
   let sttPending = 0;
+  const mode = d.contextMode ?? "off";
+  const consented = d.contextConsented ?? new Set<string>();
+  // Daily cap: messages already read for context today (IST), not counting messages this run re-extracts.
+  const todoKeys = new Set(todo.map((t) => t.msg.key));
+  const today = dayOf(d.now);
+  let contextLeft = Math.max(0, (d.contextDailyCap ?? CONTEXT_DAILY_CAP) - history.filter((r) => r.rt === "d1.messages" && r.context_status === "extracted"
+    && !todoKeys.has(r.id as string) && dayOf(String(r.extracted_at)) === today).length);
+  const ctx = { read: 0, signals: 0, dropped: 0, skippedCap: 0 };
 
   // 1. Per message: skip/park what cannot be read, transcribe voice, take vitals-only texts from the deterministic parser.
   const nameOf = (id: string) => d.persons.get(id)?.name ?? displayOf(id, aliases) ?? id;
@@ -243,6 +263,13 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       extraction_json: null, extracted_by: null, extracted_at: d.now, extraction_status: "ok", confidence: null, subject_hint: null, image_class: null,
     };
 
+    if (isPrivate(msg.text)) {
+      // /private (ADR 010): archived raw as always, never extracted (no health facts, no context), no snippet.
+      out.push({ ...base, raw_text: null, extraction_status: "private", context_status: "private", note: "/private: not extracted" });
+      replaced.add(msg.key);
+      entries.push({ ...entry, snippet: "", pending: [PRIVATE_NOTE] });
+      continue;
+    }
     if (raw.media_key && raw.media_status === "too_big") {
       out.push({ ...base, extraction_status: "skipped", note: "file over 20 MB, not stored" });
       replaced.add(msg.key);
@@ -283,6 +310,18 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
         item.extractedBy = "vitals-parser";
       } else {
         item.input = { text, media: msg.kind === "audio" ? undefined : media, now: msg.ts, replyTo: msg.replyToText };
+        const forwarded = ["forward_origin", "forward_from", "forward_date", "forward_sender_name"].some((k) => k in ((raw.update.message ?? raw.update.edited_message ?? {}) as object));
+        if (contextEligible({ mode, senderConsented: consented.has(raw.person_id), text, forwarded, vitalsOnly: !!vit?.complete })) {
+          if (contextLeft > 0) {
+            contextLeft--;
+            ctx.read++;
+            item.input.context = true;
+            base.context_status = "extracted";
+          } else {
+            ctx.skippedCap++;
+            base.context_status = "skipped_cap";
+          }
+        }
       }
     } catch (err) {
       item.error = err;
@@ -301,10 +340,16 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     it.base.extraction_json = typeof r === "string" ? r : JSON.stringify(r);
     it.ex = parseExtraction(r, it.msg.ts);
     it.extractedBy = d.extractor.model ?? "llm";
+    if (it.input!.context) {
+      // Context never touches the health result above; anything the minimisation checks reject is dropped, not trimmed.
+      const c = parseContext(r, { text: it.input!.text ?? "", ts: it.msg.ts, sender: it.raw.person_id, aliases, personIds: [...d.persons.keys()], consented: (p) => consented.has(p) });
+      it.context = c.signals;
+      ctx.dropped += c.dropped;
+    }
   });
 
   // 3. Records, questions, deep-read queue, annotations.
-  for (const { raw, msg, subject, entry, base, ex, extractedBy, error } of items) {
+  for (const { raw, msg, subject, entry, base, ex, extractedBy, error, context } of items) {
     if (error !== undefined || !ex) {
       const err = error as Error;
       if (isTransient(err)) {
@@ -328,8 +373,11 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     // Only a message attributed to its sender by default is checked: a prefix or an override is explicit.
     const hint = subject.source === "sender" ? ex.subjectHint ?? usualSubject(history, raw.person_id, nameOf) : null;
     base.subject_hint = hint;
-    out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now));
+    out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now), ...contextRows(msg.key, raw.person_id, context ?? [], mode, extractedBy!, d.now));
     replaced.add(msg.key);
+    ctx.signals += context?.length ?? 0;
+    if (mode === "shadow" && context?.length)
+      entry.context = context.map((c) => `${nameOf(c.subject)}: ${c.category.replace(/_/g, " ")}${c.intensity ? `, ${c.intensity}` : ""}: ${c.summary}${c.confidence === "low" ? " (low confidence)" : ""}`);
     entry.readings = ex.readings;
     entry.symptoms = ex.symptoms;
 
@@ -375,7 +423,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       .map((r) => ({ type: "weight", value: r.value, value2: null, value3: null, unit: "kg", measuredAt: r.measured_at }) as Reading)
       .filter((r) => Date.parse(r.measuredAt) >= Date.parse(msg.ts) - 8 * DAY);
     entry.annotations = evaluate({ readings: ex.readings, symptoms: ex.symptoms, weightHistory: weights, thresholds: d.thresholds, timeZone: tz });
-    if (ex.readings.length || ex.symptoms.length || entry.questions.length || entry.deep) entries.push(entry);
+    if (ex.readings.length || ex.symptoms.length || entry.questions.length || entry.deep || entry.context?.length) entries.push(entry);
   }
 
   const changed = out.length ? d.repo.writeKb(out, replaced) : [];
@@ -387,9 +435,10 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     ...entries.map((e) => ({ key: e.key!, recorded_at: d.now, entry: e })),
     ...[...replaced].filter((k) => !seenKeys.has(k)).map((k) => ({ key: k, recorded_at: d.now, entry: null })),
   ]);
-  const digest = buildDigest({ entries: d.repo.undeliveredDigestEntries(), pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status });
+  const digest = buildDigest({ entries: d.repo.undeliveredDigestEntries(), pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status,
+    contextSkipped: mode === "shadow" ? ctx.skippedCap : 0 });
   const ops = [...(d.warnings ?? []), ...(delayed ? [DELAYED_OPS(delayed)] : [])];
-  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, ops };
+  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, ops, context: ctx };
 }
 
 async function transcribe(stt: SpeechToText, d: ExtractDeps, media: Media, durationSec: number): Promise<Transcript> {
@@ -430,6 +479,15 @@ function recordRows(messageId: string, personId: string, ex: Extraction, by: str
       associated: json(s.associated), triggers: json(s.triggers), free_text: s.freeText, observed_at: s.observedAt, ...common,
     })),
   ];
+}
+
+/** d1.context rows (ADR 010), mapped by tools/kb/build to event facts with data.type context. No quote, no message text. */
+function contextRows(messageId: string, sender: string, signals: ContextSignal[], mode: ContextMode, by: string, at: string): Row[] {
+  return signals.map((c, i) => ({
+    rt: "d1.context", id: `${messageId}:c${i}`, source_message_id: messageId, person_id: c.subject, sender_person_id: sender,
+    category: c.category, summary: c.summary, intensity: c.intensity, confidence: c.confidence, start: c.start, end: c.end,
+    mode, extracted_by: by, extracted_at: at,
+  }));
 }
 
 function deepEntry(now: string, raw: RawRow, msg: ParsedMessage, transcript: string | null, reasons: string[], ex: Extraction | null) {

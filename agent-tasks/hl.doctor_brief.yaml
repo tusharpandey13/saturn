@@ -25,3 +25,5 @@ output_schema:
     summary: { type: string }
 prompt: |
   TODO(phase 2): hl.doctor_brief prompt. Inputs are git refs only: {{paths}}
+  Life-context facts (event, data.type context; ADR 010): include one only when it carries the tag brief-relevant;
+  never shadow or low-confidence rows. Association wording only ("around the same dates"), never a cause.

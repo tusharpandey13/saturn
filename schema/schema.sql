@@ -155,7 +155,7 @@ SELECT f.kind, f.id, f.ns,
             WHEN EXISTS (SELECT 1 FROM json_each(f.tags) WHERE value = 'low-confidence') THEN 'low-confidence'
             ELSE 'alert-input' END AS reason
 FROM fact f
-WHERE f.status = 'active' AND (
+WHERE f.status = 'active' AND json_extract(f.data, '$.type') IS NOT 'context' AND (
       (f.kind = 'medication' AND f.verification NOT IN ('human','clinician'))
    OR f.uncertain_ref IS NOT NULL
    OR (f.verification NOT IN ('human','clinician') AND (
@@ -164,13 +164,14 @@ WHERE f.status = 'active' AND (
           ('ref:code:weight','ref:code:bp','ref:code:pulse','ref:code:spo2','ref:code:potassium','ref:code:sodium','ref:code:creatinine')))));
 
 -- Timeline for generators: events (visits, admissions, procedures, falls ...), every medication statement (status
--- changes) and key observations (printed H/L flags or alert inputs), per ns, ordered by time.
+-- changes) and key observations (printed H/L flags or alert inputs), per ns, ordered by time. Life-context events
+-- (data.type context, ADR 010) are left out here and in v_needs_human: they render only in gen:context (v_context).
 CREATE VIEW v_timeline AS
 SELECT ns, at, at_precision, kind, what, label, id, source_id, verification, uncertain_ref FROM (
   SELECT ns, at, at_precision, kind, json_extract(data, '$.type') AS what,
          coalesce(json_extract(data, '$.label'), json_extract(data, '$.reason_text')) AS label,
          id, source_id, verification, uncertain_ref
-  FROM fact WHERE status = 'active' AND kind = 'event'
+  FROM fact WHERE status = 'active' AND kind = 'event' AND json_extract(data, '$.type') IS NOT 'context'
   UNION ALL
   SELECT ns, at, at_precision, kind, json_extract(data, '$.status'),
          trim(coalesce(json_extract(data, '$.brand'), json_extract(data, '$.drug_id')) || ' ' ||
@@ -185,6 +186,16 @@ SELECT ns, at, at_precision, kind, what, label, id, source_id, verification, unc
   WHERE flag IN ('H','L')
      OR code IN ('ref:code:weight','ref:code:bp','ref:code:pulse','ref:code:spo2','ref:code:potassium','ref:code:sodium','ref:code:creatinine'))
 ORDER BY ns, at, kind, id;
+
+-- Life-context bands (ADR 010): active context events that a view may show. Shadow rows (context_mode shadow) and
+-- low-confidence rows are never shown. Association only: a view puts them alongside readings, never as a cause.
+CREATE VIEW v_context AS
+SELECT ns, at, coalesce(json_extract(data, '$.end'), substr(at, 1, 10)) AS end_at, json_extract(data, '$.category') AS category,
+       json_extract(data, '$.summary') AS summary, json_extract(data, '$.intensity') AS intensity, id, source_id, tags
+FROM fact f
+WHERE kind = 'event' AND status = 'active' AND json_extract(data, '$.type') = 'context'
+  AND NOT EXISTS (SELECT 1 FROM json_each(f.tags) WHERE value IN ('shadow', 'low-confidence'))
+ORDER BY ns, at, id;
 
 -- Current medicines: the latest active statement per ns and drug (brand when no drug_id). Same day: stopped > taking
 -- > dispensed > prescribed. med_status says what the statement is; verification says how well it was read.
