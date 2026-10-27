@@ -7,6 +7,11 @@ Input: the JSON sidecar of a cross-reference (agent-tasks/saturn.research_crossr
 Checks every citation on every item:
   - it carries an identifier (pmid, doi or url) and a verbatim quote (missing quote = error); for link-only
     hosts (LINK_ONLY_HOSTS) the reverse: a locator and no quote (a quote = error);
+  - source tier and licence: a quoted citation (not link-only) carries `source_tier` and `license`; the licence must be
+    on the allow-list (QUOTABLE_LICENSES), a `label` tier must be on a label host, and a link-only tier or host is
+    never quoted. `reports_guideline` (id or URL of a link-only guideline) is allowed only on a secondary source
+    tier (oa_article, bookshelf, abstract), and the item statement must say "secondary: reports" (a secondary
+    statement is never presented as the guideline's own text);
   - phrasing: statements and questions carry no dose advice, no diagnosis, no "you should" (error);
   - online (default): each PMID resolves (NCBI E-utilities esummary; the stated title, if any, must match),
     each DOI resolves (HEAD https://doi.org/<doi>, redirects not followed: 3xx = ok, 404 = unresolved),
@@ -96,6 +101,15 @@ class Net:
 # A citation to one of these hosts must carry a locator (recommendation number) and must NOT carry a quote.
 LINK_ONLY_HOSTS = ("escardio.org", "auanet.org", "uroweb.org", "nice.org.uk",
                    "diabetesjournals.org", "diabetes.org", "icmr.gov.in", "icmr.org.in", "endocrine.org")
+# Source tiers (method, section 4). Quoted citations must name one and a licence that permits quoting.
+TIERS = ("label", "guideline_open", "guideline_link_only", "oa_article", "bookshelf", "abstract")
+SECONDARY_TIERS = ("oa_article", "bookshelf", "abstract")
+LABEL_HOSTS = ("dailymed.nlm.nih.gov", "api.fda.gov", "open.fda.gov", "accessdata.fda.gov", "ema.europa.eu")
+# Licences (normalised by norm_license) under which a short attributed verbatim quote is allowed.
+QUOTABLE_LICENSES = {"public-domain", "cc0", "cc-by", "cc-by-sa", "cc-by-nc", "cc-by-nc-sa", "cc-by-nc-nd",
+                     "cc-by-nd", "ahrq-unaltered", "ema-credit", "publisher-abstract"}
+ABSTRACT_QUOTE_MAX = 250  # "short quote" for abstracts of copyrighted papers
+SECONDARY_LABEL = "secondary: reports"
 # Real markup only: a tag starts with a letter, "/", "!" or "?". Plain-text "<135" or ">12%" is left alone.
 TAG = re.compile(r"</?[A-Za-z][^<>]*>|<[!?][^<>]*>")
 
@@ -103,6 +117,45 @@ TAG = re.compile(r"</?[A-Za-z][^<>]*>|<[!?][^<>]*>")
 def link_only(url):
     host = (urllib.parse.urlparse(url or "").hostname or "").lower()
     return any(host == h or host.endswith("." + h) for h in LINK_ONLY_HOSTS)
+
+
+def host_in(url, hosts):
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def norm_license(s):
+    """'CC BY-NC-ND 4.0', 'cc by-nc-nd', 'CC-BY-NC-SA-3.0-IGO' -> 'cc-by-nc-nd' etc."""
+    s = re.sub(r"[\s_]+", "-", (s or "").strip().lower())
+    s = re.sub(r"-v?\d+(\.\d+)?(-igo)?$", "", s)
+    return s
+
+
+def check_tier(it, c, where, q, out):
+    tier, lic = c.get("source_tier"), c.get("license")
+    if tier is not None and tier not in TIERS:
+        out.append(("error", where, f"unknown source_tier {tier!r}"))
+    if c.get("reports_guideline"):
+        if tier not in SECONDARY_TIERS:
+            out.append(("error", where, "reports_guideline only on a secondary tier "
+                                        f"({', '.join(SECONDARY_TIERS)})"))
+        if SECONDARY_LABEL not in (it.get("statement") or "").lower():
+            out.append(("error", where, f"reports_guideline: the statement must be labelled '{SECONDARY_LABEL} <guideline>'"))
+    if tier == "guideline_link_only" and q:
+        out.append(("error", where, "guideline_link_only tier: no quote allowed"))
+    if not q or link_only(c.get("url")):
+        return  # nothing quoted, or the link-only host rule already applied
+    if tier is None:
+        out.append(("error", where, "quoted citation needs source_tier"))
+        return
+    if tier == "label" and c.get("url") and not host_in(c["url"], LABEL_HOSTS):
+        out.append(("error", where, "label tier: host is not a known label host"))
+    if not lic:
+        out.append(("error", where, "quoted citation needs license"))
+    elif norm_license(lic) not in QUOTABLE_LICENSES:
+        out.append(("error", where, f"license {lic!r} is not on the quotable allow-list"))
+    if tier == "abstract" and len(q) > ABSTRACT_QUOTE_MAX:
+        out.append(("error", where, f"abstract quote longer than {ABSTRACT_QUOTE_MAX} chars"))
 
 
 def norm(s):
@@ -148,6 +201,7 @@ def verify(doc, net=None, check_quotes=False):
                 out.append(("error", where, "missing quote"))
             elif len(q) > QUOTE_MAX:
                 out.append(("error", where, f"quote longer than {QUOTE_MAX} chars"))
+            check_tier(it, c, where, q, out)
             if c.get("pmid") and not re.fullmatch(r"[1-9][0-9]{0,8}", str(c["pmid"])):
                 out.append(("error", where, f"malformed PMID {c['pmid']!r}"))
             if c.get("doi") and not re.fullmatch(r"10\.\d{4,9}/\S+", c["doi"]):

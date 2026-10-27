@@ -94,6 +94,14 @@ Read only from the records repo. Build the KB first (`tools/kb/build --records <
    version is the latest (step 10 triggers). Extract the recommendation on monitoring, targets or tests, with its
    number and printed grade, **except for link-only bodies** (section 4): never fetch, quote or summarise their
    recommendations. Cite body, version, recommendation number and URL, and point the clinician to it by name.
+   **5a. Secondary sources for link-only guidelines.** For each relevant link-only guideline:
+   (a) link it for the clinician by body, version, section or recommendation number (`locator`) and URL, with no
+   quote; (b) search for an open-access secondary source (section 4, "Quotable secondary sources") that states the
+   relevant recommendation, read its licence, and quote that source, with the statement opening
+   "secondary: reports <guideline> recommendation", `reports_guideline` set to the guideline's id or URL, and the
+   evidence block describing the secondary source itself (its design and certainty, not the guideline's);
+   (c) never present the secondary statement as the guideline's own text, and never infer the guideline's wording or
+   grade from it. If no such source exists, keep the link-only item and say nothing about what it recommends.
 6. **Literature pass (only for topics the label and guideline passes leave open).** Search PubMed/Europe PMC
    (section 5). Prefer systematic reviews and meta-analyses, then RCTs, then cohorts. Screen titles and abstracts,
    then fetch the record you cite and quote from it. Log every query (section 9).
@@ -142,6 +150,28 @@ and so is label text over interaction databases.
 Not fetchable from an agent (HTTP 403/404) on 27-Oct-2026: the NICE and ADA terms pages and the EAU copyright
 page were read through search excerpts, not the pages themselves; the owner should open them once.
 A journal or PubMed version of a link-only body's guideline is still link-only.
+
+### Quotable secondary sources and licences (checked 27-Oct-2026)
+
+Every quoted citation carries `source_tier` and `license`. Quote only when the licence permits it. The verifier
+(`QUOTABLE_LICENSES`) accepts: public-domain, cc0, cc-by, cc-by-sa, cc-by-nc, cc-by-nc-sa, cc-by-nc-nd, cc-by-nd,
+ahrq-unaltered, ema-credit, publisher-abstract. Saturn is a non-commercial family records tool, so NC licences
+fit; if the use ever becomes commercial, drop the NC tiers. Quotes stay at most 400 characters (abstracts: 250),
+attributed, unaltered, with the URL and the date checked.
+
+| `source_tier` | Source | Licence verdict | Official page (checked 27-Oct-2026) |
+|---|---|---|---|
+| `label` | DailyMed / openFDA labels | quotable: US government work, public domain (`public-domain`); openFDA CC0 unless marked. Credit "Source: National Library of Medicine". Third-party images and trademarks excepted | https://www.nlm.nih.gov/web_policies.html ; https://open.fda.gov/terms/ |
+| `oa_article` | PubMed Central open-access articles | quotable only when the article's own licence is CC BY or CC BY-NC (CC BY-SA, NC-SA, NC-ND also permit a short attributed verbatim quote). Licences vary by article and "open access" journals can still be all-rights-reserved, so read the licence per article: Europe PMC REST `resultType=core` returns a `license` field (e.g. `cc by-nc-nd`), PMC lists it on the article page. The `license` field alone is not proof of free full text (`isOpenAccess` must be `Y`; a test record had a licence but `isOpenAccess` N). No licence found = do not quote | https://pmc.ncbi.nlm.nih.gov/tools/openftlist/ ; https://europepmc.org/downloads/openaccess |
+| `bookshelf` | NCBI Bookshelf / StatPearls | quotable, CC BY-NC-ND 4.0 as shown on the StatPearls book pages (non-commercial, unaltered, attribution). Older copies show CC BY, and chapter notices differ, so read the chapter's own notice and cite its URL. NCBI pages returned a bot check to our fetcher, so this verdict rests on search excerpts of the StatPearls page, not a direct read: owner to confirm once | https://www.ncbi.nlm.nih.gov/sites/books/NBK430685/ ; https://creativecommons.org/licenses/by-nc-nd/4.0/deed.en |
+| `guideline_open` | USPSTF | quotable, `ahrq-unaltered`: reproduction without alteration, cite the USPSTF page as source; no resale or commercial use; some JAMA pages carry AMA copyright | https://www.uspreventiveservicestaskforce.org/uspstf/recommendation-topics/copyright-notice |
+| `guideline_open` | KDIGO 2024+ | quotable per edition: the notice differs by copy (2024 CKD PDF reported as CC BY; other copies and Europe PMC show CC BY-NC-ND). Read and record the licence printed on the file you quote; both permit an attributed verbatim quote. kdigo.org/guidelines gave only "© KDIGO" to our fetcher; confirm in the PDF front matter | https://kdigo.org/guidelines/ ; https://kdigo.org/wp-content/uploads/2024/03/KDIGO-2024-CKD-Guideline.pdf |
+| `guideline_open` | WHO publications | quotable, CC BY-NC-SA 3.0 IGO, non-commercial, WHO credited. Exceptions: third-party material, figures/tables/photos, ICD/ICF/ICHI (CC BY-ND) | https://www.who.int/about/policies/publishing/copyright |
+| `abstract` | abstracts of peer-reviewed papers that describe or summarise a guideline | short quote (<= 250 chars) with attribution (title, PMID); licence `publisher-abstract` (abstracts stay the publishers' copyright; the basis is short attributed quotation / fair use, not a grant, so keep it to one sentence). Prefer a CC BY/NC licence when `oa_article` is available | https://www.nlm.nih.gov/web_policies.html (copying copyrighted items beyond fair use needs the holder's permission; the page has no PubMed-abstract-specific grant) |
+| `guideline_link_only` | AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society | link-only (table above); never quoted | as above |
+
+A secondary source never changes a link-only verdict: a journal or PubMed copy of the guideline itself is still
+link-only. Only an independent article, chapter or abstract that reports the recommendation is a secondary source.
 
 | 3 Syntheses | **Cochrane** reviews (abstracts free) via PubMed; systematic reviews and meta-analyses | free abstracts | abstracts only unless open access |
 | 4 Primary studies | **PubMed** via NCBI E-utilities [S1]; **Europe PMC** REST `https://www.ebi.ac.uk/europepmc/webservices/rest/search` [S2] | free. E-utilities: ≤3 requests/s without a key, ≤10/s with `api_key`; send `tool` and `email` (registered with NCBI). Europe PMC: no key; official limits not published, so stay under 3/s | quote only from the abstract, or from the full text if it is open access |
@@ -223,7 +253,7 @@ Two files in the records repo, plus question rows:
   question list.
 
 Item fields (schema): `id` (rx-NNN), `type`, `statement`, `kb_ids`, `evidence {design, certainty, grade_as_printed,
-ocebm}`, `applicability`, `citations[] {source_type, pmid|doi|url, title, version, locator, quote (omitted for link-only bodies), accessed}`,
+ocebm}`, `applicability`, `citations[] {source_type, source_tier, license, reports_guideline (secondary sources only), pmid|doi|url, title, version, locator, quote (omitted for link-only bodies), accessed}`,
 `for_clinician`, `question_ids`, `status` (revisit), `verification`.
 
 ## 9. Phrasing rules
@@ -296,7 +326,7 @@ AI use follows the Cochrane, Campbell, JBI and CEE joint position (2025) [S10]:
   reviewed by <owner> on <date>".
 
 **Hallucination controls:**
-1. Every claim carries a PMID, DOI or URL and a verbatim quote (link-only bodies: a locator and no quote).
+1. Every claim carries a PMID, DOI or URL and a verbatim quote (link-only bodies: a locator and no quote). Every quote carries a `source_tier` and a quotable `license`; `reports_guideline` items are labelled "secondary: reports …".
 2. The verifier resolves every PMID (esummary; the title must match), DOI (doi.org) and URL. With
    `--check-quotes` it also confirms the quote appears in the PubMed abstract or the fetched page.
 3. Nothing is cited from model memory.
@@ -328,6 +358,7 @@ The run records `revisit.next_due` (the run date plus 6 months) and the triggers
       established.
 - [ ] Applicability is stated; Western-only evidence is named as such.
 - [ ] Guideline versions are current, and licence-restricted text is not pasted.
+- [ ] Each quote's licence was read from the source; every `reports_guideline` item is labelled secondary and graded on the secondary source's own evidence.
 - [ ] Questions are neutral, name a clinician, carry new ids, and do not duplicate open ones.
 - [ ] The search log is complete, and the queries contain no names, ids, dates or places.
 - [ ] The page carries "Facts as written; not advice; doctors decide." and the AI-use line.

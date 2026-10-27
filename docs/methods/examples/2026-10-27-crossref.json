@@ -6,12 +6,24 @@
   "focus": [],
   "previous": null,
   "disclaimer": "Facts as written; not advice; doctors decide.",
-  "summary": "Synthetic example (fictional person). Three items: a label note on how dutasteride affects PSA readings, a label warning on tamsulosin and orthostasis next to a family-reported dizziness, and a guideline practice point on kidney testing next to a single recorded eGFR with no urine albumin result. Three questions for the treating doctors. No red flags in the recorded window.",
+  "summary": "Synthetic example (fictional person). Four items: a label note on how dutasteride affects PSA readings, a label warning on tamsulosin and orthostasis next to a family-reported dizziness, and a guideline practice point on kidney testing next to a single recorded eGFR with no urine albumin result. Three questions for the treating doctors. No red flags in the recorded window.",
   "inputs": [
-    { "view": "v_meds_current", "rows": 3 },
-    { "view": "v_latest", "rows": 14 },
-    { "view": "fact:condition", "rows": 2 },
-    { "view": "v_timeline", "rows": 9 }
+    {
+      "view": "v_meds_current",
+      "rows": 3
+    },
+    {
+      "view": "v_latest",
+      "rows": 14
+    },
+    {
+      "view": "fact:condition",
+      "rows": 2
+    },
+    {
+      "view": "v_timeline",
+      "rows": 9
+    }
   ],
   "red_flags": [],
   "items": [
@@ -19,9 +31,25 @@
       "id": "rx-001",
       "type": "lab_interference",
       "statement": "The current dutasteride label states that dutasteride reduces serum PSA by approximately 50% within 3 to 6 months, and that an isolated PSA in a man treated for 3 months or more is compared with untreated reference values only after doubling. The recorded PSA (10-Sep-2026) was printed against an untreated reference range; dutasteride is recorded as strip-seen since 03-Feb-2026.",
-      "kb_ids": ["bob:fact:2026-09-10-example-lab-psa.psa", "bob:fact:2026-02-03-example-clinic-rx.dutasteride"],
-      "evidence": { "design": "label", "certainty": "not_graded", "grade_as_printed": "US prescribing information, section 5.1", "ocebm": "n/a" },
-      "applicability": { "match": "good", "age": "match", "sex": "match", "comorbidity": "match", "ancestry_region": "not_reported", "setting": "differs", "notes": "US label used as a proxy; the Indian package insert could not be fetched. The label statement covers men on dutasteride generally." },
+      "kb_ids": [
+        "bob:fact:2026-09-10-example-lab-psa.psa",
+        "bob:fact:2026-02-03-example-clinic-rx.dutasteride"
+      ],
+      "evidence": {
+        "design": "label",
+        "certainty": "not_graded",
+        "grade_as_printed": "US prescribing information, section 5.1",
+        "ocebm": "n/a"
+      },
+      "applicability": {
+        "match": "good",
+        "age": "match",
+        "sex": "match",
+        "comorbidity": "match",
+        "ancestry_region": "not_reported",
+        "setting": "differs",
+        "notes": "US label used as a proxy; the Indian package insert could not be fetched. The label statement covers men on dutasteride generally."
+      },
       "citations": [
         {
           "source_type": "label",
@@ -30,11 +58,15 @@
           "version": "DailyMed set 960797b3-09b1-4d6a-8ece-8b5d918e93e4 (revision Mar-2025)",
           "locator": "5.1 Effects on Prostate-Specific Antigen (PSA)",
           "quote": "To interpret an isolated PSA value in a man treated with AVODART for 3 months or more, the PSA value should be doubled for comparison with normal values in untreated men.",
-          "accessed": "2026-10-27"
+          "accessed": "2026-10-27",
+          "source_tier": "label",
+          "license": "public-domain"
         }
       ],
       "for_clinician": "treating urologist",
-      "question_ids": ["bob:q:0001"],
+      "question_ids": [
+        "bob:q:0001"
+      ],
       "status": "new",
       "verification": "agent"
     },
@@ -42,9 +74,25 @@
       "id": "rx-002",
       "type": "label_fact",
       "statement": "The current tamsulosin label lists orthostasis (postural hypotension, dizziness and vertigo) as reported more often with tamsulosin than with placebo. A family-reported episode of dizziness on standing is recorded on 05-Oct-2026; tamsulosin is recorded as strip-seen.",
-      "kb_ids": ["bob:fact:2026-10-05-tg.1234", "bob:fact:2026-02-03-example-clinic-rx.tamsulosin"],
-      "evidence": { "design": "label", "certainty": "not_graded", "grade_as_printed": "US prescribing information, section 5.1", "ocebm": "n/a" },
-      "applicability": { "match": "partial", "age": "match", "sex": "match", "comorbidity": "unknown", "ancestry_region": "not_reported", "setting": "differs", "notes": "Generic US label used as a proxy. The dizziness is family-reported, with no recorded blood pressure at the time; other recorded medicines may also be relevant and are for the doctor to weigh." },
+      "kb_ids": [
+        "bob:fact:2026-10-05-tg.1234",
+        "bob:fact:2026-02-03-example-clinic-rx.tamsulosin"
+      ],
+      "evidence": {
+        "design": "label",
+        "certainty": "not_graded",
+        "grade_as_printed": "US prescribing information, section 5.1",
+        "ocebm": "n/a"
+      },
+      "applicability": {
+        "match": "partial",
+        "age": "match",
+        "sex": "match",
+        "comorbidity": "unknown",
+        "ancestry_region": "not_reported",
+        "setting": "differs",
+        "notes": "Generic US label used as a proxy. The dizziness is family-reported, with no recorded blood pressure at the time; other recorded medicines may also be relevant and are for the doctor to weigh."
+      },
       "citations": [
         {
           "source_type": "label",
@@ -53,11 +101,15 @@
           "version": "openFDA effective_time 20260101",
           "locator": "5.1 Orthostasis",
           "quote": "The signs and symptoms of orthostasis (postural hypotension, dizziness, and vertigo) were detected more frequently in tamsulosin hydrochloride capsule-treated patients than in placebo recipients.",
-          "accessed": "2026-10-27"
+          "accessed": "2026-10-27",
+          "source_tier": "label",
+          "license": "public-domain"
         }
       ],
       "for_clinician": "treating urologist",
-      "question_ids": ["bob:q:0002"],
+      "question_ids": [
+        "bob:q:0002"
+      ],
       "status": "new",
       "verification": "agent"
     },
@@ -65,9 +117,25 @@
       "id": "rx-003",
       "type": "monitoring_gap",
       "statement": "KDIGO 2024 advises testing people at risk for and with CKD using both urine albumin and GFR (practice point, ungraded). The records hold one eGFR (52, 12-Oct-2026, printed flag L) and a doctor-written type 2 diabetes; no urine albumin result is recorded.",
-      "kb_ids": ["bob:fact:2026-10-12-example-lab-rft.egfr", "bob:fact:2024-06-01-example-clinic-note.t2dm"],
-      "evidence": { "design": "guideline", "certainty": "not_graded", "grade_as_printed": "Practice Point 1.1.1.1", "ocebm": "5" },
-      "applicability": { "match": "partial", "age": "match", "sex": "match", "comorbidity": "match", "ancestry_region": "unknown", "setting": "differs", "notes": "A single value; the printed eGFR equation is not stated on the report. Practice points are expert guidance, not graded evidence." },
+      "kb_ids": [
+        "bob:fact:2026-10-12-example-lab-rft.egfr",
+        "bob:fact:2024-06-01-example-clinic-note.t2dm"
+      ],
+      "evidence": {
+        "design": "guideline",
+        "certainty": "not_graded",
+        "grade_as_printed": "Practice Point 1.1.1.1",
+        "ocebm": "5"
+      },
+      "applicability": {
+        "match": "partial",
+        "age": "match",
+        "sex": "match",
+        "comorbidity": "match",
+        "ancestry_region": "unknown",
+        "setting": "differs",
+        "notes": "A single value; the printed eGFR equation is not stated on the report. Practice points are expert guidance, not graded evidence."
+      },
       "citations": [
         {
           "source_type": "guideline",
@@ -78,30 +146,148 @@
           "version": "2024 (Kidney Int 2024;105(4S):S117-S314)",
           "locator": "Chapter 1, Practice Point 1.1.1.1",
           "quote": "Test people at risk for and with chronic kidney disease (CKD) using both urine albumin measurement and assessment of glomerular filtration rate (GFR).",
-          "accessed": "2026-10-27"
+          "accessed": "2026-10-27",
+          "source_tier": "guideline_open",
+          "license": "CC BY-NC-ND"
         }
       ],
       "for_clinician": "treating physician (diabetes)",
-      "question_ids": ["bob:q:0003"],
+      "question_ids": [
+        "bob:q:0003"
+      ],
+      "status": "new",
+      "verification": "agent"
+    },
+    {
+      "id": "rx-004",
+      "type": "monitoring_gap",
+      "statement": "secondary: reports AUA BPH guideline recommendation. A StatPearls chapter on BPH states, in its own words, that PSA testing may be offered to men with lower urinary tract symptoms when it would change management. A doctor-written BPH is recorded; the AUA guideline itself is linked for the urologist at its BPH guideline page (section on diagnostic evaluation) and is not quoted here.",
+      "kb_ids": [
+        "bob:fact:2024-06-01-example-clinic-note.bph"
+      ],
+      "evidence": {
+        "design": "reference_text",
+        "certainty": "not_graded",
+        "grade_as_printed": "StatPearls chapter, not graded",
+        "ocebm": "5"
+      },
+      "applicability": {
+        "match": "partial",
+        "age": "match",
+        "sex": "match",
+        "comorbidity": "unknown",
+        "ancestry_region": "not_reported",
+        "setting": "differs",
+        "notes": "Secondary reference text; its wording is not the AUA's. Synthetic: the quoted sentence is a placeholder for what the real chapter says."
+      },
+      "citations": [
+        {
+          "source_type": "guideline",
+          "source_tier": "guideline_link_only",
+          "url": "https://www.auanet.org/guidelines/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
+          "title": "AUA guideline on management of BPH",
+          "version": "2023 amendment",
+          "locator": "Diagnostic evaluation section (recommendation number to be read by the clinician)",
+          "accessed": "2026-10-27"
+        },
+        {
+          "source_type": "reference_text",
+          "source_tier": "bookshelf",
+          "license": "CC BY-NC-ND",
+          "reports_guideline": "https://www.auanet.org/guidelines/guidelines/benign-prostatic-hyperplasia-(bph)-guideline",
+          "url": "https://www.ncbi.nlm.nih.gov/books/NBK558920/",
+          "title": "Benign Prostatic Hyperplasia (StatPearls)",
+          "locator": "Evaluation",
+          "quote": "Synthetic placeholder sentence standing in for a verbatim StatPearls quote on PSA testing in men with lower urinary tract symptoms.",
+          "accessed": "2026-10-27"
+        }
+      ],
+      "for_clinician": "treating urologist",
+      "question_ids": [],
       "status": "new",
       "verification": "agent"
     }
   ],
   "questions": [
-    { "id": "bob:q:0001", "text": "Treating urologist: the 10-Sep-2026 PSA was recorded while dutasteride is on the medicine list (rx-001). How should this result be read, and when is the next PSA due?", "for_clinician": "treating urologist", "item_ids": ["rx-001"], "priority": "next-visit" },
-    { "id": "bob:q:0002", "text": "Treating urologist: dizziness on standing was reported at home on 05-Oct-2026, and the tamsulosin label lists orthostasis (rx-002). Is this worth checking, for example with a standing blood pressure?", "for_clinician": "treating urologist", "item_ids": ["rx-002"], "priority": "next-visit" },
-    { "id": "bob:q:0003", "text": "Treating physician: one eGFR of 52 is recorded and no urine albumin result (rx-003). Is a repeat kidney test or a urine albumin-creatinine ratio due?", "for_clinician": "treating physician (diabetes)", "item_ids": ["rx-003"], "priority": "routine" }
+    {
+      "id": "bob:q:0001",
+      "text": "Treating urologist: the 10-Sep-2026 PSA was recorded while dutasteride is on the medicine list (rx-001). How should this result be read, and when is the next PSA due?",
+      "for_clinician": "treating urologist",
+      "item_ids": [
+        "rx-001"
+      ],
+      "priority": "next-visit"
+    },
+    {
+      "id": "bob:q:0002",
+      "text": "Treating urologist: dizziness on standing was reported at home on 05-Oct-2026, and the tamsulosin label lists orthostasis (rx-002). Is this worth checking, for example with a standing blood pressure?",
+      "for_clinician": "treating urologist",
+      "item_ids": [
+        "rx-002"
+      ],
+      "priority": "next-visit"
+    },
+    {
+      "id": "bob:q:0003",
+      "text": "Treating physician: one eGFR of 52 is recorded and no urine albumin result (rx-003). Is a repeat kidney test or a urine albumin-creatinine ratio due?",
+      "for_clinician": "treating physician (diabetes)",
+      "item_ids": [
+        "rx-003"
+      ],
+      "priority": "routine"
+    }
   ],
   "search_log": [
-    { "at": "2026-10-27T13:05:00+05:30", "source": "DailyMed SPL v2", "query": "GET /dailymed/services/v2/spls/960797b3-09b1-4d6a-8ece-8b5d918e93e4.xml", "filters": "current revision", "hits": 1, "screened": 1, "kept": 1, "notes": "dutasteride label; PSA sections 5.1 and 17" },
-    { "at": "2026-10-27T13:10:00+05:30", "source": "openFDA drug/label", "query": "search=openfda.generic_name:\"tamsulosin\"&limit=1", "filters": "none", "hits": 1, "screened": 1, "kept": 1, "notes": "warnings_and_cautions read; set 00097e78-9c04-4e62-8260-ddb50e9a6a93" },
-    { "at": "2026-10-27T13:12:00+05:30", "source": "PubMed E-utilities esearch", "query": "10.1016/j.kint.2023.10.018[doi]", "filters": "none", "hits": 1, "screened": 1, "kept": 1, "notes": "KDIGO 2024 has no PubMed abstract; quote taken from the guideline PDF at kdigo.org (practice point 1.1.1.1)" }
+    {
+      "at": "2026-10-27T13:05:00+05:30",
+      "source": "DailyMed SPL v2",
+      "query": "GET /dailymed/services/v2/spls/960797b3-09b1-4d6a-8ece-8b5d918e93e4.xml",
+      "filters": "current revision",
+      "hits": 1,
+      "screened": 1,
+      "kept": 1,
+      "notes": "dutasteride label; PSA sections 5.1 and 17"
+    },
+    {
+      "at": "2026-10-27T13:10:00+05:30",
+      "source": "openFDA drug/label",
+      "query": "search=openfda.generic_name:\"tamsulosin\"&limit=1",
+      "filters": "none",
+      "hits": 1,
+      "screened": 1,
+      "kept": 1,
+      "notes": "warnings_and_cautions read; set 00097e78-9c04-4e62-8260-ddb50e9a6a93"
+    },
+    {
+      "at": "2026-10-27T13:12:00+05:30",
+      "source": "PubMed E-utilities esearch",
+      "query": "10.1016/j.kint.2023.10.018[doi]",
+      "filters": "none",
+      "hits": 1,
+      "screened": 1,
+      "kept": 1,
+      "notes": "KDIGO 2024 has no PubMed abstract; quote taken from the guideline PDF at kdigo.org (practice point 1.1.1.1)"
+    }
   ],
-  "revisit": { "next_due": "2027-04-27", "triggers": ["new PSA result", "new eGFR or urine albumin result", "any medicine change", "KDIGO CKD update", "AUA or EAU LUTS update"] },
+  "revisit": {
+    "next_due": "2027-04-27",
+    "triggers": [
+      "new PSA result",
+      "new eGFR or urine albumin result",
+      "any medicine change",
+      "KDIGO CKD update",
+      "AUA or EAU LUTS update"
+    ]
+  },
   "limitations": [
     "Synthetic example: the person, KB ids and dates are fictional; the citations are real.",
     "Indian package inserts were not available; US labels used as proxies.",
-    "Not a systematic review; no literature pass was needed because the label and guideline passes answered each topic."
+    "Not a systematic review; no literature pass was needed because the label and guideline passes answered each topic.",
+    "rx-004 is a synthetic illustration of the secondary-source pattern: its quote is a placeholder, not real StatPearls text."
   ],
-  "verifier": { "ran_at": "2026-10-27T13:20:00+05:30", "errors": 0, "warnings": 1 }
+  "verifier": {
+    "ran_at": "2026-10-27T13:20:00+05:30",
+    "errors": 0,
+    "warnings": 1
+  }
 }

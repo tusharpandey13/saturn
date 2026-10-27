@@ -120,7 +120,7 @@
     "kb_id": { "type": "string", "pattern": "^([a-z][a-z0-9-]*:(src|fact)|ref:(drug|code|party)):[a-z0-9.-]+$" },
     "dim": { "enum": ["match", "differs", "not_reported", "unknown"] },
     "citation": {
-      "type": "object", "required": ["source_type", "accessed"], "anyOf": [{ "required": ["pmid"] }, { "required": ["doi"] }, { "required": ["url"] }],
+      "type": "object", "required": ["source_type", "source_tier", "accessed"], "anyOf": [{ "required": ["pmid"] }, { "required": ["doi"] }, { "required": ["url"] }],
       "additionalProperties": false,
       "properties": {
         "source_type": { "enum": ["guideline", "systematic_review", "primary_study", "label", "trial_registry", "reference_text"] },
@@ -131,7 +131,10 @@
         "version": { "type": "string", "description": "guideline year/edition or label revision date" },
         "locator": { "type": "string", "description": "section, recommendation number, table, page" },
         "quote": { "type": "string", "minLength": 1, "maxLength": 400, "description": "verbatim from the cited text; REQUIRED except for link-only bodies (AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society), where it must be omitted and locator is required" },
-        "accessed": { "type": "string", "format": "date" }
+        "accessed": { "type": "string", "format": "date" },
+        "source_tier": { "enum": ["label", "guideline_open", "guideline_link_only", "oa_article", "bookshelf", "abstract"], "description": "method section 4. Required for every citation" },
+        "license": { "type": "string", "maxLength": 60, "description": "licence under which the quote is made, e.g. public-domain, CC BY, CC BY-NC, CC BY-NC-ND, CC BY-NC-SA, ahrq-unaltered, publisher-abstract. Required when quote is present; must be on the verifier allow-list" },
+        "reports_guideline": { "type": "string", "maxLength": 300, "description": "id or URL of the link-only guideline (AUA, EAU, NICE, ESC, ADA, ICMR, Endocrine Society) that this SECONDARY source reports. The item statement must say 'secondary: reports <guideline> recommendation'; the quote is the secondary source's own text, never the guideline's" }
       }
     }
   }

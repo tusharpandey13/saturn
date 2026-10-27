@@ -56,6 +56,10 @@ prompt: |
      ICMR, Endocrine Society; method, "Source priority"): never fetch, quote or summarise their recommendations;
      cite the body, version, recommendation number (locator) and URL, with no quote, and point the clinician to it
      by name. The item's statement then says only that the body addresses the topic, not what it recommends.
+     Then search for a legitimately quotable open-access SECONDARY source that reports the recommendation
+     (method step 5a; tiers and licences in section 4). Quote only that, set source_tier, license and
+     reports_guideline, and open the statement "secondary: reports <guideline> recommendation". Never present
+     it as the guideline's own text. Every quoted citation needs source_tier and a licence read from the source.
   5. Write docs/health/{{ns}}/research/<today>-crossref.md (the template in the method) and its JSON sidecar
      (saturn.research_crossref.output.schema.json); add new questions to docs/health/{{ns}}/questions.md with
      the next free {{ns}}:q:NNNN ids. Edit nothing else; never touch data/ or generated blocks.

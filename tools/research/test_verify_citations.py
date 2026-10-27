@@ -37,7 +37,8 @@ class FakeNet:
 
 
 def item(iid, statement="Testolol is associated with lower example-marker values.", **cite):
-    c = {"quote": "testolol was associated with lower example-marker values", "accessed": "2026-10-27"}
+    c = {"quote": "testolol was associated with lower example-marker values", "accessed": "2026-10-27",
+         "source_tier": "abstract", "license": "publisher-abstract"}
     c.update(cite)
     return {"id": iid, "type": "association", "statement": statement, "citations": [c]}
 
@@ -79,6 +80,52 @@ class Structural(unittest.TestCase):
         ok_q = {"id": "zed:q:0002", "text": "Dr Example: is a repeat example-marker test due, given testolol?"}
         res = vc.verify(doc(item("p", pmid="1000001"), questions=[q, ok_q]))
         self.assertEqual([w for _, w, m in res if "phrasing" in m], ["question zed:q:0001"])
+
+
+class Tiers(unittest.TestCase):
+    def errs(self, *items):
+        return [m for lv, _, m in vc.verify(doc(*items)) if lv == "error"]
+
+    def test_quote_needs_tier_and_license(self):
+        a = item("a", pmid="1000001"); del a["citations"][0]["source_tier"]
+        b = item("b", pmid="1000001"); del b["citations"][0]["license"]
+        e = " | ".join(self.errs(a, b))
+        self.assertIn("needs source_tier", e)
+        self.assertIn("needs license", e)
+
+    def test_license_allow_list(self):
+        for lic in ("CC BY-NC-ND 4.0", "cc by-nc-nd", "CC BY-NC-SA 3.0 IGO", "CC0", "Public Domain"):
+            self.assertEqual(self.errs(item("a", pmid="1000001", source_tier="oa_article", license=lic)), [], lic)
+        for lic in ("all rights reserved", "proprietary", "CC BY-NC-ND-EXTRA"):
+            self.assertTrue(any("allow-list" in m for m in
+                                self.errs(item("a", pmid="1000001", source_tier="oa_article", license=lic))), lic)
+
+    def test_label_host_and_abstract_length(self):
+        bad = item("a", url="https://labels.example.org/ok", source_tier="label", license="public-domain")
+        self.assertTrue(any("label host" in m for m in self.errs(bad)))
+        good = item("b", url="https://dailymed.nlm.nih.gov/x", source_tier="label", license="public-domain")
+        self.assertEqual(self.errs(good), [])
+        long_ = item("c", pmid="1000001", quote="x" * 300)
+        self.assertTrue(any("abstract quote longer" in m for m in self.errs(long_)))
+
+    def test_link_only_tier_never_quoted(self):
+        q = item("a", url="https://example.org/g", source_tier="guideline_link_only", license="n/a")
+        self.assertTrue(any("no quote allowed" in m for m in self.errs(q)))
+
+    def test_reports_guideline(self):
+        g = "https://uroweb.org/guidelines/x"
+        ok = item("a", statement="secondary: reports EAU recommendation. Testolol is associated with lower values.",
+                  url="https://www.ncbi.nlm.nih.gov/books/NBK1/", source_tier="bookshelf",
+                  license="CC BY-NC-ND", reports_guideline=g)
+        self.assertEqual(self.errs(ok), [])
+        unlabelled = item("b", pmid="1000001", reports_guideline=g)
+        self.assertTrue(any("must be labelled" in m for m in self.errs(unlabelled)))
+        primary = item("c", statement="secondary: reports EAU recommendation.", url="https://dailymed.nlm.nih.gov/x",
+                       source_tier="label", license="public-domain", reports_guideline=g)
+        self.assertTrue(any("only on a secondary tier" in m for m in self.errs(primary)))
+        # quoting the link-only host itself is still rejected
+        self.assertTrue(any("link-only source: no quote" in m for m in
+                            self.errs(item("d", url=g, locator="3.1", source_tier="oa_article", license="CC BY"))))
 
 
 class Online(unittest.TestCase):
