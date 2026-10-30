@@ -85,6 +85,7 @@ Never create a new list of questions, to-dos or gaps. Add to `questions.md` or `
 - Every clinical statement cites a KB id or a source path (+ page). Quote verbatim for values, doses and diagnoses.
 - Tag who said it: document / doctor-written / family-reported / patient-reported / agent-inferred. Never present an inference as a fact. Uncertain readings go to a hard-read, not into prose.
 - Verification ladder for facts: `unverified` → `agent` → `human` → `patient` → `clinician`.
+- **Evidence over recollection.** Documents are the source of truth for analysis. A claim from memory (the owner's, a family member's or an agent's earlier note) is a lead to check, not a premise: find it in the documents and quote it with source, page, author and date, or report plainly that the documents don't support it. Analyses state, per claim, whether the evidence agrees, disagrees or is silent. Earlier agent-inferred statements that new evidence contradicts are corrected explicitly ("Corrected <date>: ..."), never silently edited.
 - Medicine status (every line in `medications.md`): `prescribed` / `strip-seen` / `patient-confirmed` / `clinician-reconciled` / `stopped`. A medicine is "current" only when `strip-seen` or better and not contradicted by a later prescription.
   In the KB (ADR 007) these map to `data.status` (prescribed, dispensed, taking, stopped) plus `verification`: `strip-seen` = a strip or box photo checked by a human; `patient-confirmed` = `taking`; `clinician-reconciled` = verification `clinician`.
 
