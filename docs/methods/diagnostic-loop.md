@@ -25,8 +25,13 @@ problems**. They do five things on every run:
 1. Keep a ledger of the problems.
 2. Reason about each problem as a differential with explicit probabilities, cited to the records and the literature.
 3. Choose the next steps that would best tell the hypotheses apart.
-4. Turn those steps into actions for the caretaker and a one-page packet for the doctor.
+4. Turn those steps into actions for the caretaker, questions for the family and a one-page packet for the doctor.
 5. Re-run when new data arrives and say what moved.
+
+Each run is one **panel** discussion in the style of MAI-DxO ([D4]; §5): fixed roles that keep the differential,
+choose the most discriminating next step, argue against the leader, weigh the family's burden and check the work, over
+2–3 rounds. Its beliefs are written as **inference records** (`tools/inference`, §3), so the Status page and the next
+run's belief diff read structured rows, not prose.
 
 Predictions are logged and later scored against what doctors and tests find, so the system learns how well
 calibrated it is.
@@ -71,8 +76,8 @@ numbers came only from secondary reports) or **U** (unverified). Full references
 
 | Failure | Evidence | Guard in this method |
 |---|---|---|
-| Sensitive to the **order and amount** of information; does not follow guidelines; reads labs poorly | Hager et al., Nature Medicine 2024: on 2,400 real cases, models were worse than physicians and answers changed with the order of information [F1] V | a fixed evidence-pack order; several independent agents given different orderings and framings; labs passed in as computed tables, never prose |
-| **Anchoring and framing** on a label already written | BiasMedQA: accuracy fell when cognitive-bias cues were added [F2] V | one differential agent is **blinded to doctors' labels**; the reviewer runs a bias checklist |
+| Sensitive to the **order and amount** of information; does not follow guidelines; reads labs poorly | Hager et al., Nature Medicine 2024: on 2,400 real cases, models were worse than physicians and answers changed with the order of information [F1] V | a fixed evidence-pack order; a blinded panel seat and, for full runs, two panels given different orderings; labs passed in as computed tables, never prose |
+| **Anchoring and framing** on a label already written | BiasMedQA: accuracy fell when cognitive-bias cues were added [F2] V | the panel's **Blinded** seat never sees doctors' labels; the Challenger runs a bias checklist |
 | **Sycophancy** (goes along with the user's premise) | Chen et al., npj Digit Med 2025: up to 100% compliance with illogical drug requests; explicitly allowing refusal helped [F3] V | the prompt says the owner's hypothesis is one hypothesis among others; agents are told to disagree with evidence |
 | **Fabricated or unsupported citations** | Walters & Wilder 2023: 18% of GPT-4 references fabricated [F4] V. SourceCheckup 2025: 50–90% of LLM answers not fully supported by the sources they cite [F5] V | a **citation verifier** (§5) resolves every DOI or PMID and checks the cited text supports the claim; anything unverified is marked U or dropped |
 | **Overconfidence and poor calibration** | stated confidence 90–100 across the board on USMLE-style questions [F6] P; no gain in probabilistic reasoning [D5] P | probabilities come in buckets with a residual "something else" share; predictions are logged and scored (§4 step 9); the synthesiser explains each probability |
@@ -85,6 +90,16 @@ numbers came only from secondary reports) or **U** (unverified). Full references
 - **Multi-agent work with a moderator or reviewer.** MDAgents: adding moderator review plus outside knowledge raised
   accuracy by 11.8% on average [T2] V. A multi-agent conversation on 302 rare-disease cases beat single models [T3] P.
 - **Sequential, cost-aware test selection.** MAI-DxO kept its accuracy at about half the cost of physicians [D4] V.
+  It is the template for this method's panel (§5). Read it with care:
+  - it is a **preprint** (not peer reviewed), by the system's developers;
+  - the cases are **simulated sequential** versions of published NEJM CPCs, with a model acting as the gatekeeper that
+    reveals findings on request, and costs are estimated US list prices;
+  - the comparison physicians worked without colleagues, books or AI, which is not how practice works;
+  - CPC cases have one documented answer; this family's problems may have none yet, and the data are noisy.
+
+  What carries over is the **structure** (named roles, a probability-ranked differential updated per finding, tests
+  chosen for discrimination, a cost and burden check, a devil's advocate, a consistency check), not the accuracy
+  numbers.
 - **Retrieval with citations.** MedRAG: up to 18% better than chain of thought alone, with a "lost in the middle"
   effect (material in the middle of a long context gets missed) [T4] V. Almanac gave better factuality and citations
   [T5] P.
@@ -105,7 +120,7 @@ numbers came only from secondary reports) or **U** (unverified). Full references
   - a "can't-miss" list;
   - a **diagnostic time-out** and checklists [M5] V.
   - Caveat: evidence that teaching people to debias reduces error is weak [M6] V. That is one reason this method puts
-    the checklist into a separate reviewer agent rather than trusting a single reasoner to check itself.
+    the checklist into separate Challenger and Checklist agents rather than trusting a single reasoner to check itself.
 - **Undiagnosed-disease programmes.** The NIH Undiagnosed Diseases Network diagnosed **35%** of fully evaluated
   patients; 74% of those diagnoses came from exome or genome sequencing and 11% from clinical review alone [M7] V.
   Its structure is a useful template:
@@ -181,7 +196,9 @@ Loop 0 uses only existing places. No new list of questions or to-dos is created 
 |---|---|---|
 | Run note (ledger, representations, differentials, belief diff, predictions) | `docs/log/analysis/YYYY-MM-DD-<ns>-dx-loop-NN.md` | append-only, like every log note; the latest run's ledger is the current state |
 | Predictions log | `docs/log/analysis/dx/<ns>-predictions.ndjson` | one row per prediction (§4 step 9); later superseded by `dx/` rows (iteration 3) |
+| **Inference records** (the run's beliefs: one row per hypothesis, interpretation, trend, risk; one status summary) | `inferences/<ns>/inferences.ndjson`, written only with `tools/inference` ([format](../../tools/inference/README.md)); generated page `docs/health/<ns>/status.md` | append-only; a changed belief is a supersede, an excluded one is retired; never KB facts |
 | Questions for doctors | `docs/health/<ns>/questions.md` (new `<ns>:q:NNNN`, or new item ids added to an existing question) | priority now / next visit |
+| Questions to the family (cheap tests, §4 step 6) | `docs/health/family/actions.md` (`family:act:NNNN`, tag `ask-family`) | each names the hypotheses it separates; the answer arrives in the next voice note or chat, is ingested as a family-reported source, and closes the action with that source id |
 | Caretaker actions | `docs/health/family/actions.md` (`family:act:NNNN`) | observation tasks, records to fetch, when to escalate |
 | Doctor packet | `docs/health/<ns>/briefs/YYYY-MM-DD-dx-packet-<specialty>.md` | one page; regenerated within 48 h before a visit |
 | Family-simple summary | the run note's §F, which the owner forwards or reads out | plain language, no probabilities beyond "likely / possible / less likely" |
@@ -191,7 +208,8 @@ Ids: open problems take `<ns>:dx:NNNN` (a docs-register class like `q`/`act`, pr
 
 ## 4. The loop (one run)
 
-Steps 0–2 are deterministic or close to it. Steps 3–6 are the reasoning. Steps 7–9 are output and learning.
+Steps 0–2 are deterministic or close to it. Steps 3–6 are the reasoning (the panel, §5). Steps 7–9 are output and
+learning.
 
 **Step 0. Red-flag screen.** Check the newest readings, symptoms and voice notes against the red-flag rules. Any hit
 goes at the top of the run note and is DMed to the owner first. Then continue.
@@ -247,19 +265,28 @@ are often the most informative facts.
 
 Always include the hypotheses "two problems, not one" and "artefact or record error" when the facts allow them.
 
-**Step 5. Independence, adversarial review, verification** (§5 architecture). Then synthesis: merge the independent
-differentials, show where the agents disagreed, and settle the probabilities with reasons.
+**Step 5. Panel debate, verification** (§5). The panel runs 2–3 rounds per problem set; the citation verifier checks
+the final round; the orchestrator writes the outcome. The run note shows each round's probabilities, where members
+disagreed and how it was settled.
 
-**Step 6. Discriminating next steps.** Rank candidate steps by **how much they would shift the leading hypotheses**,
-weighed against burden (cost, travel, risk, stress, wait). Cheap and informative steps come first. They are often:
-- **fetching an existing record** (old reports, discharge summaries, the original images);
-- **a structured home observation** of the next episode (§6);
-- **a question the doctor can answer from memory or notes**.
+**Step 6. Discriminating next steps.** The Test-Chooser ranks candidate steps by **expected discrimination**: how far
+each plausible result would move the top 2–3 hypotheses apart (state the expected shift both ways, with a likelihood
+ratio where one is published and cited). Stewardship then weighs burden on the family (money, travel, a parent's
+stress and effort, waiting time, risk). Cheap and informative steps come first. Every step is one of five kinds, and
+each names the hypotheses it separates:
+1. **a question to the family** (the cheapest test): something the person or a family member can answer from
+   memory or by looking ("which side was it, left or right?", "did it start at rest or while walking?", "is the box
+   from the chemist still at home?"). Logged in `family/actions.md` with tag `ask-family`, at most 5 a run, asked in
+   one message; the answer comes back in the next voice note or chat, is ingested as a family-reported source, and is
+   evidence for the next run;
+2. **fetching an existing record** (old reports, discharge summaries, the original images);
+3. **a structured home observation** of the next episode (§6);
+4. **a question for the doctor** that they can answer from memory or notes (`questions.md`);
+5. **a test to ask the doctor about**, phrased "would test X help distinguish A from B?".
 
-Tests are phrased as "would test X help distinguish A from B?" for the doctor. Each step names the hypotheses it
-separates.
-
-**Step 7. Belief diff** (every run after the first). For each problem:
+**Step 7. Belief diff** (every run after the first), from the inference records: run
+`tools/inference/inference diff <ns> --run <this run note>` after step 8's writes and paste its table. For each
+problem:
 - what moved;
 - by how much;
 - **because of which new id**;
@@ -267,8 +294,20 @@ separates.
 
 New problems added, problems parked. One table, then three sentences.
 
-**Step 8. Outputs** (§7): caretaker actions, doctor packet, family summary, questions. Human review point: the owner
-reads the run note before anything goes to a doctor or the wider family.
+**Step 8. Outputs** (§7): caretaker actions, questions to the family, doctor packet, family summary, questions, and
+**inference records** written with `tools/inference` (never by hand):
+- one `hypothesis` row per hypothesis at 5% or more, and every `can't-miss` hypothesis at any probability, with
+  `problem`, `problem_title`, `hypothesis`, `p` and its bucket, the reason, evidence ids for and against, verified
+  citations, `would_change`, and `produced_by.run` = this run note;
+- `interpretation`, `trend` or `risk` rows only where they are concrete, sourced and useful on a Status screen;
+- one `status-summary` row per person (plain language, one sentence);
+- on later runs: `supersede` a row whose probability, evidence or wording changed; `retire` a hypothesis excluded by a
+  cited test or explained by a doctor (with the reason); leave unchanged rows alone;
+- then `tools/inference/inference gen` refreshes `docs/health/<ns>/status.md`.
+
+The residual "not yet considered" share stays in the run note, not in a row. Human review point: the owner reads the
+run note and the Status page before anything goes to a doctor or the wider family, and marks rows with `review`
+(`accepted` / `disputed`).
 
 **Step 9. Predictions and scoring.** For each testable expectation, log one row:
 - `id`;
@@ -295,12 +334,12 @@ These are the loop's accuracy measures. Static checks cannot produce them.
 - A prediction's resolution date passing.
 - On request.
 
-Event-driven runs are **delta runs**: only the problems touched, plus the reviewer. A full run happens weekly while
+Event-driven runs are **delta runs**: only the problems touched, with the panel capped at 2 rounds. A full run happens weekly while
 problems are active, and monthly otherwise.
 
-### 4.1 Diagnostic time-out (reviewer checklist)
+### 4.1 Diagnostic time-out (Challenger and Checklist)
 
-The reviewer answers each item in writing, for each problem:
+The Challenger answers each item in writing, for each problem (the Checklist member confirms it was done):
 - What else could this be? Did we name at least one can't-miss alternative?
 - Did we anchor on the first label a doctor wrote, or on the owner's hypothesis?
 - Which findings do **not** fit the leading hypothesis? Have we explained them, or explained them away?
@@ -309,31 +348,58 @@ The reviewer answers each item in writing, for each problem:
 - Is any probability stated with more confidence than the evidence carries?
 - Is any wording a verdict, a reassurance or a medicine instruction? (The verifier word list, research-crossref §9.)
 
-## 5. Agent architecture
+## 5. Agent architecture: a MAI-DxO-style panel
 
-| Role | Model / effort | Sees | Produces | Why |
-|---|---|---|---|---|
-| **Orchestrator** (the owner's "doctor" session, later a `hl` task) | Opus 5.5, high | everything | the evidence pack, dispatch, the run note | single writer; follows this method |
-| **Differential agents ×3, independent** | Opus 5.5, high | the same pack, in different orders and framings: **A** systems sweep (organ system by organ system); **B** timeline and mechanism first; **C** blinded to doctors' diagnostic labels and the owner's hypotheses (facts, readings and findings only) | per-problem differentials (§4 step 4), with no sight of each other | ensembles and independence reduce order and framing effects [T1][T2][F1][F2] |
-| **Adversarial reviewer** | Opus 5.5, high | the pack + all three differentials | the time-out checklist (§4.1); missed can't-miss items; overconfidence; unsupported premises | a separate critic catches what self-review misses [T2][M6] |
-| **Citation verifier** | Sonnet 5.5, medium, with web access to PubMed / DOI / DailyMed (public mode: generic queries only) | claims + citations; KB ids | resolves each DOI or PMID, checks that the cited text supports the statement, checks KB ids exist and quotes match, enforces the licence rules (research-crossref §4) | fabricated or unsupported citations are common [F4][F5] |
-| **Synthesiser** | Opus 5.5, high | all of the above | merged differential with probabilities and disagreement, next steps, belief diff, predictions, outputs | one voice, with explicit uncertainty |
+The outer loop stays: new data over days and weeks triggers runs (§4 re-run triggers). **Inside each run**, a panel of
+fixed roles replaces the earlier "three independent differentials + one reviewer". The roles follow MAI-DxO [D4]
+(Hypothesis, Test-Chooser, Challenger, Stewardship, Checklist), with one seat kept blinded to avoid groupthink.
+
+| Role | Model / effort | Sees | Produces |
+|---|---|---|---|
+| **Orchestrator** (the owner's "doctor" session, later a `hl` task) | Opus 5.5, high | everything | the evidence pack, the rounds, the stopping decision, the run note, the writes; single writer |
+| **Hypothesis** | Opus 5.5, high | pack + ledger + previous run's active inferences (`list --active --json`) + the other members' last-round output | per-problem differential (§4 step 4) with explicit probabilities and a residual; each round, the update per new evidence or argument, with the id that moved it |
+| **Blinded** (independent seat) | Opus 5.5, high | the pack **without** doctors' diagnostic labels, the owner's hypotheses or earlier inferences: facts, readings, findings, episodes only | its own differential in round 1, never shown the debate; Hypothesis must reconcile with it and the Challenger uses every gap as an anchoring signal |
+| **Test-Chooser** | Opus 5.5, high | pack + current differential | up to 3 next steps per problem ranked by expected discrimination between the top hypotheses (§4 step 6 kinds, family questions included) |
+| **Challenger** | Opus 5.5, high | pack + current differential + Blinded's differential | devil's advocate: the time-out checklist (§4.1), anchoring and premature closure, findings that do not fit, a step that could falsify the leader, missed can't-miss items |
+| **Stewardship** | Sonnet 5.5, medium | the proposed steps + who the person is (age band, travel, access) | burden per step (money, travel, stress, waiting, risk); prefers cheap informative steps (questions to the family, a structured episode observation, fetching a record); vetoes low-yield burdensome ones with a reason |
+| **Checklist** | Sonnet 5.5, medium | the round's outputs + KB ids | consistency (probabilities add to 100% with the residual; ids stable; buckets match numbers), every evidence id exists and every quoted value matches, citation format, licence rules (research-crossref §4), the word list (no verdicts, reassurance or medicine wording); blocking issues listed |
+| **Citation verifier** (after the last round) | Sonnet 5.5, medium, web access to PubMed / DOI / DailyMed (generic queries only) | claims + citations | resolves each DOI or PMID and checks the cited text supports the statement; keep / fix / drop; only V or P citations reach inference rows |
+
+**Rounds and stopping rule.**
+1. Round 1: Hypothesis and Blinded write differentials independently; Test-Chooser, Challenger, Stewardship and
+   Checklist then respond in parallel to Hypothesis's differential.
+2. Round 2 (and 3): Hypothesis revises (reconciling Blinded and answering each Challenger point in writing); the
+   other four respond again to the revision.
+3. **Stop** after a round when all hold: no hypothesis moved by 10 percentage points or more; the top 3 per problem
+   did not change; the Checklist has no blocking issue; the Challenger raised no new unanswered can't-miss item. Stop
+   after round 3 in any case (round 2 for a delta run) and record what is still disputed.
+
+**Ensemble (optional, full runs).** Run two panels independently, each with a different evidence-pack order (A:
+systems, organ by organ; B: timeline and mechanism first) [F1][T1]. The orchestrator averages each hypothesis's
+probability across panels, shows every disagreement of 15 points or more, and takes the union of next steps re-ranked
+by expected discrimination over burden. Use it for the first run, a monthly full run, or when a `can't-miss`
+hypothesis is between 5% and 50%.
+
+**Why this shape.** Ensembles, independence and a separate critic reduce order and framing effects and catch what
+self-review misses [T1][T2][F1][F2][M6]; sequential, cost-aware choice of the next step is what MAI-DxO adds [D4];
+fabricated or unsupported citations are common, hence the verifier [F4][F5].
 
 **Literature queries never carry PHI.** They use generic terms only: condition, finding, drug INN. They never include
 names, dates, places or verbatim record text (research-crossref §5; ADR 012 split fetch).
 
 **Cost per run** (API list prices checked 31-Oct-2026: Opus 5.5 $4 / $20 per million input / output tokens, cache
-reads $0.20; Sonnet 5.5 $2 / $10). An evidence pack of about 80–120k tokens is shared by five calls (caching the pack
-cuts repeat input):
-- **Full run:** about **$4–8**.
-- **Delta run** (1–2 problems, reviewer, verifier): about **$1–3**.
-- **Steady state:** weekly full runs plus about 3 delta runs a week come to about **$30–60 a month**. The owner sets
-  the cap (ADR 013). It is separate from the ADR 012 L2 cap.
+reads $0.20; Sonnet 5.5 $2 / $10). An evidence pack of about 80–120k tokens is cached and shared by every member and
+round; each member-round adds about 10–30k fresh input and 3–6k output (estimates, not measured yet):
+- **Full run** (one panel, up to 3 rounds, verifier): about **$5–10**.
+- **Full run with a two-panel ensemble:** about **$10–18**.
+- **Delta run** (1–2 problems, up to 2 rounds, verifier): about **$1–4**.
+- **Steady state:** weekly single-panel full runs, about 3 delta runs a week and one ensemble a month come to about
+  **$40–70 a month**. The owner sets the cap (ADR 013). It is separate from the ADR 012 L2 cap.
 - **Owner-session runs** (Claude Code on the owner's Mac) use the owner's plan, not API billing.
 
 **Where it runs.**
 - **Now:** the owner's Claude Code session in the records repo checkout on the owner's Mac. Subagents provide the
-  independent agents. Outputs are commits or PRs in the records repo.
+  panel members. Outputs are commits or PRs in the records repo.
 - **Later:** a `saturn.dx_loop` task pack for the egress-locked PHI user `hl` on the home server, using the ADR 012
   split fetch for literature, triggered by the batch's "facts touching an open problem" diff, with per-run and
   per-month budgets and `git_pr` delivery. The go-live gate applies: no deployment runs it on real data until the
@@ -421,8 +487,9 @@ Words, not numbers: "likely / possible / less likely". No new alarms without a s
    say so.
 4. **Evidence links are mandatory.** A statement with no KB id, source path or verified citation is deleted, or
    marked U and kept out of the packet.
-5. **Interpretation stays out of KB facts.** It lives only in run notes, briefs and questions, labelled
-   `agent-inferred` with the model and the date.
+5. **Interpretation stays out of KB facts.** It lives only in run notes, inference records (`inferences/`, via
+   `tools/inference`), the generated Status page, briefs and questions, labelled `agent-inferred` with the model and
+   the date.
 6. **Human review points.** The owner reviews:
    - every run note before outputs leave the records repo;
    - every doctor packet before it is printed or sent.
@@ -438,7 +505,8 @@ Words, not numbers: "likely / possible / less likely". No new alarms without a s
 - **Top-k capture:** the doctor's eventual diagnosis was in the run's top 3 / top 10 when it was made.
 - **Time to a discriminating answer:** from a step proposed to its result recorded.
 - **Doctor reception:** the owner logs per visit whether the packet was used, ignored or unwelcome.
-- **Reviewer catches per run.**
+- **Challenger and Checklist catches per run**; rounds to stop.
+- **Family questions answered** (share, and median days to an answer) and how often an answer moved a hypothesis.
 - **Verifier error rate:** citations dropped.
 - **Cost per run.**
 
@@ -449,10 +517,10 @@ unwelcome twice.
 
 | Loop | Scope | Effort | Return |
 |---|---|---|---|
-| **0 (today)** | the owner pastes the [run prompt](diagnostic-loop-run-prompt.md) into the doctor session; it builds the pack, spawns 3 differential agents + reviewer + verifier, and writes the run note, questions, actions and packet as markdown | about 2–4 h agent time + 1 h owner review; no code | a first ledger, differentials and discriminating asks on the real case within a day |
+| **0 (today)** | the owner pastes the [run prompt](diagnostic-loop-run-prompt.md) into the doctor session; it builds the pack, runs the panel (+ verifier), and writes the run note, inference records (`tools/inference`, shipped), questions, family questions, actions and packet | about 2–4 h agent time + 1 h owner review | a first ledger, differentials, a Status page and discriminating asks on the real case within a day |
 | **1** | pin the episode card in the group; create the predictions file; a second, delta run after the first new episode or document | about 0.5 day | episode data begins; first belief diff |
 | **2** | a batch-side trigger: the daily digest lists "new facts touching open problems `<ns>:dx:…`" (a deterministic match of fact ids against the ledger's evidence ids); the owner starts a delta run | 1–2 agent-days | runs happen when data warrants them, not when remembered |
-| **3** | structured `dx/<ns>/{problems,hypotheses,predictions}.ndjson` beside `crossref/`; a scoring script (Brier, top-k); `gen` views of the ledger; episode facts with SOCRATES fields | 2–3 agent-days | calibration numbers; a ledger page that stays current |
+| **3** | structured `dx/<ns>/{problems,predictions}.ndjson` beside `crossref/` (hypotheses are already inference records); a scoring script (Brier, top-k); `gen` views of the ledger; episode facts with SOCRATES fields | 2–3 agent-days | calibration numbers; a ledger page that stays current |
 | **4** | a `saturn.dx_loop` task pack on `hl` (egress-locked, split literature fetch, budgets, `git_pr`) | 1–2 agent-weeks (shares agent-server phase 2 with ADR 012 L2) | runs without the owner's laptop; scheduled weekly full runs |
 | **5** | an offline evaluation of the prompts on public, synthetic or CPC-style held-out cases, to tune ensemble size and effort against cost | 3–5 agent-days | evidence that a prompt change helped, not just felt better |
 

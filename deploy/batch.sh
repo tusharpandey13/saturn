@@ -60,6 +60,9 @@ case "$step" in
     if [ "$built" = 0 ]; then
       python3 -I "$PRODUCT/tools/crossref/crossref" --records "$records" --digest "$DIGEST_FILE" \
         || echo "batch.sh: crossref failed; the digest goes out without its section" >&2
+      # Status pages from agent-inferred records (tools/inference): page generation only, no AI; never blocks.
+      python3 -I "$PRODUCT/tools/inference/inference" --records "$records" gen \
+        || echo "batch.sh: inference gen failed; status pages not refreshed" >&2
     fi
     commit "data: telegram batch $(stamp)" data/telegram data/queue docs/health crossref
     if [ "$built" != 0 ]; then echo "batch.sh: KB build or gen-views failed; extracted rows are committed" >&2; exit 1; fi

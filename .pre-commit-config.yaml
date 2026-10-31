@@ -49,6 +49,12 @@ repos:
         entry: python3 -I tools/crossref/test_crossref.py
         pass_filenames: false
         files: ^(tools/crossref/|tools/kb/records_config.py|schema/schema.sql)
+      - id: inference
+        name: inference records tool (synthetic fixtures)
+        language: system
+        entry: python3 -I tools/inference/test_inference.py
+        pass_filenames: false
+        files: ^(tools/inference/|tools/kb/records_config.py|schema/schema.sql)
       - id: no-binaries-outside-fixtures
         name: binary files only under fixtures/
         language: fail

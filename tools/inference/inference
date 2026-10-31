@@ -1,0 +1,535 @@
+#!/usr/bin/env -S python3 -I
+"""Agent-inferred records (inferences) for the diagnostic loop (ADR 013, docs/methods/diagnostic-loop.md step 8) and the
+generated Status page. Format and commands: tools/inference/README.md. Stdlib only; no LLM, no network.
+
+Records layout (all PHI, records repo only; outside data/ so the KB build never reads it):
+  inferences/<ns>/inferences.ndjson   append-only snapshots; the highest rev per id wins
+  docs/health/<ns>/status.md          generated page
+Exit 1 on any invalid row, unknown KB id, bad citation or word-list hit (the reason on stderr).
+"""
+import argparse, datetime, json, pathlib, re, sqlite3, sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "kb"))  # python3 -I drops the script dir; reuse the records.yaml loader
+import records_config  # noqa: E402
+
+SCHEMA = "inference/1"
+DISCLAIMER = "Facts as written; not advice; doctors decide."
+FOOT = "Not a diagnosis. Doctors decide."
+KINDS = ("hypothesis", "interpretation", "trend", "risk", "status-summary")
+STAKES = ("can't-miss", "quality-of-life", "housekeeping")
+STATUS = ("active", "superseded", "retired")
+REVIEWS = ("none", "accepted", "disputed")
+BUCKETS = (">50%", "20-50%", "5-20%", "<5%")
+TOOL_FIELDS = ("schema", "id", "rev", "status", "supersedes", "superseded_by", "status_reason", "review", "review_note",
+               "recorded_at", "label")
+INPUT_FIELDS = ("problem", "problem_title", "hypothesis", "kind", "statement", "p", "bucket", "reason", "stakes",
+                "evidence_for", "evidence_against", "citations", "would_change", "produced_by", "produced_at")
+ALL_FIELDS = set(TOOL_FIELDS) | set(INPUT_FIELDS)
+NS = r"[a-z][a-z0-9-]*"
+INF_ID = re.compile(rf"^({NS}):inf:\d{{4}}$")
+DX_ID = re.compile(rf"^({NS}):dx:\d{{4}}$")
+HYP_ID = re.compile(rf"^({NS}):dx:\d{{4}}\.h\d+$")
+KB_ID = re.compile(rf"^({NS}|ref):[a-z]+:\S+$")
+CITE = re.compile(r"^(doi:10\.\d{4,9}/\S+|pmid:\d{1,9}|arxiv:\d{4}\.\d{4,5}(v\d+)?|url:https://\S+)$")
+ISO_DT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)$")
+RUN_PATH = re.compile(r"^docs/log/analysis/[A-Za-z0-9._/-]+\.md$")
+# verdicts, reassurance and medicine instructions in the agent's voice (diagnostic-loop section 8, run prompt step 9)
+MEDS = r"(medicine|medication|dose|dosage|tablet|drug|pill|capsule|injection|insulin)"
+WORDS = [re.compile(x, re.I) for x in (
+    r"\byou should\b", r"\bsafe to\b", r"\brule[sd]? out\b", r"\bruling out\b", r"\bconfirm(s|ed)?\b",
+    r"\bcaused by\b", r"\bnothing to worry\b", r"\bno need to worry\b",
+    rf"\b(stop|start|reduce|increase|decrease|switch|double|halve|skip|taper|resume|discontinue)\w*\b[^.]{{0,40}}\b{MEDS}",
+    rf"\b{MEDS}\w*\b[^.]{{0,30}}\b(should|must|needs? to) be (stopped|started|reduced|increased|changed|switched)")]
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+STAKE_RANK = {s: i for i, s in enumerate(STAKES)}
+
+
+class InferenceError(Exception):
+    pass
+
+
+def now():
+    return datetime.datetime.now(IST).isoformat(timespec="seconds")
+
+
+def bucket_of(p):
+    return ">50%" if p > 0.5 else "20-50%" if p >= 0.2 else "5-20%" if p >= 0.05 else "<5%"
+
+
+# ------------------------------------------------------------------------------------------------------------ store
+def store_path(root, ns):
+    return root / "inferences" / ns / "inferences.ndjson"
+
+
+def read_rows(path):
+    rows = []
+    if path.exists():
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise InferenceError(f"{path}:{n}: bad JSON ({e.msg})")
+    return rows
+
+
+def current(rows, where):
+    """Highest rev per id; revs of one id must be 1, 2, 3... in file order."""
+    cur = {}
+    for r in rows:
+        rid, rev = r.get("id"), r.get("rev")
+        prev = cur.get(rid)
+        if not isinstance(rev, int) or rev != (prev["rev"] + 1 if prev else 1):
+            raise InferenceError(f"{where}: {rid}: rev {rev!r} does not follow {prev['rev'] if prev else 0}")
+        cur[rid] = r
+    return cur
+
+
+class Evidence:
+    """KB ids from data/kb.sqlite (fact, source, ref) and records-relative sources/ paths."""
+
+    def __init__(self, root, db):
+        self.root = root
+        self.db = pathlib.Path(db) if db else root / "data" / "kb.sqlite"
+        self._ids = None
+
+    def ids(self):
+        if self._ids is None:
+            if not self.db.exists():
+                raise InferenceError(f"{self.db} not found; run tools/kb/build --records {self.root} first")
+            con = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
+            self._ids = {r[0] for t in ("fact", "source", "ref") for r in con.execute(f"SELECT id FROM {t}")}
+            con.close()
+        return self._ids
+
+    def check(self, ref):
+        if not isinstance(ref, str) or not ref:
+            return "is not a string"
+        if ref.startswith("sources/"):
+            rel = ref.split("#", 1)[0]
+            if ".." in rel.split("/") or not (self.root / rel).exists():
+                return "is a sources/ path that does not exist"
+            return None
+        if not KB_ID.match(ref):
+            return "is neither a KB id nor a sources/ path"
+        return None if ref in self.ids() else "is not in the KB"
+
+
+def validate(r, ns, where, ev=None, root=None):
+    """Full check of one snapshot. ev=None skips the KB lookups (used when re-reading the store)."""
+    w = f"{where}: {r.get('id', '?')}"
+    extra = set(r) - ALL_FIELDS
+    if extra:
+        raise InferenceError(f"{w}: unknown field(s) {sorted(extra)}")
+    missing = ALL_FIELDS - set(r)
+    if missing:
+        raise InferenceError(f"{w}: missing field(s) {sorted(missing)}")
+    if r["schema"] != SCHEMA or r["label"] != "agent-inferred":
+        raise InferenceError(f"{w}: schema must be {SCHEMA} and label agent-inferred")
+    m = INF_ID.match(str(r["id"]))
+    if not m or m.group(1) != ns:
+        raise InferenceError(f"{w}: id must be {ns}:inf:NNNN")
+    if r["problem"] is not None:
+        m = DX_ID.match(str(r["problem"]))
+        if not m or m.group(1) != ns:
+            raise InferenceError(f"{w}: problem must be {ns}:dx:NNNN or null")
+        if not isinstance(r["problem_title"], str) or not r["problem_title"].strip():
+            raise InferenceError(f"{w}: problem_title is required with a problem")
+    elif r["problem_title"] is not None:
+        raise InferenceError(f"{w}: problem_title without a problem")
+    if r["hypothesis"] is not None:
+        m = HYP_ID.match(str(r["hypothesis"]))
+        if not m or m.group(1) != ns or not str(r["hypothesis"]).startswith(f"{r['problem']}."):
+            raise InferenceError(f"{w}: hypothesis must be <problem>.hK of this row's problem")
+    if r["kind"] not in KINDS:
+        raise InferenceError(f"{w}: kind must be one of {KINDS}")
+    if r["kind"] == "hypothesis" and r["problem"] is None:
+        raise InferenceError(f"{w}: a hypothesis needs a problem")
+    st = r["statement"]
+    if not isinstance(st, str) or not st.strip() or len(st) > 300 or "\n" in st:
+        raise InferenceError(f"{w}: statement must be one line of 1-300 characters")
+    for text in [st, r["reason"]] + list(r["would_change"] if isinstance(r["would_change"], list) else []):
+        for rx in WORDS:
+            hit = rx.search(text) if isinstance(text, str) else None
+            if hit:
+                raise InferenceError(f"{w}: word list: {hit.group(0)!r} reads as a verdict, reassurance or medicine "
+                                     "instruction; rephrase (medicine points are questions for the named doctor)")
+    p = r["p"]
+    if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 1:
+        raise InferenceError(f"{w}: p must be a number from 0 to 1")
+    if r["bucket"] != bucket_of(p):
+        raise InferenceError(f"{w}: bucket {r['bucket']!r} does not match p {p} (expected {bucket_of(p)!r})")
+    if not isinstance(r["reason"], str) or not r["reason"].strip() or "\n" in r["reason"]:
+        raise InferenceError(f"{w}: reason must be one line")
+    if r["stakes"] not in STAKES:
+        raise InferenceError(f"{w}: stakes must be one of {STAKES}")
+    for k in ("evidence_for", "evidence_against"):
+        if not isinstance(r[k], list):
+            raise InferenceError(f"{w}: {k} must be a list")
+    if not r["evidence_for"] and not r["evidence_against"]:
+        raise InferenceError(f"{w}: needs at least one evidence id (for or against)")
+    if ev is not None:
+        for k in ("evidence_for", "evidence_against"):
+            for ref in r[k]:
+                bad = ev.check(ref)
+                if bad:
+                    raise InferenceError(f"{w}: {k} {ref!r} {bad}")
+    if not isinstance(r["citations"], list):
+        raise InferenceError(f"{w}: citations must be a list")
+    for c in r["citations"]:
+        if not isinstance(c, dict) or set(c) != {"ref", "supports", "verified", "checked_at"}:
+            raise InferenceError(f"{w}: a citation is {{ref, supports, verified, checked_at}}")
+        if not CITE.match(str(c["ref"])):
+            raise InferenceError(f"{w}: citation ref {c['ref']!r} must be doi:10.x/..., pmid:N, arxiv:NNNN.NNNNN or "
+                                 "url:https://...")
+        if c["verified"] not in ("V", "P"):
+            raise InferenceError(f"{w}: citation {c['ref']}: verified must be V or P (drop unverified citations)")
+        if not isinstance(c["supports"], str) or not c["supports"].strip():
+            raise InferenceError(f"{w}: citation {c['ref']}: supports must say what it supports")
+        try:
+            datetime.date.fromisoformat(str(c["checked_at"]))
+        except ValueError:
+            raise InferenceError(f"{w}: citation {c['ref']}: checked_at must be YYYY-MM-DD")
+    wc = r["would_change"]
+    if not isinstance(wc, list) or not wc or not all(isinstance(x, str) and x.strip() for x in wc):
+        raise InferenceError(f"{w}: would_change must be a non-empty list of strings")
+    pb = r["produced_by"]
+    if not isinstance(pb, dict) or set(pb) != {"model", "run"} or not pb["model"] or not RUN_PATH.match(str(pb["run"])):
+        raise InferenceError(f"{w}: produced_by must be {{model, run}} with run docs/log/analysis/....md")
+    if root is not None and not (root / pb["run"]).exists():
+        raise InferenceError(f"{w}: produced_by.run {pb['run']} does not exist (write the run note first)")
+    for k in ("produced_at", "recorded_at"):
+        if not ISO_DT.match(str(r[k])):
+            raise InferenceError(f"{w}: {k} must be an ISO datetime with offset")
+    if r["status"] not in STATUS:
+        raise InferenceError(f"{w}: status must be one of {STATUS}")
+    if r["status"] == "superseded" and not INF_ID.match(str(r["superseded_by"])):
+        raise InferenceError(f"{w}: superseded needs superseded_by")
+    if r["status"] != "superseded" and r["superseded_by"] is not None:
+        raise InferenceError(f"{w}: superseded_by set on a {r['status']} row")
+    if r["status"] == "retired" and not (isinstance(r["status_reason"], str) and r["status_reason"].strip()):
+        raise InferenceError(f"{w}: retired needs status_reason")
+    if r["supersedes"] is not None and not INF_ID.match(str(r["supersedes"])):
+        raise InferenceError(f"{w}: supersedes must be an inference id")
+    if r["review"] not in REVIEWS:
+        raise InferenceError(f"{w}: review must be one of {REVIEWS}")
+
+
+def load(root, ns):
+    """Validate every line (shape only) and the snapshot chain; return (rows, current-by-id)."""
+    path = store_path(root, ns)
+    rows = read_rows(path)
+    where = str(path.relative_to(root))
+    for r in rows:
+        validate(r, ns, where)
+    cur = current(rows, where)
+    for rid, r in cur.items():
+        for k in ("supersedes", "superseded_by"):
+            if r[k] is not None and r[k] not in cur:
+                raise InferenceError(f"{where}: {rid}: {k} {r[k]} is not in this file")
+    return rows, cur
+
+
+def append(root, ns, new_rows):
+    path = store_path(root, ns)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    with path.open("a", encoding="utf-8") as fh:
+        if text and not text.endswith("\n"):
+            fh.write("\n")
+        for r in new_rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def ns_of(root, rid):
+    m = INF_ID.match(rid or "")
+    if not m:
+        raise InferenceError(f"{rid!r} is not an inference id <ns>:inf:NNNN")
+    check_ns(root, m.group(1))
+    return m.group(1)
+
+
+def check_ns(root, ns):
+    rc = records_config.load(root)
+    if ns not in rc["namespaces"]:
+        raise InferenceError(f"unknown namespace {ns!r} (records.yaml)")
+
+
+def read_input(src):
+    text = sys.stdin.read() if src == "-" else pathlib.Path(src).read_text(encoding="utf-8")
+    text = text.strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, list) else [obj]
+    except json.JSONDecodeError:
+        out = []
+        for n, line in enumerate(text.splitlines(), 1):
+            if line.strip():
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise InferenceError(f"input line {n}: bad JSON ({e.msg})")
+        return out
+
+
+def snapshot(old, **changes):
+    r = dict(old, **changes)
+    r["rev"] = old["rev"] + 1
+    r["recorded_at"] = now()
+    return r
+
+
+# --------------------------------------------------------------------------------------------------------- commands
+def cmd_add(a, root):
+    check_ns(root, a.ns)
+    _, cur = load(root, a.ns)
+    ev = Evidence(root, a.db)
+    items = read_input(a.file)
+    if not items:
+        raise InferenceError("add: no rows in the input")
+    nxt = max([int(i.rsplit(":", 1)[1]) for i in cur] + [0]) + 1
+    out = []
+    for n, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise InferenceError(f"input row {n}: not a JSON object")
+        bad = set(item) & set(TOOL_FIELDS)
+        if bad:
+            raise InferenceError(f"input row {n}: {sorted(bad)} are set by the tool")
+        unknown = set(item) - set(INPUT_FIELDS)
+        if unknown:
+            raise InferenceError(f"input row {n}: unknown field(s) {sorted(unknown)}")
+        row ={k: item.get(k) for k in INPUT_FIELDS}
+        for k in ("evidence_for", "evidence_against", "citations"):
+            row[k] = item.get(k, [])
+        row.update(schema=SCHEMA, id=f"{a.ns}:inf:{nxt:04d}", rev=1, status="active", supersedes=None,
+                   superseded_by=None, status_reason=None, review="none", review_note=None, recorded_at=now(),
+                   label="agent-inferred")
+        validate(row, a.ns, f"input row {n}", ev, root)
+        out.append(row)
+        nxt += 1
+    append(root, a.ns, out)
+    print("\n".join(r["id"] for r in out))
+    return 0
+
+
+def active_row(cur, rid, verb):
+    if rid not in cur:
+        raise InferenceError(f"{verb}: unknown inference {rid}")
+    if cur[rid]["status"] != "active":
+        raise InferenceError(f"{verb}: {rid} is {cur[rid]['status']}, not active")
+    return cur[rid]
+
+
+def cmd_supersede(a, root):
+    ns = ns_of(root, a.id)
+    _, cur = load(root, ns)
+    old = active_row(cur, a.id, "supersede")
+    items = read_input(a.file)
+    if len(items) != 1 or not isinstance(items[0], dict):
+        raise InferenceError("supersede: give exactly one JSON object with the changed fields")
+    bad = set(items[0]) & set(TOOL_FIELDS)
+    if bad:
+        raise InferenceError(f"supersede: {sorted(bad)} are set by the tool")
+    unknown = set(items[0]) - set(INPUT_FIELDS)
+    if unknown:
+        raise InferenceError(f"supersede: unknown field(s) {sorted(unknown)}")
+    if "produced_by" not in items[0] or "produced_at" not in items[0]:
+        raise InferenceError("supersede: produced_by and produced_at are required (the run that changed it)")
+    nid = f"{ns}:inf:{max(int(i.rsplit(':', 1)[1]) for i in cur) + 1:04d}"
+    new = {k: old[k] for k in INPUT_FIELDS}
+    new.update(items[0])
+    if "p" in items[0] and "bucket" not in items[0]:
+        new["bucket"] = bucket_of(new["p"]) if isinstance(new["p"], (int, float)) else None
+    new.update(schema=SCHEMA, id=nid, rev=1, status="active", supersedes=a.id, superseded_by=None, status_reason=None,
+               review="none", review_note=None, recorded_at=now(), label="agent-inferred")
+    validate(new, ns, "supersede", Evidence(root, a.db), root)
+    append(root, ns, [new, snapshot(old, status="superseded", superseded_by=nid)])
+    print(nid)
+    return 0
+
+
+def cmd_retire(a, root):
+    ns = ns_of(root, a.id)
+    _, cur = load(root, ns)
+    row = snapshot(active_row(cur, a.id, "retire"), status="retired", status_reason=a.reason)
+    validate(row, ns, "retire")
+    append(root, ns, [row])
+    print(f"ok: {a.id} retired")
+    return 0
+
+
+def cmd_review(a, root):
+    ns = ns_of(root, a.id)
+    _, cur = load(root, ns)
+    if a.id not in cur:
+        raise InferenceError(f"review: unknown inference {a.id}")
+    row = snapshot(cur[a.id], review=a.state, review_note=a.note)
+    validate(row, ns, "review")
+    append(root, ns, [row])
+    print(f"ok: {a.id} review {a.state}")
+    return 0
+
+
+def order(rows):
+    return sorted(rows, key=lambda r: (STAKE_RANK[r["stakes"]], -r["p"], r["id"]))
+
+
+def cmd_list(a, root):
+    check_ns(root, a.ns)
+    _, cur = load(root, a.ns)
+    rows = [r for r in cur.values() if r["status"] == "active" or not a.active]
+    rows = order(rows)
+    if a.json:
+        for r in rows:
+            print(json.dumps(r, ensure_ascii=False))
+    else:
+        for r in rows:
+            print(f"{r['id']}\t{r['status']}\t{r['bucket']}\t{r['p']}\t{r['problem'] or '-'}\t{r['statement']}")
+    return 0
+
+
+def pct(p):
+    return f"{round(p * 100)}%"
+
+
+def cmd_diff(a, root):
+    check_ns(root, a.ns)
+    rows, cur = load(root, a.ns)
+    first = {}
+    for r in rows:
+        first.setdefault(r["id"], r)
+    run = [first[i] for i in first if first[i]["produced_by"]["run"] == a.run]
+    retired = [r for r in rows if r["status"] == "retired" and r["rev"] > 1 and r["recorded_at"] >= min(
+        [x["recorded_at"] for x in run], default="9999")]
+    touched = {r["supersedes"] for r in run if r["supersedes"]} | {r["id"] for r in run} | {r["id"] for r in retired}
+    out = [f"Belief diff for {a.run} (agent-inferred; {FOOT})", "",
+           "| change | id | problem | statement | before | now |", "|---|---|---|---|---|---|"]
+    for r in order(run):
+        if r["supersedes"]:
+            o = first[r["supersedes"]]
+            moved = "moved" if o["bucket"] != r["bucket"] else "updated"
+            out.append(f"| {moved} | {r['id']} (was {o['id']}) | {r['problem'] or '-'} | {r['statement']} | "
+                       f"{o['bucket']} ({pct(o['p'])}) | {r['bucket']} ({pct(r['p'])}) |")
+        else:
+            out.append(f"| new | {r['id']} | {r['problem'] or '-'} | {r['statement']} | - | {r['bucket']} ({pct(r['p'])}) |")
+    for r in retired:
+        out.append(f"| retired | {r['id']} | {r['problem'] or '-'} | {r['statement']} | {r['bucket']} ({pct(r['p'])}) | "
+                   f"retired: {r['status_reason']} |")
+    for r in order([x for x in cur.values() if x["status"] == "active" and x["id"] not in touched]):
+        out.append(f"| unchanged | {r['id']} | {r['problem'] or '-'} | {r['statement']} | {r['bucket']} | {r['bucket']} |")
+    print("\n".join(out))
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------------------- page
+def esc(s):
+    return str(s).replace("|", "\\|")
+
+
+def ddmon(at):
+    p = (at or "")[:10].split("-")
+    mon = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+    return f"{p[2]}-{mon[int(p[1]) - 1]}-{p[0]}" if len(p) == 3 and all(x.isdigit() for x in p) else at
+
+
+def status_page(ns, display, cur):
+    act = [r for r in cur.values() if r["status"] == "active"]
+    b = [f"# Status: {display}", "", f"**{DISCLAIMER}**", "",
+         "_Generated by `tools/inference` from `inferences/" + ns + "/inferences.ndjson`. Don't edit this page; change an "
+         "item with the tool (supersede, retire, review)._", "",
+         "Every item below is **agent-inferred**: a reading of the records by an AI agent, with a probability, the "
+         "record ids it rests on and what would change it. It is not from a document and not a diagnosis. Questions "
+         "for the doctor are in [questions.md](questions.md).", ""]
+    if not act:
+        return b + ["No active inferences yet.", ""]
+    groups = {}
+    for r in act:
+        groups.setdefault(r["problem"], []).append(r)
+
+    def gkey(item):
+        k, rs = item
+        return (k is None, min(STAKE_RANK[r["stakes"]] for r in rs), -max(r["p"] for r in rs), k or "")
+
+    for pid, rs in sorted(groups.items(), key=gkey):
+        title = max(rs, key=lambda r: r["recorded_at"])["problem_title"] if pid else None
+        b += [f"## {esc(title)} ({pid})" if pid else "## Other inferences", ""]
+        for r in order(rs):
+            hyp = f" · {r['hypothesis']}" if r["hypothesis"] else ""
+            review = {"accepted": " · owner: accepted", "disputed": " · owner: **disputed**"}.get(r["review"], "")
+            b += [f"### {r['id']}: {r['kind']}, {r['stakes']}{hyp}", "",
+                  f"> **Agent-inferred · not from a document.** {r['statement']}", ">",
+                  f"> Probability: **{r['bucket']}** (about {pct(r['p'])}). {r['reason']}", ">"]
+            if r["evidence_for"]:
+                b.append("> Evidence for: " + ", ".join(f"`{e}`" for e in r["evidence_for"]) + "<br>")
+            if r["evidence_against"]:
+                b.append("> Evidence against: " + ", ".join(f"`{e}`" for e in r["evidence_against"]) + "<br>")
+            if r["citations"]:
+                b.append("> Literature: " + "; ".join(f"{c['ref']} ({c['supports']}; {c['verified']})"
+                                                       for c in r["citations"]) + "<br>")
+            b.append("> What would change it: " + " ".join(r["would_change"]))
+            b += [">", f"> _{r['produced_by']['model']}, {ddmon(r['produced_at'])}, "
+                       f"[run note](../../../{r['produced_by']['run']}){review}"
+                       + (f" (was {r['supersedes']})" if r["supersedes"] else "") + f". {FOOT}_", ""]
+    return b
+
+
+def front(title, srcs, today):
+    return ["---", f'title: "{title}"', "audience: family, doctor", "type: generated", "owner: tools/inference",
+            f"last_reviewed: {today}", "review_every: 30d", "status: active", f"sources: [{', '.join(srcs)}]",
+            "generated: true", "---", ""]
+
+
+def cmd_gen(a, root):
+    rc = records_config.load(root)
+    stale = []
+    for ns in rc["namespaces"]:
+        if not store_path(root, ns).exists():
+            continue
+        hdir = root / "docs" / "health" / ns
+        if not hdir.is_dir():
+            raise InferenceError(f"gen: docs/health/{ns}/ does not exist")
+        _, cur = load(root, ns)
+        body = "\n".join(status_page(ns, rc["display"].get(ns, ns), cur)).rstrip() + "\n"
+        page = hdir / "status.md"
+        old = page.read_text(encoding="utf-8") if page.exists() else ""
+        old_body = old.split("\n---\n", 1)[1].lstrip("\n") if old.startswith("---\n") and "\n---\n" in old else None
+        if old_body == body:
+            continue
+        stale.append(str(page.relative_to(root)))
+        if not a.check:
+            text = "\n".join(front(f"Status ({ns})", [f"inferences/{ns}/inferences.ndjson"],
+                                   datetime.date.today().isoformat())) + "\n" + body
+            page.write_text(text, encoding="utf-8")
+    if a.check and stale:
+        raise InferenceError("stale status page(s): " + ", ".join(stale) + "; run tools/inference/inference gen")
+    print(f"inference: {len(stale)} status page(s) {'stale' if a.check else 'written'}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--records", required=True)
+    ap.add_argument("--db", help="KB sqlite (default <records>/data/kb.sqlite)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("add"); s.add_argument("ns"); s.add_argument("file"); s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("supersede"); s.add_argument("id"); s.add_argument("file"); s.set_defaults(fn=cmd_supersede)
+    s = sub.add_parser("retire"); s.add_argument("id"); s.add_argument("--reason", required=True)
+    s.set_defaults(fn=cmd_retire)
+    s = sub.add_parser("review"); s.add_argument("id"); s.add_argument("state", choices=REVIEWS)
+    s.add_argument("--note"); s.set_defaults(fn=cmd_review)
+    s = sub.add_parser("list"); s.add_argument("ns"); s.add_argument("--active", action="store_true")
+    s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("diff"); s.add_argument("ns"); s.add_argument("--run", required=True); s.set_defaults(fn=cmd_diff)
+    s = sub.add_parser("gen"); s.add_argument("--check", action="store_true"); s.set_defaults(fn=cmd_gen)
+    a = ap.parse_args(argv)
+    root = pathlib.Path(a.records).resolve()
+    try:
+        return a.fn(a, root)
+    except (InferenceError, records_config.RecordsError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
