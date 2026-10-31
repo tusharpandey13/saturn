@@ -14,6 +14,14 @@ generated: false
 
 Work the owner has parked. Not scheduled. Pick up only when the owner un-parks an item. Newest first.
 
+## Transcription follow-ups (parked 31-Oct-2026)
+
+- Retire Sarvam fully (adapter, token inventory, secret name) now that STT is local whisper.cpp.
+- Faster STT if notes get long or frequent: run whisper on the home server as a turbo task (or the Mac when awake)
+  instead of the GitHub runner (currently ~5–6x slower than real time, job timeout 75 min).
+- After the ground-truth clip: evaluate whisper large-v3 (non-turbo), turbo, and Indic models (e.g. AI4Bharat
+  IndicConformer, Meta MMS) on WER/CER and medicine-name accuracy; pick by measured quality.
+
 ## Dependency, package and model upgrades (parked 31-Oct-2026)
 
 Goal: keep packages, NixOS inputs and local models current, with a cheap automatic path and a rarer agentic path.
