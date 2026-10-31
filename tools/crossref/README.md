@@ -30,7 +30,9 @@ Stdout carries counts only.
 | `baseline-shift-{sbp,dbp,pulse,weight}-home` | `baseline_shift` | active | 2 of the last 3 home daily values (`home_series.py`) on one side of the person's own band: median ± 3 × max(1.4826 × MAD, `min_spread`) of the 28-day window minus those 3 days; nothing below 7 baseline days | routine |
 
 Facts with an open hard read (`uncertain_ref`) or tagged `low-confidence` never carry a flag alone; they stay in the
-needs-human queue. Red-flag thresholds (`config/thresholds.yaml`) are not routed here and are never suppressed.
+needs-human queue. Device-screen summaries and partly legible screens (tags `device-average`, `device-memory`,
+`device-type-unknown`, `partial-reading`, `uncertain`; set by `tools/kb/build`) are left out of the home daily series,
+the baselines and every flag. Red-flag thresholds (`config/thresholds.yaml`) are not routed here and are never suppressed.
 
 ## Running profile (health profile iteration 1)
 Design: [health-profile](../../docs/design/health-profile.md) (section 5.1, as built). `home_series.py` builds

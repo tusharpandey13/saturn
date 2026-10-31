@@ -12,12 +12,12 @@ import { PRODUCT_NAME } from "../product.js";
 import { parseUpdate, type ParsedMessage, type TelegramAdapter } from "../channel/telegram.js";
 import type { ThresholdsConfig } from "../config/thresholds.js";
 import { type ExtractInput, type Extractor, ExtractorStopError } from "../extract/adapter.js";
-import { type Extraction, parseExtraction } from "../extract/schema.js";
+import { type Extraction, isDeviceSummary, parseExtraction } from "../extract/schema.js";
 import { readingEn } from "../replies.js";
 import { evaluate } from "../rules/engine.js";
 import type { Store } from "../store.js";
 import { SARVAM_REST_MAX_SEC, SttJobFailedError } from "../../../adapters/stt/sarvam.js";
-import { HEALTH_MEDIA_KINDS, IMAGE_CLASS, type Media, type Person, type Reading, type SpeechToText, type Symptom, type Transcript } from "../types.js";
+import { HEALTH_MEDIA_KINDS, IMAGE_CLASS, type Media, type PartialReading, type Person, type Reading, type SpeechToText, type Symptom, type Transcript } from "../types.js";
 import { parseVitals } from "../vitals.js";
 import { buildDigest, type DigestEntry, PRIVATE_NOTE, STT_PENDING_NOTE } from "./digest.js";
 import { CONTEXT_DAILY_CAP, contextEligible, type ContextMode, type ContextSignal, isPrivate, parseContext } from "../extract/context.js";
@@ -413,16 +413,18 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     if (mode === "shadow" && context?.length)
       entry.context = context.map((c) => `${nameOf(c.subject)}: ${c.category.replace(/_/g, " ")}${c.intensity ? `, ${c.intensity}` : ""}: ${c.summary}${c.confidence === "low" ? " (low confidence)" : ""}`);
     entry.readings = [...ex.readings, ...(ex.reportReadings ?? [])];
+    const partials = ex.partials ?? [];
+    if (partials.length) entry.notes = [...(entry.notes ?? []), ...partials.map((p) => `${readingEn(p)}; legible parts kept as uncertain`)];
     entry.symptoms = ex.symptoms;
     if (ex.report) {
       const n = ex.report.items.filter((i) => i.section === "result").length;
       const text = ex.report.items.filter((i) => i.section !== "result").map((i) => i.section);
-      entry.notes = [`${ex.report.type} report: ${n} value(s)${text.length ? ` + ${text.join(" and ")}` : ""} recorded${ex.report.sampleAt ? ` (sample ${ex.report.sampleAt.slice(0, 10)})` : " (no sample date printed)"}`];
+      entry.notes = [...(entry.notes ?? []), `${ex.report.type} report: ${n} value(s)${text.length ? ` + ${text.join(" and ")}` : ""} recorded${ex.report.sampleAt ? ` (sample ${ex.report.sampleAt.slice(0, 10)})` : " (no sample date printed)"}`];
     }
 
     // Questions for the admin and work for the offline Opus agent (needs_deep). Never ask anyone to retype values.
     const reasons: string[] = [];
-    const nothing = !ex.readings.length && !ex.symptoms.length;
+    const nothing = !ex.readings.length && !ex.symptoms.length && !partials.length;
     const media = msg.kind === "image" || msg.kind === "document";
     if (media && ex.mediaKind) base.image_class = IMAGE_CLASS[ex.mediaKind];
     const docKind = ex.mediaKind && ["prescription", "report", "medicine"].includes(ex.mediaKind) ? ex.mediaKind : null;
@@ -442,6 +444,19 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       const what = ex.outOfRange.map((o) => (o.type === "bp" ? `BP ${o.value}` : readingEn({ type: o.type, value: o.value, value2: null, value3: null, unit: "", measuredAt: msg.ts }))).join(", ");
       entry.questions.push(`${what ? `"${what}"` : "a value"} looks implausible and was not recorded; kept for a closer read. Reply if you know the right value.`);
     }
+    const unclear = ex.readings.filter((r) => r.kind === "unknown");
+    if (unclear.length) {
+      // A memory/average indicator whose meaning the model could not tell: stored, kept out of rules and the daily
+      // series (KB tag device-type-unknown + needs-human) until a human says which it is.
+      reasons.push("reading_type_unknown");
+      entry.questions.push(`screen shows "${unclear[0].indicator}": a new single reading, or the device's stored average/memory? Kept out of the daily series until checked.`);
+    }
+    const legibility = [...partials, ...ex.readings.filter((r) => r.missing)];
+    if (legibility.length) {
+      // Partly legible screen: legible parts stored (tagged uncertain), the missing part goes to the deep read.
+      reasons.push("partial_reading");
+      entry.questions.push(`photo partly legible (${[...new Set(legibility.flatMap((r) => Object.keys(r.missing ?? {})))].join(", ")} not readable); the legible parts are kept as uncertain. Reply if you know what it shows.`);
+    }
     if (hint) {
       // Records stay with the sender (never auto-reassigned); a human checks who the message is about (admin: /for <name>).
       reasons.push("subject_hint");
@@ -458,10 +473,11 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
 
     // Red-flag rules: digest annotations only (ADR 005).
     const weights = [...history, ...out]
-      .filter((r) => r.rt === "d1.readings" && r.type === "weight" && r.person_id === subject.id && r.source_message_id !== msg.key && r.confirmed !== -1)
+      .filter((r) => r.rt === "d1.readings" && r.type === "weight" && r.person_id === subject.id && r.source_message_id !== msg.key && r.confirmed !== -1 && !r.reading_kind)
       .map((r) => ({ type: "weight", value: r.value, value2: null, value3: null, unit: "kg", measuredAt: r.measured_at }) as Reading)
       .filter((r) => Date.parse(r.measuredAt) >= Date.parse(msg.ts) - 8 * DAY);
-    entry.annotations = evaluate({ readings: [...ex.readings, ...(ex.reportReadings ?? [])], symptoms: ex.symptoms, weightHistory: weights, thresholds: d.thresholds, timeZone: tz });
+    // Device averages / memory recalls / unclear indicators are not one measurement: no red-flag thresholds on them.
+    entry.annotations = evaluate({ readings: [...ex.readings.filter((r) => !isDeviceSummary(r)), ...(ex.reportReadings ?? [])], symptoms: ex.symptoms, weightHistory: weights, thresholds: d.thresholds, timeZone: tz });
     if (entry.readings.length || ex.symptoms.length || entry.questions.length || entry.deep || entry.context?.length || entry.notes?.length) entries.push(entry);
   }
 
@@ -508,9 +524,14 @@ function recordRows(messageId: string, personId: string, ex: Extraction, by: str
   const common = { person_id: personId, source_message_id: messageId, confidence: ex.confidence, confirmed: 0, extracted_by: by, extracted_at: at };
   const json = (v: unknown) => JSON.stringify(v);
   return [
-    ...ex.readings.map((r, i) => ({
+    // Partly legible BP screens follow the complete readings (value or value2 null: never filled in).
+    ...[...ex.readings, ...(ex.partials ?? [])].map((r: Reading | PartialReading, i) => ({
       rt: "d1.readings", id: `${messageId}:r${i}`, type: r.type, value: r.value, value2: r.value2, value3: r.value3, unit: r.unit,
-      measured_at: r.measuredAt, source_value: r.sourceValue ?? null, source_unit: r.sourceUnit ?? null, ...common,
+      measured_at: r.measuredAt, source_value: r.sourceValue ?? null, source_unit: r.sourceUnit ?? null,
+      // Device screen type and per-component legibility (tools/kb/build tags them; absent = a plain, legible reading).
+      ...(r.kind && { reading_kind: r.kind }), ...(r.indicator && { indicator: r.indicator }), ...(r.window && { window: r.window }),
+      ...(r.missing && { missing: json(r.missing) }), ...(r.uncertain && { uncertain: json(r.uncertain) }),
+      ...common,
     })),
     // A report's printed values, ranges, flags, findings and impression (tools/kb/build -> observation facts at the
     // sample time, tagged document). Report meta (facility, doctors, dates) also stays in the message's extraction_json.

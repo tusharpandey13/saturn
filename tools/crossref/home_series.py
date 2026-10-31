@@ -19,7 +19,10 @@ DEFAULTS = {
     "problem_signals": {},  # {ns: {condition fact id: [series]}} (owner-set, design D3)
     "links": {},  # {ns: [records-relative paths of analysis notes]} (owner-tagged)
 }
-SKIP_TAGS = ("low-confidence",)
+# Not one home measurement, or not settled: device averages / memory recalls / unclear indicators and partly legible
+# screens (tools/kb/build _reading_tags) never enter the daily series or the baseline.
+DEVICE_SKIP_TAGS = ("device-average", "device-memory", "device-type-unknown", "partial-reading", "uncertain")
+SKIP_TAGS = ("low-confidence",) + DEVICE_SKIP_TAGS
 MED = r"(?:morning\s+)?(?:medicines?|meds|tablets?|pills?|dawa|dawai|davai|dawaai|goli|goliyan|golis)"
 BEFORE = re.compile(rf"\b(?:before\s+(?:\w+\s+){{0,2}}?{MED}|{MED}\s+(?:\w+\s+){{0,2}}?(?:pehle|pahle|se\s+pehle))\b", re.I)
 AFTER = re.compile(rf"\b(?:after\s+(?:\w+\s+){{0,2}}?{MED}|{MED}\s+(?:\w+\s+){{0,2}}?(?:baad|bad|ke\s+baad))\b", re.I)

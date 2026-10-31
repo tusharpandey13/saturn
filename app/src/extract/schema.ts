@@ -3,8 +3,8 @@
 // plausibility checks. Nothing from the LLM reaches the database without passing through here.
 
 import { z } from "zod";
-import { MEDIA_KINDS, SIDES, SYMPTOM_TYPES } from "../types.js";
-import type { MediaKind, Reading, ReadingType, Side, Symptom, SymptomType } from "../types.js";
+import { BP_COMPONENTS, MEDIA_KINDS, READING_KINDS, SIDES, SYMPTOM_TYPES } from "../types.js";
+import type { BpComponent, MediaKind, PartialReading, Reading, ReadingKind, ReadingType, Side, Symptom, SymptomType } from "../types.js";
 import { ContextItem } from "./context.js";
 
 export const REPORT_TYPES = ["lab", "imaging", "discharge", "other"] as const;
@@ -12,6 +12,10 @@ const READING_TYPES = [
   "weight", "bp", "pulse", "spo2", "potassium", "sodium", "creatinine", "glucose_fasting", "glucose_pp", "glucose_random",
 ] as const satisfies readonly ReadingType[];
 const str = (description?: string) => (description ? z.string().describe(description) : z.string());
+const component = (what: string) => z.strictObject({
+  confidence: z.number().describe(`0-1 confidence in the ${what} as read`),
+  illegible_reason: z.string().nullable().describe(`why the ${what} cannot be read (cropped, glare, blur), only when it is on the screen but illegible; else null`),
+});
 const strs = (description?: string) => (description ? z.array(z.string()).describe(description) : z.array(z.string()));
 
 /** The extraction contract (Zod 4). Strict: every property required (nullable where optional), no extras. */
@@ -21,11 +25,19 @@ export const ExtractionOutput = z.strictObject({
   ),
   readings: z.array(z.strictObject({
     type: z.enum(READING_TYPES),
-    value: z.number().describe("weight kg | systolic | bpm | SpO2 % | lab value | blood sugar"),
+    value: z.number().nullable().describe("weight kg | systolic | bpm | SpO2 % | lab value | blood sugar; null ONLY for a BP systolic that is illegible"),
     value2: z.number().nullable().describe("diastolic for bp, else null"),
     value3: z.number().nullable().describe("pulse shown on a BP monitor, else null"),
     unit: z.string(),
     measured_at: z.string().nullable().describe("ISO-8601 if shown on the device/report, else null"),
+    reading_kind: z.enum(READING_KINDS).describe(
+      "device screen type: single = one measurement; average = the device's stored average (AVG, Ave, AVG AM/PM, average icon); memory-recall = a stored earlier reading shown from memory (M, MEM, memory index like M 3/30); unknown = an indicator is shown but its meaning is unclear",
+    ),
+    indicator: z.string().nullable().describe("the memory/average indicator text or icon exactly as seen (\"AVG AM\", \"M 3/30\", \"average icon\"); null if none"),
+    window: z.string().nullable().describe("count or window of the average/memory if printed (\"3 readings\", \"7 days\", \"3/30\"); else null"),
+    components: z.strictObject({
+      systolic: component("systolic"), diastolic: component("diastolic"), pulse: component("pulse"), time: component("clock time"),
+    }).nullable().describe("BP monitor screens only: per-component confidence; else null"),
   })),
   symptoms: z.array(z.strictObject({
     symptom_type: z.enum(SYMPTOM_TYPES),
@@ -91,6 +103,8 @@ const DIA_RANGE: [number, number] = [30, 150];
 
 export interface Extraction {
   readings: Reading[];
+  /** BP screens with systolic or diastolic illegible: legible parts only (never invented). */
+  partials?: PartialReading[];
   symptoms: Symptom[];
   confidence: number;
   /** What a photo/PDF shows (null for text/voice or when not reported). */
@@ -163,17 +177,49 @@ function canonical(type: ReadingType, value: number, unitRaw: unknown): { value:
 }
 
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+/** Same bar as LOW_CONFIDENCE in the batch and v_needs_human. */
+const COMPONENT_LOW = 0.8;
+
+/** A device average, memory recall or an unclear indicator: kept as a fact, tagged, but never fed to the red-flag
+ *  rules or the home daily series (one stored average is not one measurement). */
+export const isDeviceSummary = (r: { kind?: ReadingKind }): boolean => r.kind === "average" || r.kind === "memory-recall" || r.kind === "unknown";
+
+/** reading_kind / indicator / window: only what differs from a plain single reading. */
+function deviceMeta(r: any): Pick<Reading, "kind" | "indicator" | "window"> {
+  const indicator = nstr(r?.indicator, 60);
+  const window = nstr(r?.window, 60);
+  let kind: ReadingKind = READING_KINDS.includes(r?.reading_kind) ? r.reading_kind : "single";
+  if (kind === "unknown" && !indicator) kind = "single"; // nothing seen: a plain reading
+  return { ...(kind !== "single" && { kind }), ...(indicator !== null && { indicator }), ...(window !== null && { window }) };
+}
+
+/** BP per-component legibility: illegible components (with a reason) and legible ones read with low confidence. */
+function bpLegibility(r: any): { missing: Partial<Record<BpComponent, string>>; uncertain: BpComponent[] } {
+  const c = r?.components && typeof r.components === "object" ? r.components : {};
+  const missing: Partial<Record<BpComponent, string>> = {};
+  const uncertain: BpComponent[] = [];
+  for (const k of BP_COMPONENTS) {
+    const reason = nstr(c[k]?.illegible_reason, 120);
+    if (reason) missing[k] = reason;
+    else if (isNum(c[k]?.confidence) && c[k].confidence < COMPONENT_LOW) uncertain.push(k);
+  }
+  if (!isNum(r?.value) && !missing.systolic) missing.systolic = "not legible";
+  if (!isNum(r?.value2) && !missing.diastolic) missing.diastolic = "not legible";
+  return { missing, uncertain };
+}
 const inRange = (v: number, [lo, hi]: [number, number]) => v >= lo && v <= hi;
 const strArr = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
 
-function parseReading(r: any, now: string, rejected: string[], outOfRange: Extraction["outOfRange"]): Reading | null {
+function parseReading(r: any, now: string, rejected: string[], outOfRange: Extraction["outOfRange"]): Reading | PartialReading | null {
+  const bp = r?.type === "bp" ? bpLegibility(r) : null;
+  if (bp && (bp.missing.systolic || bp.missing.diastolic)) return parsePartialBp(r, now, rejected, bp.missing, bp.uncertain);
   if (!r || !isReadingType(r.type) || !isNum(r.value)) {
     rejected.push(`malformed reading: ${JSON.stringify(r)}`);
     return null;
   }
   const type = r.type as ReadingType;
   const value2 = isNum(r.value2) ? r.value2 : null;
-  const value3 = isNum(r.value3) ? r.value3 : null;
+  const value3 = isNum(r.value3) && !bp?.missing.pulse ? r.value3 : null;
   const c = canonical(type, r.value, r.unit);
   if (!c) {
     rejected.push(`${type}: unknown unit ${JSON.stringify(r.unit)}`);
@@ -196,10 +242,40 @@ function parseReading(r: any, now: string, rejected: string[], outOfRange: Extra
   }
   return {
     type, value: c.value, value2: type === "bp" ? value2 : null, value3: type === "bp" ? value3 : null, unit: c.unit,
-    measuredAt: normaliseMeasuredAt(r.measured_at, now),
+    measuredAt: bp?.missing.time ? now : normaliseMeasuredAt(r.measured_at, now),
     ...(c.sourceUnit && { sourceValue: c.sourceValue, sourceUnit: c.sourceUnit }),
+    ...deviceMeta(r),
+    ...(bp && bp.uncertain.length > 0 && { uncertain: bp.uncertain }),
+    ...(bp && Object.keys(bp.missing).length > 0 && { missing: bp.missing }),
   };
 }
+
+/** A BP screen with systolic or diastolic illegible: keep the legible, plausible components; the rest stay null. */
+function parsePartialBp(r: any, now: string, rejected: string[], missing: Partial<Record<BpComponent, string>>, uncertain: BpComponent[]): PartialReading | null {
+  const val = (k: BpComponent, v: unknown, range: [number, number]) => {
+    if (missing[k] || !isNum(v)) return null;
+    if (inRange(v, range)) return v;
+    missing[k] = `implausible value ${v}`;
+    return null;
+  };
+  const value = val("systolic", r.value, PLAUSIBLE.bp);
+  const value2 = val("diastolic", r.value2, DIA_RANGE);
+  const value3 = val("pulse", r.value3, PLAUSIBLE.pulse);
+  if (value === null && value2 === null && value3 === null) {
+    rejected.push("bp: no legible component");
+    return null;
+  }
+  if (value !== null && value2 !== null && value <= value2) {
+    rejected.push(`bp ${value}/${value2} implausible`);
+    return null;
+  }
+  return {
+    type: "bp", value, value2, value3, unit: "mmHg", measuredAt: missing.time ? now : normaliseMeasuredAt(r.measured_at, now),
+    missing, ...(uncertain.length > 0 && { uncertain }), ...deviceMeta(r),
+  };
+}
+
+const isPartial = (r: Reading | PartialReading): r is PartialReading => r.value === null || (r.type === "bp" && r.value2 === null);
 
 function parseSymptom(s: any, now: string, rejected: string[]): Symptom | null {
   if (!s || !SYMPTOM_TYPES.includes(s.symptom_type)) {
@@ -293,7 +369,9 @@ export function parseExtraction(raw: unknown, now: string): Extraction {
   }
   if (!obj || typeof obj !== "object") obj = {};
   const outOfRange: Extraction["outOfRange"] = [];
-  const readings = (Array.isArray(obj.readings) ? obj.readings : []).map((r: any) => parseReading(r, now, rejected, outOfRange)).filter(Boolean) as Reading[];
+  const parsed = (Array.isArray(obj.readings) ? obj.readings : []).map((r: any) => parseReading(r, now, rejected, outOfRange)).filter(Boolean) as (Reading | PartialReading)[];
+  const readings = parsed.filter((r) => !isPartial(r)) as Reading[];
+  const partials = parsed.filter(isPartial);
   const symptoms = (Array.isArray(obj.symptoms) ? obj.symptoms : []).map((s: any) => parseSymptom(s, now, rejected)).filter(Boolean) as Symptom[];
   const confidence = isNum(obj.confidence) ? Math.min(1, Math.max(0, obj.confidence)) : 0;
   const unreadableReason = typeof obj.unreadable_reason === "string" ? obj.unreadable_reason : null;
@@ -305,5 +383,5 @@ export function parseExtraction(raw: unknown, now: string): Extraction {
   const hint = typeof obj.subject_hint === "string" ? obj.subject_hint.trim().slice(0, 80) : "";
   const subjectHint = hint && !/^(null|none|self|sender)$/i.test(hint) ? hint : null;
   const { report, readings: reportReadings } = parseReport(obj.report, now);
-  return { readings, symptoms, confidence, mediaKind, unreadableReason, subjectHint, rejected, outOfRange, report, reportReadings };
+  return { readings, ...(partials.length > 0 && { partials }), symptoms, confidence, mediaKind, unreadableReason, subjectHint, rejected, outOfRange, report, reportReadings };
 }

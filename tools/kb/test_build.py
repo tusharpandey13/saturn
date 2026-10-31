@@ -325,6 +325,60 @@ class ReportTest(unittest.TestCase):
         self.assertFalse(any(".-100.9." in f for f in facts))
 
 
+class DeviceScreenTest(unittest.TestCase):
+    """d1.readings with a device screen type (average / memory recall / unclear indicator) or per-component legibility
+    (app/src/extract/schema.ts): tagged, kept out of the home series, needs-human where a human must settle it."""
+
+    def test_device_types_and_partial_readings(self):
+        T = "2026-10-31T15:30:00.000Z"
+        rows, n = [], 20
+        for kind, extra in (
+                ("average", {"value": 142, "value2": 88, "value3": 76, "reading_kind": "average", "indicator": "AVG AM",
+                             "window": "7 days"}),
+                ("memory", {"value": 118, "value2": 74, "value3": None, "reading_kind": "memory-recall", "indicator": "M 3/30"}),
+                ("unknown", {"value": 125, "value2": 80, "value3": None, "reading_kind": "unknown", "indicator": "M"}),
+                ("partial", {"value": None, "value2": 72, "value3": 81, "missing": json.dumps({"systolic": "cropped at top"}),
+                             "uncertain": json.dumps(["diastolic"])}),
+                ("single", {"value": 130, "value2": 84, "value3": 70})):
+            n += 1
+            rows += [{"rt": "d1.messages", "id": f"-100:{n}", "person_id": "alice", "chat_id": "-100", "kind": "image",
+                      "received_at": "2026-10-31T03:00:00.000Z", "raw_text": None, "extraction_status": "ok", "media_ref": None,
+                      "extraction_json": None, "extracted_by": "claude-haiku-5-5", "extracted_at": T},
+                     {"rt": "d1.readings", "id": f"-100:{n}:r0", "source_message_id": f"-100:{n}", "person_id": "alice",
+                      "type": "bp", "unit": "mmHg", "measured_at": "2026-10-31T08:30:00+05:30", "source_value": None,
+                      "source_unit": None, "confidence": 0.9, "confirmed": 0, "extracted_by": "claude-haiku-5-5",
+                      "extracted_at": T, **extra}]
+        with tempfile.TemporaryDirectory() as tmp:
+            tg = pathlib.Path(tmp) / "telegram"
+            tg.mkdir()
+            (tg / "2026-10.ndjson").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            db = pathlib.Path(tmp) / "kb.sqlite"
+            out = build("--records", str(RECORDS), "--telegram", str(tg), "--db", str(db))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            con = sqlite3.connect(db)
+            facts = {r[0].split("-tg.-100.")[1]: (json.loads(r[1]), json.loads(r[2])) for r in con.execute(
+                "SELECT id, data, tags FROM fact WHERE id LIKE 'alice:fact:2026-10-31-tg.-100.%'")}
+            nh = dict(con.execute("SELECT id, reason FROM v_needs_human WHERE id LIKE 'alice:fact:2026-10-31-tg.-100.%'").fetchall())
+            con.close()
+        avg = facts["21.r0"]
+        self.assertEqual(avg[1], ["document", "device-average"])
+        self.assertEqual(avg[0]["components"], {"systolic": 142, "diastolic": 88, "reading_type": "average",
+                                                "indicator": "AVG AM", "window": "7 days"})
+        self.assertEqual(facts["21.r0.pulse"][1], ["document", "device-average"])  # the pulse on that screen too
+        self.assertEqual(facts["22.r0"][1], ["document", "device-memory"])
+        self.assertEqual(facts["23.r0"][1], ["document", "device-type-unknown", "needs-human"])
+        part = facts["24.r0"]
+        self.assertEqual(part[1], ["document", "partial-reading", "uncertain", "needs-human"])
+        self.assertNotIn("value_num", part[0])  # the illegible systolic is never filled in
+        self.assertEqual(part[0]["value_text"], "?/72")
+        self.assertEqual(part[0]["components"], {"systolic": None, "diastolic": 72, "illegible": {"systolic": "cropped at top"},
+                                                 "uncertain": ["diastolic"]})
+        self.assertEqual(facts["24.r0.pulse"][0]["value_num"], 81)
+        self.assertEqual(facts["25.r0"][1], ["document"])
+        self.assertEqual((nh["alice:fact:2026-10-31-tg.-100.23.r0"], nh["alice:fact:2026-10-31-tg.-100.24.r0"],
+                          nh["alice:fact:2026-10-31-tg.-100.21.r0"]), ("needs-human", "needs-human", "alert-input"))
+
+
 class HandledManuallyTest(unittest.TestCase):
     """data/telegram/handled-manually.ndjson: replaced_by / duplicate_of messages keep their source, lose their facts."""
     T = "2026-10-30T07:00:00.000Z"

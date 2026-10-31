@@ -170,6 +170,24 @@ def _envelope(row, msg, quote, ns, src_id):
     }
 
 
+def _reading_tags(r):
+    """Device screen type and legibility of a d1.readings row (app/src/extract/schema.ts). Averages, memory recalls and
+    unclear indicators are kept out of the home daily series, baselines and flags (tools/crossref SKIP_TAGS); an unclear
+    indicator or an illegible component is queued for a human (v_needs_human reason needs-human)."""
+    kind, tags = r.get("reading_kind"), []
+    if kind == "average":
+        tags.append("device-average")
+    elif kind == "memory-recall":
+        tags.append("device-memory")
+    elif kind == "unknown":
+        tags += ["device-type-unknown", "needs-human"]
+    if r.get("missing"):
+        tags += ["partial-reading", "uncertain", "needs-human"]
+    elif r.get("uncertain"):
+        tags.append("uncertain")
+    return list(dict.fromkeys(tags))
+
+
 def _reporter(msg):
     """KB ns of the member who sent a message about someone else (subject attribution, ADR 009), else None."""
     sender = (msg or {}).get("sender_person_id")
@@ -334,12 +352,22 @@ def telegram_records(rows, root, codes=None, handled=None):
                 code, cat, unit = D1_READING[r["type"]]
                 at = ist(r["measured_at"])
                 env = _envelope(r, msg, said, ns, sid)
+                env["tags"] += _reading_tags(r)
                 data = {"code": f"ref:code:{code}", "category": cat, "value_num": r["value"], "unit": unit,
                         "value_raw": None if r.get("source_value") is None else str(r["source_value"]),
                         "unit_raw": r.get("source_unit") or r["unit"],
                         "method": "home glucometer" if code.startswith("glucose") else None}
+                device = {k: r[f] for k, f in (("reading_type", "reading_kind"), ("indicator", "indicator"),
+                                                ("window", "window")) if r.get(f)}
+                legibility = {k: _jl(r[k]) for k in ("missing", "uncertain") if r.get(k)}
                 if code == "bp":
-                    data["components"] = {"systolic": r["value"], "diastolic": r.get("value2")}
+                    data["components"] = {"systolic": r["value"], "diastolic": r.get("value2"), **device,
+                                          **({"illegible": legibility["missing"]} if "missing" in legibility else {}),
+                                          **({"uncertain": legibility["uncertain"]} if "uncertain" in legibility else {})}
+                    if r["value"] is None:  # systolic illegible: never filled in; the legible parts as written
+                        data["value_text"] = f"?/{r['value2'] if r.get('value2') is not None else '?'}"
+                elif device:
+                    data["components"] = device
                 fid = f"{ns}:fact:{tg_local(r['measured_at'], r['id'])}"
                 out.append((where, "fact", {"id": fid, "kind": "observation", "at": at, "at_precision": "minute",
                                             "data": data, **env}))

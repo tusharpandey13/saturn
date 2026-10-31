@@ -22,7 +22,8 @@ import records_config  # noqa: E402
 BLOCK = re.compile(r"(<!-- gen:([a-z-]+) start -->\n)(.*?)(<!-- gen:\2 end -->)", re.S)
 FAMILY_TAGS = ("family-reported", "patient-reported", "user-report", "secondhand")
 FLAG_TAGS = ("low-confidence", "internal-contradiction", "text-table-mismatch", "written-stopped", "owner-unconfirmed",
-             "identity-unconfirmed", "subject-hint")
+             "identity-unconfirmed", "subject-hint", "device-average", "device-memory", "device-type-unknown",
+             "partial-reading", "uncertain")
 MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 GLANCE_DAYS = 180
 # Life-context events (ADR 010) render only in gen:context; every other block and the header count leave them out, so
@@ -490,6 +491,9 @@ def b_quality(kb, ns):
                      "row with the settled value and no `uncertain_ref`.",
         "low-confidence": "a reading below 0.8 confidence from the migration. Re-read the page; supersede with the "
                           "settled value, or open a hard read.",
+        "needs-human": "a device screen the batch could not settle: an unclear memory/average indicator, or a "
+                       "partly legible reading (the missing part is null, never filled in). Check the photo; supersede "
+                       "with the settled reading type or values and `verification: human`.",
         "alert-input": "a value that feeds bot alerts (weight, BP, pulse, SpO2, K, Na, creatinine). Check it against "
                        "the page and set `verification: human`.",
     }
