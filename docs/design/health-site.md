@@ -1,12 +1,19 @@
 ---
 title: Family health site: design
-status: proposed (awaiting owner approval; nothing built)
+status: approved; first slice built (tools/site)
 date: 2026-10-31
 ---
 
 # Family health site: design
 
-**This document is the design only; nothing is built.** It contains no PHI. Every example uses the synthetic person in the mockup.
+It contains no PHI. Every example uses the synthetic person in the mockup.
+
+**First slice (31-Oct-2026), owner feedback applied:** `tools/site/build --records <dir> --out <dir>`. Six tabs, in
+this order: **Overview** (the mockup's Today), **Status** (agent inferences; "No inferences yet" plus the person's
+latest analysis notes until rows exist), **Medicines**, **Results**, **History** (own tab) and **Wiki** (problems as
+written, care team, documents with the originals, questions, family to-dos, every records page and analysis note).
+All six fit the bottom bar at 390 px. The Ask screen became Wiki > Questions (the top "now" question stays on
+Overview). Doctor view and Simple view are placeholders. Sections 4 and 5 below are the original proposal.
 
 - **Mockup:** [health-site-mockup/index.html](health-site-mockup/index.html). It has 8 pages, uses synthetic data and is mobile-first.
 - **Screenshots:** in [health-site-mockup/shots/](health-site-mockup/shots/), taken at 390 px, light mode, plus two in dark mode.

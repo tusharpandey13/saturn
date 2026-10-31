@@ -43,6 +43,12 @@ repos:
         entry: sh -c 'python3 -I tools/kb/build --records fixtures/records-example --check && python3 -I tools/kb/test_gen.py'
         pass_filenames: false
         files: ^(tools/kb/|schema/|fixtures/records-example/)
+      - id: site-example
+        name: health site builds from the synthetic records (no external URL, links resolve, flag colour rule)
+        language: system
+        entry: python3 -I tools/site/test_site.py
+        pass_filenames: false
+        files: ^(tools/site/|tools/kb/|schema/|fixtures/records-example/)
       - id: crossref
         name: cross-referencing checks (synthetic fixtures)
         language: system

@@ -1,0 +1,1269 @@
+#!/usr/bin/env -S python3 -I
+"""Build the family health site (static HTML) from a records repo's KB. Design: docs/design/health-site.md.
+
+Usage: tools/site/build --records DIR --out DIR [--person NS] [--db PATH] [--today YYYY-MM-DD]
+
+Reads <records>/data/kb.sqlite (read-only; built by tools/kb/build: run that first, or the site builds the KB into a
+temp file when it is missing) through the existing views, plus docs/health/<ns>/questions.md, family/actions.md, the
+cross-check pages and agent inference rows when present. Writes <out>/index.html (person picker),
+<out>/<ns>/{overview,status,medicines,results,history,wiki}.html, trend pages under <out>/<ns>/trend/, rendered
+Markdown pages, linked originals under <out>/files/, one style.css and build.json.
+
+Rules: static HTML, relative links only (served under a path prefix), no JS, no external URL anywhere, colour only
+from the lab's printed flag, agent-inferred content visibly apart from facts. Refuses an --out inside the product repo
+or inside the records repo's tracked tree. Python stdlib only. Record and flag only: nothing here diagnoses or advises.
+"""
+import argparse, datetime, html, importlib.machinery, importlib.util, json, os, pathlib, posixpath, re, shutil
+import sqlite3, subprocess, sys, tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+PRODUCT = HERE.parents[1]
+sys.path.insert(0, str(HERE))  # python3 -I drops the script dir
+sys.path.insert(0, str(PRODUCT / "tools" / "kb"))
+import charts, md  # noqa: E402
+import records_config  # noqa: E402
+
+_loader = importlib.machinery.SourceFileLoader("gen_views", str(PRODUCT / "tools" / "kb" / "gen-views"))
+_spec = importlib.util.spec_from_loader("gen_views", _loader)
+gv = importlib.util.module_from_spec(_spec)
+_loader.exec_module(gv)  # reuse the KB helpers and queries of the Markdown views (design 10 risk c)
+
+TABS = [("overview", "Overview"), ("status", "Status"), ("medicines", "Medicines"), ("results", "Results"),
+        ("history", "History"), ("wiki", "Wiki")]
+FOOT = "Facts as written; not advice; doctors decide."
+FAMILY_TAGS = gv.FAMILY_TAGS
+REPORTED_KINDS = ("telegram_msg", "chat", "voice")
+CHANGE_DAYS = 14
+KIND_NAMES = {"telegram_msg": "Telegram message", "chat": "family chat", "voice": "voice note", "photo": "photo",
+              "lab": "lab report", "rx": "prescription", "echo": "echo report", "ecg": "ECG", "imaging": "imaging report",
+              "discharge": "discharge summary", "consult": "consultation", "bill": "bill", "ai_summary": "AI summary",
+              "other": "document"}
+ESC = html.escape
+
+ICONS = {
+    "overview": '<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/>',
+    "status": '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
+    "medicines": '<rect x="3" y="8.5" width="18" height="7" rx="3.5" transform="rotate(-35 12 12)"/><path d="M9.5 8.5l5 7"/>',
+    "results": '<path d="M9 3h6"/><path d="M10 3v6L4.5 19a1.5 1.5 0 0 0 1.3 2h12.4a1.5 1.5 0 0 0 1.3-2L14 9V3"/><path d="M7 15h10"/>',
+    "history": '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+    "wiki": '<path d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4z"/><path d="M20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z"/>',
+    "up": '<path d="M12 19V5M6 11l6-6 6 6"/>',
+    "down": '<path d="M12 5v14M6 13l6 6 6-6"/>',
+    "doc": '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>',
+    "visit": '<path d="M6 3v6a4 4 0 0 0 8 0V3"/><path d="M10 13v3a5 5 0 0 0 10 0v-2"/><circle cx="20" cy="12" r="2"/>',
+    "event": '<circle cx="12" cy="12" r="3"/>',
+    "fall": '<circle cx="13" cy="4" r="2"/><path d="M12 7l-3 6h5l2 7M9 13l-4 3"/>',
+    "hospital": '<path d="M4 21V5h16v16"/><path d="M12 8v6M9 11h6"/>',
+    "chev": '<path d="M9 6l6 6-6 6"/>',
+}
+
+
+def icon(name, cls="icon"):
+    return f'<svg class="{cls}" viewBox="0 0 24 24" aria-hidden="true">{ICONS.get(name, ICONS["event"])}</svg>'
+
+
+def j(v):
+    return json.loads(v) if v else {}
+
+
+def fdate(at, precision="day"):
+    return gv.fdate(at, precision)
+
+
+def day(at):
+    try:
+        return datetime.date.fromisoformat(str(at)[:10])
+    except ValueError:
+        try:
+            return datetime.date.fromisoformat(str(at)[:7] + "-01")
+        except ValueError:
+            return None
+
+
+def num(v):
+    if v is None:
+        return ""
+    s = f"{v}"
+    return s[:-2] if s.endswith(".0") else s
+
+
+class GuardError(Exception):
+    pass
+
+
+# ------------------------------------------------------------------------------------------------------------ site io
+class Site:
+    """Collects pages and copied files; writes them under one output root. Every href is relative."""
+
+    def __init__(self, out, records):
+        self.out, self.records = out, records
+        self.pages = {}       # rel path -> html
+        self.files = {}       # rel path under out -> absolute source path
+
+    @staticmethod
+    def rel(frm, to):
+        """Relative href from page `frm` to `to` (both out-relative posix paths; `to` may carry #anchor)."""
+        path, _, anchor = to.partition("#")
+        r = posixpath.relpath(path, posixpath.dirname(frm) or ".")
+        return r + (f"#{anchor}" if anchor else "")
+
+    def original(self, path):
+        """Out-relative path of an original under sources/ (copied on write), or None if missing/outside."""
+        if not path:
+            return None
+        p = (self.records / path).resolve()
+        try:
+            relp = p.relative_to(self.records)
+        except ValueError:
+            return None
+        if relp.parts[:1] != ("sources",) or not p.is_file():
+            return None
+        dest = "files/" + relp.as_posix()
+        self.files[dest] = p
+        return dest
+
+    def write(self):
+        for relp, text in self.pages.items():
+            dst = self.out / relp
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(text, encoding="utf-8")
+        for relp, src in self.files.items():
+            dst = self.out / relp
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(src, dst)  # same filesystem: no copy (git replaces files, so the link keeps this version)
+            except OSError:
+                shutil.copy2(src, dst)
+        shutil.copy2(HERE / "style.css", self.out / "style.css")
+
+
+def head(title, path):
+    css = Site.rel(path, "style.css")
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+            "<meta name=\"robots\" content=\"noindex, nofollow\"><meta name=\"referrer\" content=\"no-referrer\">"
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; img-src 'self' data:; "
+            "style-src 'self'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'\">"
+            f"<title>{ESC(title)} · Saturn</title><link rel=\"stylesheet\" href=\"{css}\"></head>")
+
+
+def footer():
+    return (f'<p class="footer"><b>{FOOT}</b><br>Every fact links to its document. '
+            '<span class="infline">Dashed purple</span> = agent-inferred; dashed grey = family-reported.<br>'
+            'Private: served only on the family Tailscale network.</p>')
+
+
+class Person:
+    def __init__(self, ns, display, asof):
+        self.ns, self.display, self.asof = ns, display, asof
+
+    @property
+    def initials(self):
+        w = self.display.split()
+        return (w[0][:1] + (w[1][:1] if len(w) > 1 else w[0][1:2])).upper() if w else "?"
+
+
+def shell(p, path, title, body, tab=None, badge=None):
+    """Page with top bar, body, footer and the six-tab bottom bar."""
+    top = (f'<header class="top"><div class="row"><a class="who" href="{Site.rel(path, "index.html")}">'
+           f'<span class="avatar">{ESC(p.initials)}</span>{ESC(p.display)}</a>'
+           f'<div class="asof">Data as of <b>{ESC(fdate(p.asof) or "no dated facts")}</b><br>'
+           f'<a href="{Site.rel(path, "index.html")}">switch person</a></div></div></header>')
+    nav = []
+    for key, label in TABS:
+        on = ' class="on" aria-current="page"' if key == tab else ""
+        b = f'<span class="badge">{badge}</span>' if key == "wiki" and badge else ""
+        nav.append(f'<a href="{Site.rel(path, f"{p.ns}/{key}.html")}"{on}>{icon(key)}<span>{label}{b}</span></a>')
+    return (head(f"{title} · {p.display}", path) + "<body><div class=\"wrap\">" + top + body + footer() + "</div>"
+            '<div class="tabs"><nav aria-label="Main">' + "".join(nav) + "</nav></div></body></html>")
+
+
+# ---------------------------------------------------------------------------------------------------------- KB layer
+class Data:
+    def __init__(self, kb, root, rc):
+        self.kb, self.root, self.rc = kb, root, rc
+        self.con = kb.con
+
+    def lab_name(self, f, d=None):
+        d = d if d is not None else j(f["data"])
+        org = d.get("org_id")
+        s = self.kb.sources.get(f["source_id"])
+        if not org and s:
+            org = s["org_id"]
+        if org:
+            return self.kb.name(org)
+        return KIND_NAMES.get(s["kind"], s["kind"]) if s else "source not recorded"
+
+    def reported(self, fid):
+        f = self.kb.facts[fid]
+        tags = j(f["tags"]) or []
+        s = self.kb.sources.get(f["source_id"])
+        return any(t in FAMILY_TAGS for t in tags) or bool(s and (s["rank"] == "recollection" or s["kind"] in REPORTED_KINDS))
+
+    def trend(self, ns):
+        """code -> list of v_trend rows (oldest first)."""
+        out = {}
+        for r in self.kb.q("SELECT * FROM v_trend WHERE ns = ? ORDER BY at, id", ns):
+            out.setdefault(r["code"], []).append(r)
+        return out
+
+    def latest(self, ns):
+        return {r["code"]: r for r in self.kb.q("SELECT * FROM v_latest WHERE ns = ?", ns)}
+
+
+def obs_display(d):
+    comp = d.get("components") or {}
+    if isinstance(comp, dict) and "systolic" in comp and "diastolic" in comp:
+        return f"{num(comp['systolic'])}/{num(comp['diastolic'])}"
+    if d.get("value_num") is not None:
+        return num(d["value_num"])
+    return d.get("value_text", "")
+
+
+def lab_flagged(d):
+    """True only when the lab printed (or bolded) H or L: the one source of colour (design 6.2)."""
+    return d.get("flag") in ("H", "L") and (d.get("flag_basis") or "printed") in ("printed", "bold")
+
+
+def flag_pill(d, reported=False):
+    f, basis = d.get("flag"), d.get("flag_basis") or "printed"
+    lo, hi, v = d.get("ref_low"), d.get("ref_high"), d.get("value_num")
+    if reported and not f:
+        return '<span class="pill neutral">No lab range</span>' if lo is None and hi is None else ""
+    if f in ("H", "L") and basis in ("printed", "bold"):
+        word = "High" if f == "H" else "Low"
+        return f'<span class="pill flag">{icon("up" if f == "H" else "down")}{word} (lab flag)</span>'
+    if f in ("H", "L"):
+        return (f'<span class="pill ok">{icon("up" if f == "H" else "down")}outside printed range (computed)</span>')
+    if f == "N":
+        return '<span class="pill ok">In lab range (lab)</span>'
+    if v is not None and (lo is not None or hi is not None):
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            return (f'<span class="pill ok">{icon("up" if hi is not None and v > hi else "down")}'
+                    'outside printed range (computed)</span>')
+        return '<span class="pill ok">In printed range</span>'
+    if lo is None and hi is None and not d.get("ref_text"):
+        return '<span class="pill neutral">No lab range</span>'
+    return ""
+
+
+def point(dt, f, d, lab):
+    comp = d.get("components") or {}
+    v = d.get("value_num")
+    if v is None and isinstance(comp, dict) and isinstance(comp.get("systolic"), (int, float)):
+        v = comp["systolic"]
+    return {"t": dt, "v": v, "lo": d.get("ref_low"), "hi": d.get("ref_high"), "lab": lab, "flag": lab_flagged(d),
+            "label": f"{obs_display(d)} {d.get('unit') or ''} · {fdate(f['at'])} · {lab}"}
+
+
+# ------------------------------------------------------------------------------------------------- questions / to-dos
+ITEM_RE = re.compile(r"^###\s+([a-z][a-z0-9-]*:(?:q|act):\d{4}):\s*(.*)$")
+FIELD_RE = re.compile(r"\*\*([A-Za-z][A-Za-z /-]*?):\*\*\s*")
+
+
+def parse_register(text):
+    """questions.md / actions.md -> (items, sections). Item: id, title, section, fields {Ask, Why, Priority, ...}."""
+    _, body = md.split_front_matter(text)
+    items, section, cur = [], "", None
+    sections = {}
+    for line in body.splitlines():
+        if line.startswith("## "):
+            section = line[3:].strip()
+            sections[section] = []
+            cur = None
+            continue
+        m = ITEM_RE.match(line)
+        if m:
+            cur = {"id": m.group(1), "title": m.group(2).strip(), "section": section, "fields": {}, "lines": []}
+            items.append(cur)
+            continue
+        if section:
+            sections.setdefault(section, []).append(line)
+        if cur is None or line.startswith("#"):
+            continue
+        cur["lines"].append(line)
+    for it in items:
+        joined = "\n".join(it["lines"])
+        for chunk in re.split(r"\n(?=- \*\*)", joined):
+            chunk = chunk.strip()
+            if not chunk.startswith("- **"):
+                continue
+            parts = FIELD_RE.split(chunk[2:])
+            for k in range(1, len(parts) - 1, 2):
+                key = parts[k].strip()
+                val = parts[k + 1].strip().rstrip(".").strip()
+                if key not in it["fields"]:
+                    it["fields"][key] = val
+        pr = it["fields"].get("Priority", "").lower()
+        it["prio"] = "now" if pr.startswith("now") else "next" if pr.startswith("next") else "some" if pr else "next"
+        st = it["fields"].get("Status", "open").lower()
+        it["open"] = not any(w in st for w in ("answered", "done", "dropped", "closed", "superseded")) and \
+            not any(w in it["section"].lower() for w in ("answered", "done", "dropped"))
+    return items, sections
+
+
+PRIO_LABEL = {"now": "Now", "next": "Next visit", "some": "Someday"}
+
+
+# ------------------------------------------------------------------------------------------------------- inferences
+STAKES_ORDER = {"can't-miss": 0, "quality-of-life": 1, "housekeeping": 2}
+
+
+def load_inferences(root, ns):
+    """Active agent-inferred records of one person (tools/inference, schema inference/1):
+    inferences/<ns>/inferences.ndjson, append-only snapshots; the highest rev per id wins. Never KB facts.
+    Ordered as the Status page orders them: stakes (can't-miss first), then p (highest first)."""
+    path = root / "inferences" / ns / "inferences.ndjson"
+    if not path.is_file():
+        return None  # no store: Status is not turned on for this person
+    best = {}
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            raise SystemExit(f"error: {path}:{n}: not JSON (fix it with tools/inference)")
+        if row.get("schema") != "inference/1" or not row.get("id"):
+            continue
+        if row["id"] not in best or int(row.get("rev") or 0) >= int(best[row["id"]].get("rev") or 0):
+            best[row["id"]] = row
+    rows = [r for r in best.values() if r.get("status") == "active"]
+    rows.sort(key=lambda r: (STAKES_ORDER.get(r.get("stakes"), 9), -(r.get("p") or 0), r["id"]))
+    return rows
+
+
+def evidence_ref(b, kb, link_src):
+    """A KB id as code, or a sources/ path linked to the copied original."""
+    if isinstance(b, str) and b.startswith("sources/"):
+        href = link_src(b.split("#")[0])
+        return f'<a href="{ESC(href)}"><code>{ESC(b)}</code></a>' if href else f"<code>{ESC(b)}</code>"
+    return f"<code>{ESC(str(b))}</code>"
+
+
+def inferred_box(inf, kb=None, link_src=lambda x: None, run_href=None, short=False):
+    """The dashed purple block (design 6.1): never styled like a fact."""
+    p = inf.get("p")
+    pct = f"{round(p * 100)}%" if isinstance(p, (int, float)) else ""
+    head = " · ".join(x for x in [inf.get("kind", "").replace("-", " "), f"p {pct} ({inf.get('bucket')})" if pct else "",
+                                  inf.get("stakes")] if x)
+    out = ['<div class="inferred" role="note"><div class="label">' + icon("status") +
+           'Agent-inferred · not from a document</div>',
+           f'<div class="xs infmeta">{ESC(head)}</div>', f"<p>{ESC(inf.get('statement') or '')}</p>"]
+    if not short:
+        if inf.get("reason"):
+            out.append(f'<div class="small">Why this probability: {ESC(inf["reason"])}</div>')
+        for key, word in (("evidence_for", "For"), ("evidence_against", "Against")):
+            ev = inf.get(key) or []
+            if ev:
+                out.append(f'<div class="small">{word}: ' + ", ".join(evidence_ref(b, kb, link_src) for b in ev) + "</div>")
+        cits = inf.get("citations") or []
+        if cits:
+            out.append('<div class="small">Literature: ' + "; ".join(
+                f"{ESC(md.strip_scheme(str(c.get('ref', ''))))} ({ESC(str(c.get('supports', '')))}; "
+                f"{ESC(str(c.get('verified', '')))})" for c in cits) + "</div>")
+        wc = inf.get("would_change") or []
+        if wc:
+            out.append('<div class="small">Would change it: ' + ESC(" · ".join(wc)) + "</div>")
+    review = inf.get("review") or "none"
+    rev = {"accepted": "reviewed by the owner: accepted", "disputed": "reviewed by the owner: disputed"}.get(review,
+                                                                                                         "not reviewed")
+    when = fdate(str(inf.get("produced_at") or "")) if inf.get("produced_at") else ""
+    run = (f' · <a href="{ESC(run_href)}">analysis note</a>' if run_href else "")
+    out.append(f'<div class="foot">{ESC(inf.get("id", ""))} · {ESC(when)} · {rev}{run}. Not a diagnosis. Doctors decide.'
+               "</div></div>")
+    return "".join(out)
+
+
+# -------------------------------------------------------------------------------------------------------- the build
+class Builder:
+    def __init__(self, root, out, kb, rc, today):
+        self.root, self.kb, self.rc, self.today = root, kb, rc, today
+        self.site = Site(out, root)
+        self.data = Data(kb, root, rc)
+        self.md_pages = {}  # records-relative .md path -> out-relative html path (rendered on demand)
+        self.cfg = gv.CONFIG
+        self.questions, self.todos = {}, []
+        actions = root / "docs" / "health" / "family" / "actions.md"
+        if actions.is_file():
+            self.todos = parse_register(actions.read_text(encoding="utf-8"))[0]
+
+    # ---- shared bits
+    def src_chip(self, path, fid, label_page=True):
+        f = self.kb.facts.get(fid)
+        if not f:
+            return ""
+        s = self.kb.sources.get(f["source_id"])
+        bits = [self.data.lab_name(f), fdate(s["issued_at"] if s and s["issued_at"] else f["at"])]
+        if label_page and f["page"] is not None:
+            bits.append(f"p.{f['page']}")
+        text = " · ".join(b for b in bits if b)
+        orig = self.site.original(s["path"]) if s else None
+        if orig:
+            return f'<a class="src" href="{Site.rel(path, orig)}">{icon("doc")}{ESC(text)}</a>'
+        return f'<span class="src">{icon("doc")}{ESC(text)}</span>'
+
+    def prov(self, fid):
+        f = self.kb.facts[fid]
+        marks = self.kb.marks(fid)
+        q = f'<div>Quote: “{ESC(f["quote"])}”</div>' if f["quote"] else ""
+        return (f'<details class="prov"><summary>Provenance</summary><div><code>{ESC(fid)}</code></div>{q}'
+                f'<div>Verification: {ESC(f["verification"])}{" · " + ESC(marks) if marks else ""}</div></details>')
+
+    def md_href(self, relpath):
+        """Out-relative html path for a records-relative markdown file (registered for rendering)."""
+        relpath = posixpath.normpath(relpath)
+        if relpath not in self.md_pages:
+            parts = relpath.split("/")
+            if parts[:2] == ["docs", "health"] and len(parts) == 4:
+                self.md_pages[relpath] = f"{parts[2]}/pages/{parts[3][:-3]}.html"
+            else:
+                stem = re.sub(r"[^A-Za-z0-9._-]", "-", relpath[:-3].replace("/", "--"))
+                self.md_pages[relpath] = f"notes/{stem}.html"
+        return self.md_pages[relpath]
+
+    def md_link(self, md_rel, page_path):
+        """Link callback for md.render: maps a target written in `md_rel` to a site href or None."""
+        base = posixpath.dirname(md_rel)
+
+        def link(target):
+            if re.match(r"^[a-z][a-z0-9+.-]*:", target, re.I) or target.startswith("//"):
+                return None  # external or a scheme: never linked
+            path, _, anchor = target.partition("#")
+            if not path:
+                return f"#{anchor}" if anchor else None
+            for cand in (posixpath.normpath(posixpath.join(base, path)), posixpath.normpath(path)):
+                if cand.startswith(".."):
+                    continue
+                full = self.root / cand
+                if cand.endswith(".md") and full.is_file() and (cand.startswith("docs/health/") or
+                                                                cand.startswith("docs/log/analysis/")):
+                    return Site.rel(page_path, self.md_href(cand) + (f"#{anchor}" if anchor else ""))
+                orig = self.site.original(cand)
+                if orig:
+                    return Site.rel(page_path, orig)
+            return None
+        return link
+
+    def render_md_pages(self):
+        """Render every registered markdown page (new links found while rendering are rendered too)."""
+        done = set()
+        while True:
+            todo = [k for k in self.md_pages if k not in done]
+            if not todo:
+                break
+            for relpath in todo:
+                done.add(relpath)
+                out_path = self.md_pages[relpath]
+                fm, body = md.split_front_matter((self.root / relpath).read_text(encoding="utf-8"))
+                title = fm.get("title") or pathlib.Path(relpath).stem
+                parts = relpath.split("/")
+                ns = parts[2] if parts[:2] == ["docs", "health"] else None
+                p = self.people.get(ns)
+                gen = ' <span class="pill neutral">generated view</span>' if fm.get("generated") == "true" else ""
+                inner = (f'<h1>{ESC(title)}</h1><p class="xs muted">Page from the records repo: <code>{ESC(relpath)}'
+                         f'</code>{gen}</p><div class="md">' + md.render(body, self.md_link(relpath, out_path)) + "</div>")
+                if p:
+                    self.site.pages[out_path] = shell(p, out_path, title, inner, tab="wiki")
+                else:
+                    self.site.pages[out_path] = (head(title, out_path) + '<body><div class="wrap wide">'
+                                                 f'<p><a class="back" href="{Site.rel(out_path, "index.html")}">'
+                                                 'All people</a></p>' + inner + footer() + "</div></body></html>")
+
+    # ---- per person
+    def build(self, people):
+        self.people = {p.ns: p for p in people}
+        for p in people:
+            qpath = self.root / "docs" / "health" / p.ns / "questions.md"
+            self.questions[p.ns] = parse_register(qpath.read_text(encoding="utf-8")) if qpath.is_file() else ([], {})
+            self.infs = load_inferences(self.root, p.ns)
+            trend, latest = self.data.trend(p.ns), self.data.latest(p.ns)
+            self.trend_pages(p, trend, latest)
+            self.overview(p, trend, latest)
+            self.status(p)
+            self.medicines(p)
+            self.results(p, trend, latest)
+            self.history(p)
+            self.wiki(p)
+            self.questions_page(p)
+            self.todos_page(p)
+            self.documents(p)
+            for mode, what in (("doctor", "Doctor view"), ("simple", "Simple view")):
+                path = f"{p.ns}/{mode}.html"
+                self.site.pages[path] = shell(p, path, what, f'<h1>{what}</h1><div class="notice">Not in this '
+                                              'slice of the site yet. It will follow the design (section 5).</div>')
+        self.index(people)
+        self.render_md_pages()
+
+    def index(self, people):
+        path = "index.html"
+        cards = []
+        for p in people:
+            n_now = sum(1 for q in self.questions[p.ns][0] if q["open"] and q["prio"] == "now")
+            cards.append(f'<a class="card pick" href="{p.ns}/overview.html"><span class="avatar">{ESC(p.initials)}</span>'
+                         f'<span><b>{ESC(p.display)}</b><br><span class="small muted">Data as of '
+                         f'{ESC(fdate(p.asof) or "none")}{f" · {n_now} to ask now" if n_now else ""}</span></span>'
+                         f'{icon("chev", "icon chev")}</a>')
+        body = ('<h1>Family health</h1><p class="muted small">Pick a person. Facts are as written in the documents.</p>'
+                + "".join(cards))
+        self.site.pages[path] = (head("Family health", path) + '<body><div class="wrap">' + body + footer() +
+                                 "</div></body></html>")
+
+    # ---- timeline grouping (Overview + History)
+    def timeline_cards(self, p, path, since=None, limit=None):
+        rows = self.kb.q("SELECT * FROM v_timeline WHERE ns = ? ORDER BY at DESC, id DESC", p.ns)
+        groups, order = {}, []
+        for r in rows:
+            d = day(r["at"])
+            if since and (d is None or d < since):
+                continue
+            if r["kind"] == "observation":  # one card per document, or per day for family-reported readings
+                key = (("rep", str(r["at"])[:10]) if self.data.reported(r["id"])
+                       else ("obs", r["source_id"], str(r["at"])[:10]))
+            else:
+                key = ("one", r["id"])
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(r)
+        cards = []
+        for key in order:
+            rs = groups[key]
+            r0 = rs[0]
+            f0 = self.kb.facts[r0["id"]]
+            reported = all(self.data.reported(r["id"]) for r in rs)
+            if key[0] in ("obs", "rep"):
+                s = self.kb.sources.get(r0["source_id"])
+                kind = "home readings" if key[0] == "rep" else KIND_NAMES.get(s["kind"] if s else "", "result")
+                title = f"{'Home readings' if reported else 'Results'}: {len(rs)} value{'s' if len(rs) > 1 else ''}"
+                pills = []
+                for r in rs[:6]:
+                    d = j(self.kb.facts[r["id"]]["data"])
+                    name = self.kb.name(r["what"])
+                    if lab_flagged(d) and not reported:
+                        pills.append(f'<span class="pill flag">{icon("up" if d["flag"] == "H" else "down")}'
+                                     f'{ESC(name)} {ESC(obs_display(d))}</span>')
+                    else:
+                        pills.append(f'<span class="pill ok">{ESC(name)} {ESC(obs_display(d))}</span>')
+                more = f'<span class="xs muted">+{len(rs) - 6} more</span>' if len(rs) > 6 else ""
+                detail = f'<div class="pills">{"".join(pills)}{more}</div>'
+                ic, typ = "results", kind
+            elif r0["kind"] == "medication":
+                title = f"Medicine {r0['what'] or ''}: {r0['label'] or ''}".strip()
+                detail, ic, typ = "", "medicines", "medicine"
+            else:
+                title = r0["label"] or (r0["what"] or "event").replace("_", " ")
+                detail = ""
+                what = r0["what"] or ""
+                ic = {"opd": "visit", "teleconsult": "visit", "test_visit": "results", "fall": "fall",
+                      "procedure": "hospital", "admission": "hospital", "hospitalisation": "hospital"}.get(what, "event")
+                typ = what.replace("_", " ") or "event"
+            party = self.kb.party(r0["id"])
+            when = fdate(f0["at"], "day" if key[0] == "rep" else f0["at_precision"])
+            meta = " · ".join(x for x in [when, typ, party, "family-reported" if reported else "",
+                                          "uncertain" if r0["uncertain_ref"] else ""] if x)
+            cards.append({"d": day(f0["at"]), "rep": key[0] == "rep", "n": len(rs), "html": (
+                f'<div class="ev{" reported" if reported else ""}"><span class="ic">{icon(ic)}</span>'
+                f'<div class="d">{ESC(meta)}</div><div class="t">{ESC(gv.short(title, 140))}</div>{detail}'
+                f'<div>{self.src_chip(path, r0["id"])}</div></div>')})
+            if limit and len(cards) >= limit:
+                break
+        return cards
+
+    # ---- Overview (the mockup's Today)
+    def overview(self, p, trend, latest):
+        path = f"{p.ns}/overview.html"
+        out = ['<h1>Overview</h1><p class="muted small">The state at a glance. Tap anything for detail.</p>']
+        since = self.today - datetime.timedelta(days=CHANGE_DAYS)
+        allrecent = self.timeline_cards(p, path, since=since)
+        recent = [c for c in allrecent if not c["rep"]][:3]
+        home = [c for c in allrecent if c["rep"]]
+        out.append(f'<h2>What changed <span class="muted small">· last {CHANGE_DAYS} days</span>'
+                   f'<a class="more" href="history.html">All history</a></h2>')
+        if recent or home:
+            out.append('<div class="tl compact">' + "".join(c["html"] for c in recent) + "</div>")
+            if home:
+                n = sum(c["n"] for c in home)
+                out.append(f'<div class="list reported"><a href="results.html#home"><b>Home readings: {n} values on '
+                           f'{len(home)} day{"s" if len(home) != 1 else ""}</b><div class="small muted">family-reported; '
+                           f'latest {ESC(fdate(home[0]["d"].isoformat()) if home[0]["d"] else "")}. '
+                           'See Results and History.</div></a></div>')
+        else:
+            last = self.timeline_cards(p, path, limit=2)
+            out.append('<p class="muted small">Nothing dated in the last 14 days. Most recent:</p>'
+                       + ('<div class="tl compact">' + "".join(c["html"] for c in last) + "</div>" if last else ""))
+        todos = [t for t in self.todos if t["open"] and t["id"].startswith(f"{p.ns}:")]
+        now_t = [t for t in todos if t["prio"] == "now"]
+        if todos:
+            out.append('<h2>Pending</h2><div class="list">'
+                       f'<a href="todos.html"><b>{len(now_t)} family to-do{"s" if len(now_t) != 1 else ""} now</b> · '
+                       f'{len(todos)} open<div class="small muted">'
+                       + ESC(" · ".join(gv.short(t["title"], 50) for t in (now_t or todos)[:2])) + "</div></a></div>")
+        qs = [q for q in self.questions[p.ns][0] if q["open"]]
+        now_q = [q for q in qs if q["prio"] == "now"]
+        if qs:
+            top = (now_q or qs)[0]
+            ask = top["fields"].get("Ask") or top["title"]
+            aud = top["fields"].get("Audience", "")
+            out.append(f'<h2>Ask the doctor <span class="muted small">· {len(now_q)} to ask now</span>'
+                       '<a class="more" href="questions.html">All</a></h2>'
+                       f'<a class="card q" href="questions.html#{ESC(md.slug(top["id"]))}">'
+                       f'<span class="prio {top["prio"]}">{PRIO_LABEL[top["prio"]]}</span>'
+                       + (" · <span class='small muted'>for " + ESC(aud) + "</span>" if aud else "") +
+                       f'<div class="ask">{md.inline(gv.short(ask, 260))}</div>'
+                       f'<span class="small accent">{len(qs)} open in all</span></a>')
+        codes = [c for c in self.cfg.get("glance_codes", {}).get(p.ns, []) if f"ref:code:{c}" in latest]
+        codes = [f"ref:code:{c}" for c in codes] or sorted(latest, key=lambda c: latest[c]["at"], reverse=True)
+        tiles = []
+        for code in codes[:4]:
+            tiles.append(self.tile(p, code, trend.get(code, []), latest[code]))
+        if tiles:
+            out.append('<h2>Key numbers<a class="more" href="results.html">All results</a></h2>'
+                       '<div class="tiles">' + "".join(tiles) + "</div>")
+        if self.infs:
+            out.append(self.inf_html(path, self.infs[0], short=True)
+                       + '<p class="small"><a href="status.html">All agent inferences</a></p>')
+        out.append('<div class="modes"><a href="doctor.html">' + icon("visit") + 'Doctor view</a>'
+                   '<a href="simple.html">' + icon("overview") + 'Simple view</a></div>')
+        self.site.pages[path] = shell(p, path, "Overview", "".join(out), tab="overview")
+
+    def tile(self, p, code, rows, lr):
+        f = self.kb.facts[lr["id"]]
+        d = j(f["data"])
+        rep = self.data.reported(lr["id"])
+        pts = [point(day(r["at"]), self.kb.facts[r["id"]], j(self.kb.facts[r["id"]]["data"]), "")
+               for r in rows if day(r["at"])]
+        unit = f' <span class="unit">{ESC(d["unit"])}</span>' if d.get("unit") else ""
+        rng = gv.KB.ref_range(d)
+        meta = f'{fdate(f["at"])}' + (f" · range {rng}" if rng else "")
+        return (f'<a class="tile{" flagged" if lab_flagged(d) and not rep else ""}" href="trend/{tslug(code)}.html">'
+                f'<span class="name">{ESC(self.kb.name(code))}</span><span class="val">{ESC(gv.short(obs_display(d), 18))}'
+                f'{unit}</span><span class="meta">{flag_pill(d, rep)}{charts.sparkline(pts) if len(pts) > 1 else ""}'
+                f'</span><span class="xs muted">{ESC(meta)}</span></a>')
+
+    # ---- Status (agent inferences)
+    def status(self, p):
+        path = f"{p.ns}/status.html"
+        out = ['<h1>Status</h1><p class="muted small">What the agent infers from the documented facts. Labelled, '
+               'never a diagnosis; each item lists the facts it rests on.</p>']
+        if self.infs:
+            groups = {}
+            for i in self.infs:
+                groups.setdefault(i.get("problem_title") or "Other inferences", []).append(i)
+            for title, rows in groups.items():
+                out.append(f'<h2>{ESC(title)} <span class="muted small">· {len(rows)}</span></h2>')
+                out += [self.inf_html(path, i) for i in rows]
+        else:
+            out.append('<div class="inferred" role="note"><div class="label">' + icon("status") +
+                       'Agent-inferred · not from a document</div><p>No inferences yet.</p>'
+                       '<div class="foot">Inference records (tools/inference) appear here once the agent writes them.'
+                       '</div></div>')
+            notes = self.analysis_notes(p)
+            if notes:
+                out.append('<h2>Latest analysis notes</h2><p class="small muted">Agent analyses in the records log '
+                           '(agent-written; each claim cites its documents).</p><div class="list">')
+                for rel, title, dt in notes:
+                    out.append(f'<a href="{Site.rel(path, self.md_href(rel))}"><b>{ESC(title)}</b>'
+                               f'<div class="small muted">{ESC(dt)}</div></a>')
+                out.append("</div>")
+        flags = self.root / "docs" / "health" / p.ns / "flags.md"
+        if flags.is_file():
+            out.append(f'<p class="small"><a href="{Site.rel(path, self.md_href(f"docs/health/{p.ns}/flags.md"))}">'
+                       'Cross-check flags</a> (automatic checks of the records) are in the Wiki.</p>')
+        self.site.pages[path] = shell(p, path, "Status", "".join(out), tab="status")
+
+    def inf_html(self, path, inf, short=False):
+        run = (inf.get("produced_by") or {}).get("run")
+        run_href = None
+        if run and run.endswith(".md") and (self.root / run).is_file():
+            run_href = Site.rel(path, self.md_href(run))
+
+        def link_src(rel):
+            orig = self.site.original(rel)
+            return Site.rel(path, orig) if orig else None
+        return inferred_box(inf, self.kb, link_src, run_href, short)
+
+    def analysis_notes(self, p, n=5):
+        d = self.root / "docs" / "log" / "analysis"
+        names = {p.ns.lower(), p.display.lower()}
+        found = []
+        for f in sorted(d.rglob("*.md")) if d.is_dir() else []:
+            if f.name.lower() == "readme.md":
+                continue
+            fm, _ = md.split_front_matter(f.read_text(encoding="utf-8"))
+            toks = set(re.split(r"[-_.]", f.stem.lower()))
+            who = {fm.get(k, "").lower() for k in ("person", "ns", "subject")}
+            if names & toks or names & who:
+                rel = f.relative_to(self.root).as_posix()
+                found.append((rel, fm.get("title") or f.stem, f.stem[:10]))
+        found.sort(key=lambda x: x[0].rsplit("/", 1)[-1], reverse=True)
+        return found[:n]
+
+    # ---- Medicines
+    def medicines(self, p):
+        path = f"{p.ns}/medicines.html"
+        rows = self.kb.q("SELECT * FROM v_meds_current WHERE ns = ? ORDER BY at DESC, drug", p.ns)
+        out = ['<h1>Medicines</h1><div class="notice">Records what was written and what is reported as taken. '
+               'It never suggests a change. Ask the treating doctor about any difference.</div>']
+        if not rows:
+            out.append('<p class="muted">No medicine statements in the KB.</p>')
+            self.site.pages[path] = shell(p, path, "Medicines", "".join(out), tab="medicines")
+            return
+        snap = rows[0]["list_id"]
+        cur = [r for r in rows if r["display_status"] not in ("stopped", "not-in-current-list")]
+        notlist = [r for r in rows if r["display_status"] == "not-in-current-list"]
+        stopped = [r for r in rows if r["display_status"] == "stopped"]
+        lead = (f"From the complete list confirmed on {fdate(rows[0]['list_at'])}, plus anything stated after it."
+                if snap else "The latest statement per medicine. Latest does not mean taken now.")
+        out.append(f'<h2>Current <span class="muted small">· {len(cur)}</span></h2><p class="small muted">{ESC(lead)}</p>')
+        out.append(self.med_table(path, cur))
+        diffs = self.med_differences(path, cur)
+        if diffs:
+            out.append('<h2>Statements that differ</h2><p class="small muted">Two sources say different things. '
+                       'Both are shown; neither is chosen.</p>' + "".join(diffs))
+        if notlist:
+            out.append(f'<h2>Not in the current list <span class="muted small">· {len(notlist)}</span></h2>'
+                       '<p class="small muted">Their latest statement predates the confirmed list and they are not on '
+                       'it. Derived for display; ask before reading any as stopped or current.</p>')
+            out.append(self.med_table(path, notlist))
+        if stopped:
+            out.append(f'<h2>Stopped <span class="muted small">· latest statement says stopped</span></h2>')
+            out.append(self.med_table(path, stopped, grid=False))
+        mp = self.root / "docs" / "health" / p.ns / "medications.md"
+        if mp.is_file():
+            out.append(f'<p class="small"><a href="{Site.rel(path, self.md_href(f"docs/health/{p.ns}/medications.md"))}">'
+                       'Full medicine history (every statement)</a></p>')
+        self.site.pages[path] = shell(p, path, "Medicines", "".join(out), tab="medicines")
+
+    @staticmethod
+    def dose_cell(v):
+        if v is None:
+            return '<td class="t"><span class="dose no">·</span></td>'
+        if v == 0:
+            return '<td class="t"><span class="dose no">–</span></td>'
+        s = {0.5: "½", 0.25: "¼", 1.5: "1½"}.get(v, num(v))
+        return f'<td class="t"><span class="dose">{s}</span></td>'
+
+    def status_pill(self, r, f):
+        st, ver = r["display_status"], f["verification"]
+        if st == "prescribed":
+            return '<span class="pill st weak">Prescribed only</span>'
+        if st == "taking" or ver in ("human", "clinician"):
+            word = {"taking": "Taking (reported)", "dispensed": "Dispensed"}.get(st, st)
+            if ver == "clinician":
+                word += " · clinician-reconciled"
+            return f'<span class="pill st strong">{ESC(word)}</span>'
+        return f'<span class="pill st">{ESC(st.replace("-", " "))}</span>'
+
+    def med_table(self, path, rows, grid=True):
+        head = ('<div class="card flush"><table class="medgrid"><thead><tr><th>Medicine</th>'
+                + ('<th class="t">Morn</th><th class="t">Noon</th><th class="t">Night</th>' if grid else "")
+                + "</tr></thead><tbody>")
+        body = []
+        for r in rows:
+            f = self.kb.facts[r["id"]]
+            d = j(f["data"])
+            name = r["brand"] or self.kb.name(r["drug"])
+            has_dose = any(d.get(k) is not None for k in ("dose_m", "dose_n", "dose_e"))
+            sub = " · ".join(x for x in [r["generic"] if r["generic"] and r["generic"].lower() != (name or "").lower()
+                                         else "", d.get("strength"), d.get("route"), d.get("duration_text")] if x)
+            who = self.kb.party(r["id"])
+            marks = self.kb.marks(r["id"])
+            cell = (f'<td><div class="medname">{ESC(name or r["drug"])}</div>'
+                    f'<div class="medsub">{ESC(sub)}</div>'
+                    + (f'<div class="medsub">As written: “{ESC(d["schedule_raw"])}”</div>'
+                       if d.get("schedule_raw") and (not grid or has_dose) else "")
+                    + f'<div class="medsub">{ESC(fdate(f["at"], f["at_precision"]))}{" · " + ESC(who) if who else ""}</div>'
+                    + f'<div class="meta">{self.status_pill(r, f)} {self.src_chip(path, r["id"])}</div>'
+                    + (f'<div class="medsub">{ESC(marks)}</div>' if marks else "") + "</td>")
+            if grid:
+                ds = [d.get("dose_m"), d.get("dose_n"), d.get("dose_e")]
+                if all(x is None for x in ds):
+                    cell += (f'<td class="t raw" colspan="3">as written: “{ESC(gv.short(d.get("schedule_raw") or "", 60))}”</td>'
+                             if d.get("schedule_raw") else '<td class="t raw" colspan="3">schedule not written</td>')
+                else:
+                    cell += "".join(self.dose_cell(x) for x in ds)
+            body.append(f"<tr>{cell}</tr>")
+        return head + "".join(body) + "</tbody></table></div>"
+
+    def med_differences(self, path, cur):
+        """Other active statements about a current drug, on or after a month before its latest, that differ in
+        strength, schedule or status: shown side by side, never resolved."""
+        out = []
+        for r in cur:
+            f = self.kb.facts[r["id"]]
+            d = j(f["data"])
+            lo = (day(f["at"]) or self.today) - datetime.timedelta(days=30)
+            others = []
+            for o in self.kb.q("SELECT id FROM fact WHERE ns = ? AND kind = 'medication' AND status = 'active' AND id != ? "
+                               "AND (json_extract(data, '$.drug_id') = ? OR lower(json_extract(data, '$.brand')) = ?)",
+                               r["ns"], r["id"], r["drug"], (r["brand"] or "").lower()):
+                of = self.kb.facts[o["id"]]
+                od = j(of["data"])
+                if (day(of["at"]) or lo) < lo or od.get("status") == "stopped":
+                    continue
+                if (od.get("strength"), od.get("schedule_raw")) != (d.get("strength"), d.get("schedule_raw")):
+                    others.append(of)
+            if not others:
+                continue
+            lines = [self.med_line(path, f)] + [self.med_line(path, o) for o in others[:3]]
+            out.append(f'<div class="conflict"><b>{ESC(r["brand"] or self.kb.name(r["drug"]))}</b>'
+                       + "".join(lines) + "</div>")
+        return out
+
+    def med_line(self, path, f):
+        d = j(f["data"])
+        txt = " · ".join(x for x in [d.get("status"), d.get("strength"), d.get("schedule_raw"),
+                                     fdate(f["at"], f["at_precision"]), self.kb.party(f["id"])] if x)
+        return f'<div class="small">{ESC(txt)} {self.src_chip(path, f["id"])}</div>'
+
+    # ---- Results
+    def results(self, p, trend, latest):
+        path = f"{p.ns}/results.html"
+        out = ['<h1>Results</h1><p class="muted small">Latest value of each test, with the lab\'s own range. Colour '
+               'only where the lab printed a flag. Tap a test for its trend.</p>']
+        series = self.cfg.get("key_series", {}).get(p.ns) or []
+        used = set()
+        reported = {c for c, r in latest.items() if self.data.reported(r["id"])}
+        groups = []
+        for name, codes in series:
+            cs = [f"ref:code:{c}" for c in codes if f"ref:code:{c}" in latest and f"ref:code:{c}" not in reported]
+            if cs:
+                groups.append((name, cs))
+                used.update(cs)
+        rest = {}
+        for c, r in latest.items():
+            if c in used or c in reported:
+                continue
+            cat = j(self.kb.facts[r["id"]]["data"]).get("category") or "other"
+            rest.setdefault(cat, []).append(c)
+        for cat in sorted(rest):
+            title = {"lab": "Other lab results", "imaging": "Imaging", "ecg": "ECG", "vital": "Vitals (documents)",
+                     "symptom": "Symptoms", "exam": "Examination"}.get(cat, "Other")
+            groups.append((title, sorted(rest[cat], key=lambda c: self.kb.name(c).lower())))
+        if groups:
+            out.append('<nav class="chips" aria-label="Panels">' + "".join(
+                f'<a class="chip" href="#{md.slug(n)}">{ESC(n)}</a>' for n, _ in groups) + "</nav>")
+        for name, cs in groups:
+            out.append(f'<h2 id="{md.slug(name)}">{ESC(name)}</h2><div class="list">')
+            out += [self.result_row(p, path, c, trend.get(c, []), latest[c]) for c in cs]
+            out.append("</div>")
+        if reported:
+            out.append('<h2 id="home">Home readings <span class="muted small">· family-reported</span></h2>'
+                       '<p class="small muted">Told or messaged by the family, not on a lab report. Never coloured.</p>'
+                       '<div class="list reported">')
+            out += [self.result_row(p, path, c, trend.get(c, []), latest[c])
+                    for c in sorted(reported, key=lambda c: self.kb.name(c).lower())]
+            out.append("</div>")
+        conf = self.kb.q("SELECT * FROM v_conflicts WHERE ns = ? ORDER BY day DESC", p.ns)
+        if conf:
+            out.append('<h2>Sources disagree</h2><p class="small muted">The same test on the same day, with different '
+                       'values in two sources. Both are shown; neither is chosen.</p>')
+            for c in conf:
+                out.append(f'<div class="conflict"><b>{ESC(self.kb.name(c["code"]))}</b> · {ESC(fdate(c["day"]))}'
+                           f'<div class="small">{ESC(num(c["value_a"]))} {self.src_chip(path, c["id_a"])}</div>'
+                           f'<div class="small">{ESC(num(c["value_b"]))} {self.src_chip(path, c["id_b"])}</div></div>')
+        if not latest:
+            out.append('<p class="muted">No results in the KB.</p>')
+        self.site.pages[path] = shell(p, path, "Results", "".join(out), tab="results")
+
+    def previous(self, rows, lr):
+        prior = [r for r in rows if r["id"] != lr["id"] and str(r["at"]) < str(lr["at"])]
+        return prior[-1] if prior else None
+
+    def result_row(self, p, path, code, rows, lr):
+        f = self.kb.facts[lr["id"]]
+        d = j(f["data"])
+        rep = self.data.reported(lr["id"])
+        unit = f' <span class="unit">{ESC(d["unit"])}</span>' if d.get("unit") and d.get("value_num") is not None else ""
+        lab = self.data.lab_name(f, d)
+        prev = self.previous(rows, lr)
+        bar = ""
+        if d.get("value_num") is not None and (d.get("ref_low") is not None or d.get("ref_high") is not None):
+            pv = None
+            if prev:
+                pd = j(self.kb.facts[prev["id"]]["data"])
+                if self.data.lab_name(self.kb.facts[prev["id"]], pd) == lab:
+                    pv = pd.get("value_num")
+            bar = ('<div class="bar">' + charts.range_bar(d["value_num"], d.get("ref_low"), d.get("ref_high"), pv,
+                                                          lab_flagged(d) and not rep,
+                                                          f"{self.kb.name(code)} {obs_display(d)}") + "</div>")
+        rng = gv.KB.ref_range(d)
+        before = ""
+        if prev:
+            pf = self.kb.facts[prev["id"]]
+            pd = j(pf["data"])
+            plab = self.data.lab_name(pf, pd)
+            before = (f"before: {obs_display(pd)} on {fdate(pf['at'])}" + (" (other lab)" if plab != lab else ""))
+        val = obs_display(d)
+        long_text = len(val) > 24
+        sub = " · ".join(x for x in [f"range {rng}" if rng else "", fdate(f["at"], f["at_precision"]), lab, before] if x)
+        return (f'<a class="result" href="trend/{tslug(code)}.html"><span class="n">{ESC(self.kb.name(code))}</span>'
+                + (f'<span class="v">{ESC(val)}{unit}</span>' if not long_text else '<span class="v"></span>')
+                + (f'<span class="txt">{ESC(gv.short(val, 220))}</span>' if long_text else "")
+                + bar + f'<span class="sub">{flag_pill(d, rep)}<span>{ESC(sub)}</span></span></a>')
+
+    def trend_pages(self, p, trend, latest):
+        for code, rows in trend.items():
+            path = f"{p.ns}/trend/{tslug(code)}.html"
+            lr = latest.get(code) or rows[-1]
+            f = self.kb.facts[lr["id"]]
+            d = j(f["data"])
+            rep = self.data.reported(lr["id"])
+            name = self.kb.name(code)
+            unit = d.get("unit") or ""
+            pts, sys_pts, dia_pts, labs = [], [], [], []
+            for r in rows:
+                rf = self.kb.facts[r["id"]]
+                rd = j(rf["data"])
+                dt = day(rf["at"])
+                lab = self.data.lab_name(rf, rd)
+                if dt is None:
+                    continue
+                comp = rd.get("components") or {}
+                if isinstance(comp, dict) and isinstance(comp.get("systolic"), (int, float)) \
+                        and isinstance(comp.get("diastolic"), (int, float)):
+                    sp = point(dt, rf, rd, lab)
+                    sp.update(v=comp["systolic"], lo=None, hi=None)
+                    dp = dict(sp, v=comp["diastolic"])
+                    sys_pts.append(sp)
+                    dia_pts.append(dp)
+                elif rd.get("value_num") is not None:
+                    pts.append(point(dt, rf, rd, lab))
+                else:
+                    continue
+                if lab not in labs:
+                    labs.append(lab)
+            chart = ""
+            if sys_pts:
+                chart = charts.trend_chart([("systolic", sys_pts), ("diastolic", dia_pts)], unit)
+            elif len(pts) >= 1:
+                chart = charts.trend_chart([(name, pts)], unit)
+            hero_unit = f' <span class="unit">{ESC(unit)}</span>' if unit and d.get("value_num") is not None else ""
+            rng = gv.KB.ref_range(d)
+            out = [f'<p><a class="back" href="../results.html">‹ Results</a></p><h1>{ESC(name)}</h1>',
+                   f'<div class="card hero"><div class="big val">{ESC(gv.short(obs_display(d), 300))}{hero_unit}</div>'
+                   f'<div class="meta">{flag_pill(d, rep)}</div><div class="small muted">'
+                   f'{ESC(" · ".join(x for x in [fdate(f["at"], f["at_precision"]), self.data.lab_name(f, d), "range " + rng if rng else "", "family-reported" if rep else ""] if x))}'
+                   f'</div></div>']
+            if chart:
+                out.append(f'<div class="card">{chart}{charts.legend(labs)}'
+                           + ('<p class="xs muted">Lines join one lab\'s results only. Shaded band: each result\'s own '
+                              'printed range. Amber marker: the lab flagged it.</p>' if not sys_pts else
+                              '<p class="xs muted">Upper line systolic, lower line diastolic (one mmHg axis).</p>')
+                           + "</div>")
+            body = []
+            for r in reversed(rows):
+                rf = self.kb.facts[r["id"]]
+                rd = j(rf["data"])
+                body.append(f'<tr><td>{ESC(fdate(rf["at"], rf["at_precision"]))}</td>'
+                            f'<td class="r">{ESC(gv.short(obs_display(rd), 120))}</td>'
+                            f'<td>{flag_pill(rd, self.data.reported(r["id"]))}</td><td>{ESC(gv.KB.ref_range(rd))}</td>'
+                            f'<td>{self.src_chip(path, r["id"])}</td></tr>')
+            out.append(f'<h2>Every value <span class="muted small">· {len(rows)}</span></h2><div class="card flush tw">'
+                       '<table class="trendtable"><thead><tr><th>Date</th><th class="r">Value</th><th>Flag</th><th>Range</th>'
+                       '<th>Source</th></tr></thead><tbody>' + "".join(body) + "</tbody></table></div>")
+            out.append('<h2>Latest, as written</h2><div class="card">'
+                       + (f'<p>“{ESC(f["quote"])}”</p>' if f["quote"] else '<p class="muted small">No verbatim quote stored.</p>')
+                       + self.src_chip(path, lr["id"]) + self.prov(lr["id"]) + "</div>")
+            self.site.pages[path] = shell(p, path, name, "".join(out), tab="results")
+
+    # ---- History
+    def history(self, p):
+        path = f"{p.ns}/history.html"
+        cards = self.timeline_cards(p, path)
+        out = ['<h1>History</h1><p class="muted small">Newest first: visits, events, every medicine statement, and '
+               'results the lab flagged or that are tracked. Dashed = family-reported.</p>']
+        cutoff = self.today - datetime.timedelta(days=365)
+        month, older_year, in_details = None, None, False
+        body = ['<div class="tl">']
+        for c in cards:
+            dt = c["d"]
+            if dt and dt < cutoff and older_year != dt.year:
+                if in_details:
+                    body.append("</div></details>")
+                body.append(f'</div><details class="older"><summary>{dt.year}</summary><div class="tl">')
+                in_details, older_year, month = True, dt.year, None
+            m = dt.strftime("%b %Y") if dt else "Date not recorded"
+            if m != month:
+                body.append(f'<div class="m">{m}</div>')
+                month = m
+            body.append(c["html"])
+        body.append("</div></details>" if in_details else "</div>")
+        out += body if cards else ['<p class="muted">No dated events in the KB.</p>']
+        tp = self.root / "docs" / "health" / p.ns / "timeline.md"
+        if tp.is_file():
+            out.append(f'<p class="small"><a href="{Site.rel(path, self.md_href(f"docs/health/{p.ns}/timeline.md"))}">'
+                       'Full timeline page (every row with its fact id)</a></p>')
+        self.site.pages[path] = shell(p, path, "History", "".join(out), tab="history")
+
+    # ---- Wiki
+    def wiki(self, p):
+        path = f"{p.ns}/wiki.html"
+        qs = self.questions[p.ns][0]
+        open_q = [q for q in qs if q["open"]]
+        todos = [t for t in self.todos if t["open"] and (t["id"].startswith(f"{p.ns}:") or t["id"].startswith("family:"))]
+        n_src = self.kb.q("SELECT count(*) FROM source WHERE ns = ? AND status = 'active'", p.ns)[0][0]
+        out = ['<h1>Wiki</h1><p class="muted small">Everything else, as written: problems, care team, documents, '
+               'questions and every records page.</p><div class="list">',
+               f'<a href="questions.html"><b>Questions for the doctors</b><div class="small muted">{len(open_q)} open · '
+               f'{sum(1 for q in open_q if q["prio"] == "now")} now</div></a>',
+               f'<a href="todos.html"><b>Family to-dos</b><div class="small muted">{len(todos)} open</div></a>',
+               f'<a href="documents.html"><b>Documents</b><div class="small muted">{n_src} sources, with the originals'
+               '</div></a></div>']
+        conds = self.kb.q("SELECT id FROM fact WHERE ns = ? AND kind = 'condition' AND status = 'active' "
+                          "ORDER BY at DESC", p.ns)
+        out.append(f'<h2>Problems, as written <span class="muted small">· {len(conds)}</span></h2>')
+        if conds:
+            out.append('<div class="list">')
+            for (fid,) in conds:
+                f = self.kb.facts[fid]
+                d = j(f["data"])
+                st = d.get("status_as_documented")
+                out.append(f'<div><div>“{ESC(d.get("text_as_written", ""))}”</div><div class="small muted">'
+                           f'{ESC(" · ".join(x for x in [st, fdate(f["at"], f["at_precision"]), self.kb.party(fid)] if x))}'
+                           f'</div>{self.src_chip(path, fid)}</div>')
+            out.append("</div>")
+        else:
+            out.append('<p class="muted small">No condition facts in the KB.</p>')
+        parties = {}
+        for f in self.kb.facts.values():
+            if f["ns"] != p.ns or f["status"] != "active":
+                continue
+            for pid in self.kb.party_ids(f["id"]):
+                parties.setdefault(pid, [None, None])
+                dt = str(f["at"])[:10]
+                lo, hi = parties[pid]
+                parties[pid] = [min(lo or dt, dt), max(hi or dt, dt)]
+        if parties:
+            out.append(f'<h2>Care team and places <span class="muted small">· {len(parties)}</span></h2><div class="list">')
+            for pid, (lo, hi) in sorted(parties.items(), key=lambda x: x[1][1], reverse=True):
+                r = self.kb.refs.get(pid)
+                rd = j(r["data"]) if r else {}
+                c = rd.get("credentials") or {}
+                role = " · ".join(x for x in [rd.get("kind"), c.get("role"), c.get("specialty"), rd.get("city")] if x)
+                out.append(f'<div><b>{ESC(self.kb.name(pid))}</b><div class="small muted">{ESC(role)}</div>'
+                           f'<div class="xs muted">seen in records {ESC(fdate(lo))}'
+                           f'{" to " + ESC(fdate(hi)) if hi != lo else ""}</div></div>')
+            out.append("</div>")
+        pages = sorted((self.root / "docs" / "health" / p.ns).glob("*.md")) if (self.root / "docs" / "health" / p.ns).is_dir() else []
+        if pages:
+            out.append('<h2>Records pages</h2><div class="list">')
+            for pg in pages:
+                rel = pg.relative_to(self.root).as_posix()
+                fm, _ = md.split_front_matter(pg.read_text(encoding="utf-8"))
+                out.append(f'<a href="{Site.rel(path, self.md_href(rel))}"><b>{ESC(fm.get("title") or pg.stem)}</b>'
+                           f'<div class="xs muted">{ESC(pg.name)}{" · generated" if fm.get("generated") == "true" else ""}'
+                           '</div></a>')
+            fam = self.root / "docs" / "health" / "family" / "actions.md"
+            if fam.is_file():
+                out.append(f'<a href="{Site.rel(path, self.md_href("docs/health/family/actions.md"))}"><b>Family actions '
+                           '(full page)</b><div class="xs muted">actions.md</div></a>')
+            out.append("</div>")
+        notes = self.analysis_notes(p, n=50)
+        if notes:
+            out.append('<h2>Analysis notes <span class="muted small">· agent-written</span></h2><div class="list">')
+            for rel, title, dt in notes:
+                out.append(f'<a href="{Site.rel(path, self.md_href(rel))}"><b>{ESC(title)}</b>'
+                           f'<div class="xs muted">{ESC(dt)}</div></a>')
+            out.append("</div>")
+        self.site.pages[path] = shell(p, path, "Wiki", "".join(out), tab="wiki")
+
+    def q_card(self, q, path):
+        fl = q["fields"]
+        ask = fl.get("Ask") or fl.get("Do") or q["title"]
+        why = fl.get("Why", "")
+        aud = fl.get("Audience") or fl.get("Owner") or ""
+        link = self.md_link(f"docs/health/{q['id'].split(':')[0]}/questions.md", path)
+        return (f'<div class="card q" id="{ESC(md.slug(q["id"]))}"><div class="meta"><span class="prio {q["prio"]}">'
+                f'{PRIO_LABEL[q["prio"]]}</span>' + ("<span class='pill st'>" + ESC(aud) + "</span>" if aud else "") +
+                f'<span class="xs muted">{ESC(q["id"])}</span></div><h3>{md.inline(q["title"], link)}</h3>'
+                f'<div class="ask">{md.inline(ask, link)}</div>'
+                + (f'<div class="why">{md.inline(why, link)}</div>' if why else "") + "</div>")
+
+    def questions_page(self, p):
+        path = f"{p.ns}/questions.html"
+        items, sections = self.questions[p.ns]
+        out = ['<p><a class="back" href="wiki.html">‹ Wiki</a></p><h1>Questions for the doctors</h1>'
+               '<p class="muted small">Questions to ask. Each “why” is a documented fact, not a conclusion.</p>']
+        for pr in ("now", "next", "some"):
+            qs = [q for q in items if q["open"] and q["prio"] == pr]
+            if qs:
+                out.append(f'<h2>{PRIO_LABEL[pr]} <span class="muted small">· {len(qs)}</span></h2>')
+                out += [self.q_card(q, path) for q in qs]
+        rel = f"docs/health/{p.ns}/questions.md"
+        for name, lines in sections.items():
+            if name.lower().startswith(("answered", "dropped")):
+                out.append(f'<details class="card"><summary><b>{ESC(name)}</b></summary>'
+                           + md.render("\n".join(lines), self.md_link(rel, path)) + "</details>")
+        if not items:
+            out.append('<p class="muted">No questions page for this person.</p>')
+        else:
+            out.append(f'<p class="small"><a href="{Site.rel(path, self.md_href(rel))}">Full page as written</a></p>')
+        self.site.pages[path] = shell(p, path, "Questions", "".join(out), tab="wiki")
+
+    def todos_page(self, p):
+        path = f"{p.ns}/todos.html"
+        mine = [t for t in self.todos if t["open"] and (t["id"].startswith(f"{p.ns}:") or t["id"].startswith("family:"))]
+        out = ['<p><a class="back" href="wiki.html">‹ Wiki</a></p><h1>Family to-dos</h1>'
+               '<p class="muted small">Read-only. Done items are recorded in the records repo.</p>']
+        link = self.md_link("docs/health/family/actions.md", path)
+        for pr in ("now", "next", "some"):
+            ts = [t for t in mine if t["prio"] == pr]
+            if ts:
+                out.append(f'<h2>{PRIO_LABEL[pr]} <span class="muted small">· {len(ts)}</span></h2><div class="list">')
+                for t in ts:
+                    do = t["fields"].get("Do") or t["fields"].get("Ask") or ""
+                    out.append(f'<div class="todo"><span class="box"></span><div><b>{md.inline(t["title"], link)}</b>'
+                               f'<div class="small muted">{md.inline(gv.short(do, 300), link)}</div>'
+                               f'<div class="xs muted">{ESC(t["id"])}</div></div></div>')
+                out.append("</div>")
+        if not mine:
+            out.append('<p class="muted">No open to-dos.</p>')
+        self.site.pages[path] = shell(p, path, "To-dos", "".join(out), tab="wiki")
+
+    def documents(self, p):
+        path = f"{p.ns}/documents.html"
+        rows = self.kb.q("SELECT * FROM source WHERE ns = ? AND status = 'active' "
+                         "ORDER BY coalesce(issued_at, received_at, created_at) DESC, id", p.ns)
+        out = ['<p><a class="back" href="wiki.html">‹ Wiki</a></p><h1>Documents</h1>'
+               f'<p class="muted small">{len(rows)} sources, newest first. Tap to open the original.</p><div class="list">']
+        for s in rows:
+            orig = self.site.original(s["path"])
+            org = self.kb.name(s["org_id"]) if s["org_id"] else ""
+            who = self.kb.name(s["practitioner_id"]) if s["practitioner_id"] else ""
+            n = self.kb.q("SELECT count(*) FROM fact WHERE source_id = ? AND status = 'active'", s["id"])[0][0]
+            meta = " · ".join(x for x in [fdate(s["issued_at"] or s["received_at"] or ""), s["kind"], org, who,
+                                          s["rank"] if s["rank"] != "original" else "", f"{n} facts"] if x)
+            title = pathlib.PurePosixPath(s["path"]).name if s["path"] else s["id"]
+            inner = (f'<b>{ESC(title)}</b><div class="small muted">{ESC(meta)}</div>'
+                     + ("" if orig else '<div class="xs muted">original not in the records repo</div>'))
+            out.append(f'<a href="{Site.rel(path, orig)}">{inner}</a>' if orig else f"<div>{inner}</div>")
+        out.append("</div>")
+        self.site.pages[path] = shell(p, path, "Documents", "".join(out), tab="wiki")
+
+
+def tslug(code):
+    return re.sub(r"[^a-z0-9.-]", "-", code.split(":")[-1].lower())
+
+
+# -------------------------------------------------------------------------------------------------------- guards, io
+def git_toplevel(path):
+    try:
+        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                           timeout=20)
+        return pathlib.Path(r.stdout.strip()).resolve() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def check_out(out, records):
+    """Refuse an output inside the product repo, or inside the records repo unless git ignores it there."""
+    out = out.resolve()
+    if out == pathlib.Path(out.anchor) or out == pathlib.Path.home().resolve():
+        raise GuardError(f"refusing to write the site to {out}")
+    if out == PRODUCT or PRODUCT in out.parents:
+        raise GuardError(f"refusing to write inside the product repo ({PRODUCT}): the site holds real records")
+    rec = records.resolve()
+    if out == rec or rec in out.parents:
+        probe = out
+        r = subprocess.run(["git", "-C", str(rec), "check-ignore", "-q", str(probe)], capture_output=True)
+        if r.returncode != 0:
+            raise GuardError(f"refusing to write inside the records repo's tracked tree ({out}); use a gitignored "
+                             "path such as <records>/site/ or a directory outside the repo")
+    if out.exists() and any(out.iterdir()) and not (out / "build.json").is_file():
+        raise GuardError(f"{out} exists, is not empty and is not a previous site build (no build.json)")
+
+
+def records_commit(root):
+    try:
+        r = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=20)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def product_version():
+    """The product tag/commit this build ran from (git describe), or None outside a git checkout."""
+    try:
+        r = subprocess.run(["git", "-C", str(PRODUCT), "describe", "--tags", "--always", "--dirty"],
+                           capture_output=True, text=True, timeout=20)
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--records", required=True, help="records repo root (records.yaml, data/, docs/health/)")
+    ap.add_argument("--out", required=True, help="output directory (outside the product repo; replaced atomically)")
+    ap.add_argument("--person", action="append", help="only this namespace (repeatable)")
+    ap.add_argument("--db", default=None, help="KB sqlite (default <records>/data/kb.sqlite)")
+    ap.add_argument("--today", default=datetime.date.today().isoformat(), help="date for 'last 14 days' (tests)")
+    a = ap.parse_args(argv)
+    root = pathlib.Path(a.records).resolve()
+    out = pathlib.Path(a.out).resolve()
+    try:
+        rc = records_config.load(root)
+        check_out(out, root)
+    except (records_config.RecordsError, GuardError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    tmp_kb = None
+    db = pathlib.Path(a.db) if a.db else root / "data" / "kb.sqlite"
+    if not db.exists():
+        tmp_kb = tempfile.TemporaryDirectory(prefix="site-kb-")
+        db = pathlib.Path(tmp_kb.name) / "kb.sqlite"
+        r = subprocess.run([sys.executable, "-I", str(PRODUCT / "tools" / "kb" / "build"), "--records", str(root),
+                            "--db", str(db)], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(r.stdout + r.stderr, file=sys.stderr)
+            print("error: KB build failed; run tools/kb/build --records <dir> and fix it first", file=sys.stderr)
+            return 1
+    cfg = root / "data" / "meta" / "gen-views.json"
+    if cfg.exists():
+        gv.CONFIG.update(json.loads(cfg.read_text(encoding="utf-8")))
+    kb = gv.KB(sqlite3.connect(f"file:{db}?mode=ro", uri=True))
+    display = rc.get("display", {})
+    people = []
+    for ns in rc["persons"]:
+        if a.person and ns not in a.person:
+            continue
+        n, latest = kb.asof(ns)
+        if n:
+            people.append(Person(ns, display.get(ns) or ns, latest))
+    if not people:
+        print("error: no person with facts in the KB", file=sys.stderr)
+        return 1
+    out.parent.mkdir(parents=True, exist_ok=True)
+    stage = pathlib.Path(tempfile.mkdtemp(prefix=".site-", dir=out.parent))
+    try:
+        b = Builder(root, stage, kb, rc, datetime.date.fromisoformat(a.today))
+        b.build(people)
+        b.site.write()
+        meta = {"records_commit": records_commit(root), "built_at": datetime.datetime.now(datetime.timezone.utc)
+                .isoformat(timespec="seconds"), "product_version": product_version(),
+                "people": [p.ns for p in people], "pages": len(b.site.pages), "files": len(b.site.files)}
+        (stage / "build.json").write_text(json.dumps(meta, indent=1) + "\n")
+        os.chmod(stage, 0o755)
+        old = None
+        if out.exists():
+            old = out.with_name(out.name + ".old")
+            if old.exists():
+                shutil.rmtree(old)
+            out.rename(old)
+        stage.rename(out)
+        if old:
+            shutil.rmtree(old)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    finally:
+        if tmp_kb:
+            tmp_kb.cleanup()
+    print(f"ok: {len(people)} people, {meta['pages']} pages, {meta['files']} originals -> {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

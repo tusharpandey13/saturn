@@ -23,7 +23,7 @@ tools/doc-scan/.venv/
 *.sqlite
 data/kb.tmp
 fixtures/records-example/data/kb.sqlite
-site/
+/site/
 .wrangler/
 .vitest/
 .batch/
