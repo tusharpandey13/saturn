@@ -12,6 +12,7 @@ This repo is the **product**: code, schema, templates, generic runbooks and synt
 | How to keep a records repo (rules for agents and humans) | [records-guide.md](records-guide.md) |
 | Why it is built this way | [decisions/](decisions/README.md) |
 | How agents cross-reference records with the literature | [methods/research-crossref.md](methods/research-crossref.md) |
+| How agents reason on open, unexplained problems (diagnostic loop, proposed) | [methods/diagnostic-loop.md](methods/diagnostic-loop.md) |
 | The research behind the decisions | [research/](research/README.md) |
 | Page templates and doc governance | [meta/](meta/README.md) |
 | Deployment-specific notes (hosts, accounts, costs, token inventory) | the environment repo, not the product |

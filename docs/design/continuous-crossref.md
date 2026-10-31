@@ -14,6 +14,8 @@ generated: false
 
 **Facts as written; not advice; doctors decide.**
 
+Repositioned by [ADR 013](../decisions/013-diagnostic-loop.md) (proposed, 31-Oct-2026): these checks become hygiene and inputs for the [diagnostic loop](../methods/diagnostic-loop.md); section 11 is superseded for records repos that opt in to interpretation.
+
 Decision record: [ADR 012](../decisions/012-continuous-crossref.md) (proposed). This page is the design; the ADR is the
 short decision. Home-series baselines, change checks and the running profile extend this design in
 [health-profile.md](health-profile.md).

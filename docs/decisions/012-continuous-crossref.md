@@ -1,7 +1,7 @@
 # 012: Continuous cross-referencing (checks, flags, claims register)
 
 Date: 2026-10-30 · Status: **PROPOSED** · Related: 005 (batch), 007 (data model), 011 (admin-only output), the
-[research cross-reference method](../methods/research-crossref.md) · Design:
+[research cross-reference method](../methods/research-crossref.md) · Repositioned by: [013](013-diagnostic-loop.md) (proposed) · Design:
 [design/continuous-crossref.md](../design/continuous-crossref.md)
 
 ## Context
