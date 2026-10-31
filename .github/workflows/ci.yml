@@ -37,6 +37,7 @@ jobs:
           python3 -I tools/kb/test_gen.py
           python3 -I tools/crossref/test_crossref.py
           python3 -I tools/inference/test_inference.py
+          python3 -I tools/site/test_site.py
   doc-scan:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
