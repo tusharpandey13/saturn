@@ -542,7 +542,8 @@ def main(argv):
                pathlib.Path(opt("--db")) if opt("--db") else data_dir / "kb.sqlite")
     tg_dir = pathlib.Path(opt("--telegram")).resolve() if opt("--telegram") else data_dir / "telegram"
     show = lambda p: p.relative_to(root) if p.is_relative_to(root) else p
-    schemas = {p.name.split(".")[0]: json.loads(p.read_text()) for p in SCHEMA_DIR.glob("*.schema.json")}
+    schemas = {p.name.split(".")[0]: json.loads(p.read_text()) for p in SCHEMA_DIR.glob("*.schema.json")
+               if p.name != "catalog.schema.json"}  # the service catalog (tools/catalog), not a KB kind
     bad = [f"schema/{k}.schema.json {e}" for k, sch in sorted(schemas.items()) for e in unknown_keywords(sch)]
     if bad:
         print("\n".join(f"error: {e}" for e in bad), file=sys.stderr)

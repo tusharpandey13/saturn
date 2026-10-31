@@ -1,0 +1,203 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/tusharpandey13/saturn/schema/catalog.schema.json",
+ "title": "Saturn catalog entity (Backstage entity vocabulary + an x-saturn block)",
+ "description": "One YAML document per entity in an environment repo's catalog/*.yaml. Spec: docs/catalog.md. Checked by tools/catalog/catalog validate (this schema, then cross-references, unique names and the no-secret-values rule).",
+ "type": "object",
+ "required": ["apiVersion", "kind", "metadata", "spec"],
+ "additionalProperties": false,
+ "properties": {
+  "apiVersion": {"const": "backstage.io/v1alpha1"},
+  "kind": {"enum": ["System", "Component", "API", "Resource", "Group"]},
+  "metadata": {"$ref": "#/$defs/metadata"},
+  "spec": {"type": "object"},
+  "x-saturn": {"$ref": "#/$defs/xsaturn"}
+ },
+ "allOf": [
+  {"if": {"properties": {"kind": {"const": "System"}}}, "then": {"properties": {"spec": {"$ref": "#/$defs/systemSpec"}}}},
+  {"if": {"properties": {"kind": {"const": "Component"}}}, "then": {"properties": {"spec": {"$ref": "#/$defs/componentSpec"}}}},
+  {"if": {"properties": {"kind": {"const": "API"}}}, "then": {"properties": {"spec": {"$ref": "#/$defs/apiSpec"}}}},
+  {"if": {"properties": {"kind": {"const": "Resource"}}}, "then": {"properties": {"spec": {"$ref": "#/$defs/resourceSpec"}}}},
+  {"if": {"properties": {"kind": {"const": "Group"}}}, "then": {"properties": {"spec": {"$ref": "#/$defs/groupSpec"}}}}
+ ],
+ "$defs": {
+  "name": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"},
+  "ref": {"description": "[kind:]name; the name alone when it is unique", "type": "string", "pattern": "^((system|component|api|resource|group):)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"},
+  "refs": {"type": "array", "items": {"$ref": "#/$defs/ref"}},
+  "text": {"type": "string", "minLength": 1},
+  "lifecycle": {"enum": ["experimental", "trial", "production", "deprecated"]},
+  "metadata": {
+   "type": "object",
+   "required": ["name", "description"],
+   "additionalProperties": false,
+   "properties": {
+    "name": {"$ref": "#/$defs/name"},
+    "title": {"$ref": "#/$defs/text"},
+    "description": {"$ref": "#/$defs/text"},
+    "tags": {"type": "array", "items": {"type": "string", "pattern": "^[a-z0-9:+#-]+$"}},
+    "links": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": ["url"],
+      "additionalProperties": false,
+      "properties": {"url": {"$ref": "#/$defs/text"}, "title": {"$ref": "#/$defs/text"}, "type": {"type": "string"}}
+     }
+    }
+   }
+  },
+  "systemSpec": {
+   "type": "object",
+   "required": ["owner"],
+   "additionalProperties": false,
+   "properties": {"owner": {"$ref": "#/$defs/ref"}, "lifecycle": {"$ref": "#/$defs/lifecycle"}, "dependsOn": {"$ref": "#/$defs/refs"}}
+  },
+  "componentSpec": {
+   "type": "object",
+   "required": ["type", "lifecycle", "owner"],
+   "additionalProperties": false,
+   "properties": {
+    "type": {"enum": ["service", "cli", "job", "website", "library"]},
+    "lifecycle": {"$ref": "#/$defs/lifecycle"},
+    "owner": {"$ref": "#/$defs/ref"},
+    "system": {"$ref": "#/$defs/ref"},
+    "subcomponentOf": {"$ref": "#/$defs/ref"},
+    "dependsOn": {"$ref": "#/$defs/refs"},
+    "providesApis": {"$ref": "#/$defs/refs"},
+    "consumesApis": {"$ref": "#/$defs/refs"}
+   }
+  },
+  "apiSpec": {
+   "type": "object",
+   "required": ["type", "lifecycle", "owner"],
+   "additionalProperties": false,
+   "properties": {
+    "type": {"enum": ["openapi", "other"]},
+    "lifecycle": {"$ref": "#/$defs/lifecycle"},
+    "owner": {"$ref": "#/$defs/ref"},
+    "system": {"$ref": "#/$defs/ref"},
+    "definition": {"description": "a URL or repo path of the definition (not the text)", "$ref": "#/$defs/text"}
+   }
+  },
+  "resourceSpec": {
+   "type": "object",
+   "required": ["type", "owner"],
+   "additionalProperties": false,
+   "properties": {
+    "type": {"enum": ["database", "bucket", "repo", "queue", "file-store", "host", "network", "secret-store"]},
+    "lifecycle": {"$ref": "#/$defs/lifecycle"},
+    "owner": {"$ref": "#/$defs/ref"},
+    "system": {"$ref": "#/$defs/ref"},
+    "dependsOn": {"$ref": "#/$defs/refs"}
+   }
+  },
+  "groupSpec": {
+   "type": "object",
+   "required": ["type"],
+   "additionalProperties": false,
+   "properties": {
+    "type": {"enum": ["person", "team", "org"]},
+    "parent": {"$ref": "#/$defs/ref"},
+    "children": {"$ref": "#/$defs/refs"}
+   }
+  },
+  "xsaturn": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "urls": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": ["url"],
+      "additionalProperties": false,
+      "properties": {"name": {"type": "string"}, "url": {"$ref": "#/$defs/text"}, "tailnet": {"type": "boolean"}, "phi": {"type": "boolean"}}
+     }
+    },
+    "ports": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": ["port"],
+      "additionalProperties": false,
+      "properties": {
+       "port": {"type": "integer"},
+       "bind": {"type": "string"},
+       "protocol": {"type": "string"},
+       "tailnet": {"type": "boolean"},
+       "note": {"type": "string"}
+      }
+     }
+    },
+    "auth": {
+     "type": "object",
+     "required": ["method"],
+     "additionalProperties": false,
+     "properties": {
+      "method": {"$ref": "#/$defs/text"},
+      "secrets": {
+       "description": "secret NAMES and where they live; never values",
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": ["name", "location"],
+        "additionalProperties": false,
+        "properties": {"name": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"}, "location": {"$ref": "#/$defs/text"}, "note": {"type": "string"}}
+       }
+      },
+      "notes": {"type": "string"}
+     }
+    },
+    "health": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "http": {
+       "type": "object",
+       "required": ["url"],
+       "additionalProperties": false,
+       "properties": {
+        "url": {"$ref": "#/$defs/text"},
+        "status": {"type": "integer"},
+        "conditions": {"type": "array", "items": {"type": "string"}}
+       }
+      },
+      "unit": {"type": "string"},
+      "metric": {"type": "string"},
+      "check": {"description": "the Gatus check (group/name) that watches this", "type": "string", "pattern": "^[a-z0-9-]+/[a-z0-9-]+$"},
+      "gatus": {
+       "description": "generate a Gatus endpoint from health.http (tools/catalog/catalog gen gatus)",
+       "type": "object",
+       "required": ["group", "name"],
+       "additionalProperties": false,
+       "properties": {"group": {"$ref": "#/$defs/name"}, "name": {"$ref": "#/$defs/name"}, "interval": {"type": "string", "pattern": "^[0-9]+[smh]$"}}
+      },
+      "description": {"description": "what it means when the check fails (alert text)", "type": "string"}
+     }
+    },
+    "data": {
+     "type": "object",
+     "required": ["phi"],
+     "additionalProperties": false,
+     "properties": {
+      "phi": {"type": "boolean"},
+      "reads": {"type": "array", "items": {"type": "string"}},
+      "writes": {"type": "array", "items": {"type": "string"}},
+      "notes": {"type": "string"}
+     }
+    },
+    "docs": {"description": "<repo>:<path>[#anchor] or a URL", "type": "array", "items": {"type": "string", "pattern": "^([a-z0-9-]+:[^\\s]+|https://\\S+)$"}},
+    "runbook": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": ["what", "cmd"],
+      "additionalProperties": false,
+      "properties": {"what": {"$ref": "#/$defs/text"}, "cmd": {"$ref": "#/$defs/text"}, "where": {"type": "string"}}
+     }
+    },
+    "agents": {"description": "notes for agents: how to use it, what not to do", "type": "string"}
+   }
+  }
+ }
+}

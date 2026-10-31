@@ -1,0 +1,93 @@
+# A made-up hosted app. Synthetic only.
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: owner
+  title: Owner
+  description: The single owner of every environment (example).
+spec:
+  type: person
+---
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: example-app
+  title: Example app
+  description: A chat bot that stores messages and runs a nightly job.
+  tags: [example]
+spec:
+  owner: group:owner
+  lifecycle: production
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: example-worker
+  title: Example Worker
+  description: >
+    Receives webhook calls and writes messages to the database.
+  links:
+    - url: https://worker.example.invalid/health
+      title: Health
+spec:
+  type: service
+  lifecycle: production
+  owner: group:owner
+  system: example-app
+  dependsOn: [resource:example-db, example-bucket]
+  providesApis: [example-webhook]
+x-saturn:
+  urls:
+    - {name: health, url: "https://worker.example.invalid/health", tailnet: false}
+  auth:
+    method: webhook secret header
+    secrets:
+      - {name: WEBHOOK_SECRET, location: secrets/example.sops.env}
+  health:
+    http:
+      url: https://worker.example.invalid/health
+      status: 200
+      conditions: ["[BODY] == ok"]
+    gatus: {group: external, name: example-worker, interval: 5m}
+    description: Example Worker /health failing
+  data:
+    phi: false
+    writes: [example-db, example-bucket]
+  docs: [example-env:docs/worker.md]
+  runbook:
+    - {what: tail logs, cmd: "wrangler tail example-worker"}
+  agents: |
+    Read-only for agents. Deploys go through the deploy workflow.
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: example-webhook
+  description: The webhook the chat platform calls.
+spec:
+  type: other
+  lifecycle: production
+  owner: owner
+  system: example-app
+---
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: example-db
+  description: SQL database for messages.
+spec:
+  type: database
+  owner: group:owner
+  system: example-app
+x-saturn:
+  data: {phi: false, notes: "synthetic"}
+---
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: example-bucket
+  description: Object storage for uploads.
+spec:
+  type: bucket
+  owner: group:owner
+  system: example-app

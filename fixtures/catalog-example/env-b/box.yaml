@@ -1,0 +1,62 @@
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: home-box
+  title: Home box
+  description: A small home server that runs agents and checks.
+spec:
+  owner: group:owner
+---
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: box
+  description: The machine itself (example).
+spec:
+  type: host
+  owner: group:owner
+  system: home-box
+x-saturn:
+  runbook:
+    - {what: status, cmd: "scripts/ops status", where: laptop}
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: box-router
+  title: Router
+  description: Routes jobs to agents.
+spec:
+  type: service
+  lifecycle: production
+  owner: group:owner
+  system: home-box
+  dependsOn: [resource:box]
+  consumesApis: [api:example-webhook]
+x-saturn:
+  ports:
+    - {port: 8787, bind: 127.0.0.1, protocol: http}
+  health:
+    http: {url: "http://127.0.0.1:8787/healthz", status: 200, conditions: ["[BODY].ok == true"]}
+    gatus: {group: core, name: box-router}
+    unit: box-router.service
+    description: router /healthz failing
+  data: {phi: false}
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: box-checks
+  description: Health checks with alerts.
+spec:
+  type: service
+  lifecycle: production
+  owner: group:owner
+  system: home-box
+  dependsOn: [box]
+x-saturn:
+  urls:
+    - {name: page, url: "https://box.example-tailnet.invalid/", tailnet: true}
+  health:
+    unit: checks.service
+    check: core/box-router

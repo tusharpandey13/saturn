@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""Saturn service catalog tool (stdlib only). Spec: docs/catalog.md; schema: schema/catalog.schema.json.
+
+  catalog validate DIR...
+  catalog merge DIR... [-o FILE]
+  catalog gen wellknown DIR... [-o FILE]
+  catalog gen llms DIR... --out DIR [--title T] [--summary S]
+  catalog gen agents-md DIR... --target FILE [--check]
+  catalog gen gatus DIR... [--format yaml|json] [--alert-type custom] [-o FILE]
+
+Exit: 0 ok, 1 invalid catalog (or --check found a stale file), 2 usage.
+"""
+import argparse, json, pathlib, re, sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+SCHEMA = ROOT / "schema" / "catalog.schema.json"
+KINDS = ("Group", "System", "Resource", "Component", "API")
+START, END = "<!-- catalog:where-is-what start -->", "<!-- catalog:where-is-what end -->"
+
+
+class CatalogError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- YAML subset
+def _strip_comment(s):
+    """Drop a ` #` comment outside quotes."""
+    q = None
+    esc = False
+    for i, c in enumerate(s):
+        if q:
+            if esc:
+                esc = False
+            elif c == "\\" and q == '"':
+                esc = True
+            elif c == q:
+                q = None
+        elif c in "\"'":
+            if i == 0 or s[i - 1] in " [{,:":
+                q = c
+        elif c == "#" and (i == 0 or s[i - 1] in " \t"):
+            return s[:i].rstrip()
+    return s.rstrip()
+
+
+def _split_flow(s, where):
+    out, depth, q, cur, esc = [], 0, None, "", False
+    for c in s:
+        if q:
+            cur += c
+            if esc:
+                esc = False
+            elif c == "\\" and q == '"':
+                esc = True
+            elif c == q:
+                q = None
+            continue
+        if c in "\"'" and (not cur.strip() or cur.rstrip().endswith(":")):
+            q = c
+        elif c in "[{":
+            depth += 1
+        elif c in "]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+    if q or depth:
+        raise CatalogError(f"{where}: unbalanced flow value")
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _scalar(v, where):
+    v = v.strip()
+    if not v:
+        return None
+    if v[0] == '"':
+        if len(v) < 2 or v[-1] != '"':
+            raise CatalogError(f"{where}: unterminated string")
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError as e:
+            raise CatalogError(f"{where}: bad double-quoted string ({e.msg})")
+    if v[0] == "'":
+        if len(v) < 2 or v[-1] != "'":
+            raise CatalogError(f"{where}: unterminated string")
+        return v[1:-1].replace("''", "'")
+    if v[0] == "[":
+        if v[-1] != "]":
+            raise CatalogError(f"{where}: unterminated flow list")
+        return [_scalar(x, where) for x in _split_flow(v[1:-1], where)]
+    if v[0] == "{":
+        if v[-1] != "}":
+            raise CatalogError(f"{where}: unterminated flow map")
+        d = {}
+        for item in _split_flow(v[1:-1], where):
+            m = re.match(r"^([A-Za-z0-9_.-]+|\"[^\"]*\")\s*:\s*(.*)$", item)
+            if not m:
+                raise CatalogError(f"{where}: bad flow map item {item!r}")
+            d[m.group(1).strip('"')] = _scalar(m.group(2), where)
+        return d
+    if v[0] in "&*!|>%@`":
+        raise CatalogError(f"{where}: unsupported YAML ({v[0]})")
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    return {"true": True, "false": False, "null": None, "~": None}.get(v, v)
+
+
+KEY_RE = re.compile(r"^([A-Za-z0-9_.$/-]+|\"[^\"]*\"):(?:\s+(.*))?$")
+
+
+class _Lines:
+    def __init__(self, text, where):
+        self.where, self.items = where, []  # (lineno, indent, body, raw)
+        for n, raw in enumerate(text.splitlines(), 1):
+            if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+                raise CatalogError(f"{where}:{n}: tab indentation")
+            self.items.append((n, len(raw) - len(raw.lstrip(" ")), raw))
+        self.i = 0
+
+    def peek(self):
+        """Next meaningful line: (n, indent, body) or None."""
+        while self.i < len(self.items):
+            n, ind, raw = self.items[self.i]
+            body = _strip_comment(raw.strip())
+            if body:
+                return n, ind, body
+            self.i += 1
+        return None
+
+
+def _block_text(L, parent_indent, style, n0):
+    lines, ind = [], None
+    while L.i < len(L.items):
+        n, i, raw = L.items[L.i]
+        if raw.strip() == "":
+            lines.append("")
+            L.i += 1
+            continue
+        if i <= parent_indent:
+            break
+        if ind is None:
+            ind = i
+        if i < ind:
+            break
+        lines.append(raw[ind:].rstrip())
+        L.i += 1
+    while lines and lines[-1] == "":
+        lines.pop()
+    if style.startswith(">"):
+        paras, cur = [], []
+        for ln in lines:
+            if ln == "":
+                paras.append(" ".join(cur))
+                cur = []
+            else:
+                cur.append(ln)
+        paras.append(" ".join(cur))
+        text = "\n".join(paras)
+    else:
+        text = "\n".join(lines)
+    return text if style.endswith("-") else text + "\n"
+
+
+def _value(L, rest, indent, where):
+    """The value after `key:` (rest may be empty: then a nested block follows)."""
+    if rest is not None and rest.strip():
+        r = _strip_comment(rest)
+        if r in ("|", "|-", ">", ">-"):
+            L.i += 1
+            return _block_text(L, indent, r, where)
+        L.i += 1
+        return _scalar(r, where)
+    L.i += 1
+    nxt = L.peek()
+    if nxt is None or nxt[1] < indent or (nxt[1] == indent and not nxt[2].startswith("- ") and nxt[2] != "-"):
+        return None
+    if nxt[1] == indent:  # a list at the key's own indent
+        return _block(L, indent)
+    return _block(L, nxt[1])
+
+
+def _block(L, indent):
+    first = L.peek()
+    is_list = first[2] == "-" or first[2].startswith("- ")
+    out = [] if is_list else {}
+    while True:
+        p = L.peek()
+        if p is None or p[1] < indent:
+            return out
+        n, ind, body = p
+        where = f"{L.where}:{n}"
+        if ind > indent:
+            raise CatalogError(f"{where}: unexpected indentation")
+        if body == "---":
+            return out
+        if is_list:
+            if not (body == "-" or body.startswith("- ")):
+                return out  # a list at its key's indent ends at the next key (the parent map checks it)
+            item = body[1:].strip()
+            if not item:
+                L.i += 1
+                nxt = L.peek()
+                out.append(_block(L, nxt[1]) if nxt and nxt[1] > indent else None)
+                continue
+            m = KEY_RE.match(item)
+            if m and not item.startswith(("{", "[", '"', "'")):
+                # a map inside a list item: re-read this line as a map at the item's content indent
+                sub = indent + (len(body) - len(item))
+                _, _, raw = L.items[L.i]
+                L.items[L.i] = (n, sub, " " * sub + raw.strip()[len(body) - len(item):])
+                out.append(_block(L, sub))
+            else:
+                out.append(_scalar(item, where))
+                L.i += 1
+        else:
+            m = KEY_RE.match(body)
+            if not m:
+                raise CatalogError(f"{where}: expected `key: value`")
+            k = m.group(1).strip('"')
+            if k in out:
+                raise CatalogError(f"{where}: duplicate key {k!r}")
+            out[k] = _value(L, m.group(2), indent, where)
+
+
+def parse_yaml(text, where):
+    """-> list of documents (a YAML subset: docs/catalog.md)."""
+    L, docs = _Lines(text, where), []
+    while True:
+        p = L.peek()
+        if p is None:
+            return docs
+        n, ind, body = p
+        if body == "---":
+            L.i += 1
+            continue
+        if ind != 0:
+            raise CatalogError(f"{where}:{n}: a document must start at column 0")
+        docs.append(_block(L, 0))
+
+
+# ---------------------------------------------------------------- JSON Schema (the subset catalog.schema.json uses)
+def _schema_errors(inst, sch, root, path="$"):
+    if "$ref" in sch:
+        node = root
+        for part in sch["$ref"].lstrip("#/").split("/"):
+            node = node[part]
+        return _schema_errors(inst, node, root, path)
+    errs = []
+    t = sch.get("type")
+    types = {"object": dict, "array": list, "string": str, "boolean": bool}
+    if t == "integer":
+        if not isinstance(inst, int) or isinstance(inst, bool):
+            return [f"{path}: expected an integer"]
+    elif t:
+        if not isinstance(inst, types[t]) or (t != "boolean" and isinstance(inst, bool)):
+            return [f"{path}: expected {t}"]
+    if "const" in sch and inst != sch["const"]:
+        errs.append(f"{path}: must be {sch['const']!r}")
+    if "enum" in sch and inst not in sch["enum"]:
+        errs.append(f"{path}: {inst!r} is not one of {', '.join(map(str, sch['enum']))}")
+    if isinstance(inst, str):
+        if "pattern" in sch and not re.search(sch["pattern"], inst):
+            errs.append(f"{path}: {inst!r} does not match {sch['pattern']}")
+        if len(inst) < sch.get("minLength", 0):
+            errs.append(f"{path}: empty")
+    if isinstance(inst, dict):
+        for r in sch.get("required", []):
+            if r not in inst:
+                errs.append(f"{path}: missing {r}")
+        props = sch.get("properties", {})
+        for k, v in inst.items():
+            if k in props:
+                errs += _schema_errors(v, props[k], root, f"{path}.{k}")
+            elif sch.get("additionalProperties") is False:
+                errs.append(f"{path}: unknown key {k!r}")
+    if isinstance(inst, list) and "items" in sch:
+        for i, v in enumerate(inst):
+            errs += _schema_errors(v, sch["items"], root, f"{path}[{i}]")
+    for sub in sch.get("allOf", []):
+        if "if" in sub:
+            if not _schema_errors(inst, sub["if"], root, path):
+                errs += _schema_errors(inst, sub["then"], root, path)
+        else:
+            errs += _schema_errors(inst, sub, root, path)
+    return errs
+
+
+# ---------------------------------------------------------------- secrets
+SECRET_RES = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY"), "private key"),
+    (re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"), "GitHub token"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "GitHub token"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "API key"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "Slack token"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS key"),
+    (re.compile(r"\btskey-[A-Za-z0-9-]{10,}"), "Tailscale key"),
+    (re.compile(r"\bAGE-SECRET-KEY-1[0-9A-Z]{20,}"), "age key"),
+    (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b"), "Telegram bot token"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), "JWT"),
+]
+TOKEN_RE = re.compile(r"[A-Za-z0-9+=_-]{32,}")
+
+
+def _random_looking(tok):
+    if re.fullmatch(r"[A-Z][A-Z0-9_]*", tok) or (re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", tok)
+                                                 and not re.fullmatch(r"[0-9a-f-]+", tok)):
+        return False  # names: UPPER_SNAKE or kebab-case words (not hex ids)
+    classes = sum(bool(re.search(p, tok)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]"))
+    return classes >= 2 and len(set(tok)) >= 12
+
+
+def secret_findings(obj, path="$"):
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out += secret_findings(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            out += secret_findings(v, f"{path}[{i}]")
+    elif isinstance(obj, str):
+        for rx, what in SECRET_RES:
+            if rx.search(obj):
+                out.append(f"{path}: looks like a {what}")
+        for tok in TOKEN_RE.findall(obj):
+            if _random_looking(tok):
+                out.append(f"{path}: random-looking value {tok[:6]}... (secrets and opaque ids stay out of the catalog)")
+    return out
+
+
+# ---------------------------------------------------------------- load + validate
+REF_FIELDS = {  # spec field -> allowed target kinds
+    "owner": ("Group",), "system": ("System",), "subcomponentOf": ("Component",), "parent": ("Group",),
+    "children": ("Group",), "dependsOn": ("Component", "Resource", "System", "API"),
+    "providesApis": ("API",), "consumesApis": ("API",),
+}
+
+
+def load(dirs):
+    ents, errs = [], []
+    schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+    for d in dirs:
+        p = pathlib.Path(d)
+        if not p.is_dir():
+            raise CatalogError(f"{d}: not a directory")
+        files = sorted(p.glob("*.yaml")) + sorted(p.glob("*.yml"))
+        if not files:
+            errs.append(f"{d}: no *.yaml files")
+        for f in files:
+            try:
+                docs = parse_yaml(f.read_text(encoding="utf-8"), str(f))
+            except CatalogError as e:
+                errs.append(str(e))
+                continue
+            for i, doc in enumerate(docs):
+                where = f"{f}[{i}]"
+                if not isinstance(doc, dict):
+                    errs.append(f"{where}: an entity must be a map")
+                    continue
+                errs += [f"{where} {e}" for e in _schema_errors(doc, schema, schema)]
+                errs += [f"{where} {e}" for e in secret_findings(doc)]
+                ents.append((where, doc))
+    return ents, errs
+
+
+def _name(e):
+    return (e.get("metadata") or {}).get("name")
+
+
+def resolve(ref, by_name):
+    kind, _, name = ref.rpartition(":")
+    e = by_name.get(name)
+    if e is None or (kind and e["kind"].lower() != kind):
+        return None
+    return e
+
+
+def validate(dirs):
+    ents, errs = load(dirs)
+    by_name = {}
+    for where, e in ents:
+        n = _name(e)
+        if n in by_name:
+            errs.append(f"{where}: name {n!r} is not unique")
+        elif n:
+            by_name[n] = e
+    for where, e in ents:
+        spec = e.get("spec") if isinstance(e.get("spec"), dict) else {}
+        for field, kinds in REF_FIELDS.items():
+            vals = spec.get(field)
+            for ref in vals if isinstance(vals, list) else ([vals] if isinstance(vals, str) else []):
+                t = resolve(ref, by_name)
+                if t is None:
+                    errs.append(f"{where}: spec.{field} {ref!r} does not resolve")
+                elif t["kind"] not in kinds:
+                    errs.append(f"{where}: spec.{field} {ref!r} is a {t['kind']}, expected {'/'.join(kinds)}")
+        h = (e.get("x-saturn") or {}).get("health") or {}
+        if isinstance(h, dict) and "gatus" in h and "http" not in h:
+            errs.append(f"{where}: x-saturn.health.gatus needs health.http")
+    gat = [(h["gatus"]["group"], h["gatus"]["name"]) for _, e in ents
+           for h in [((e.get("x-saturn") or {}).get("health") or {})] if isinstance(h.get("gatus"), dict)]
+    for g in sorted({g for g in gat if gat.count(g) > 1}):
+        errs.append(f"gatus check {g[0]}/{g[1]} is generated twice")
+    if errs:
+        raise CatalogError("\n".join(errs))
+    order = {k: i for i, k in enumerate(KINDS)}
+    return sorted((e for _, e in ents), key=lambda e: (order[e["kind"]], _name(e)))
+
+
+# ---------------------------------------------------------------- generators
+def _yaml_scalar(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, int):
+        return str(v)
+    return json.dumps(v, ensure_ascii=False)
+
+
+def to_yaml(obj, ind=0):
+    pad, lines = " " * ind, []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = k if re.fullmatch(r"[A-Za-z0-9_.$/-]+", k) else json.dumps(k)
+            if isinstance(v, (dict, list)) and v:
+                lines.append(f"{pad}{key}:")
+                lines.append(to_yaml(v, ind + 2))
+            else:
+                lines.append(f"{pad}{key}: {_yaml_scalar(v) if not isinstance(v, (dict, list)) else ('{}' if isinstance(v, dict) else '[]')}")
+    elif isinstance(obj, list):
+        for v in obj:
+            if isinstance(v, (dict, list)) and v:
+                sub = to_yaml(v, ind + 2)
+                lines.append(f"{pad}- {sub.lstrip()}")
+            else:
+                lines.append(f"{pad}- {_yaml_scalar(v)}")
+    return "\n".join(lines)
+
+
+def x(e, *path, default=None):
+    v = e.get("x-saturn") or {}
+    for p in path:
+        if not isinstance(v, dict) or p not in v:
+            return default
+        v = v[p]
+    return v
+
+
+def kind_type(e):
+    t = (e.get("spec") or {}).get("type")
+    return f"{e['kind']}" + (f" ({t})" if t else "")
+
+
+def one_line(s):
+    return " ".join(str(s).split())
+
+
+def where_of(e):
+    """Short 'where it is reached' text."""
+    bits = []
+    for u in x(e, "urls", default=[]):
+        bits.append(u["url"] + (" (tailnet)" if u.get("tailnet") else ""))
+    for p in x(e, "ports", default=[]):
+        bits.append(f"{p.get('bind', '')}:{p['port']}".lstrip(":") if p.get("bind") else f":{p['port']}")
+    if not bits:
+        bits += [l["url"] for l in (e["metadata"].get("links") or [])]
+    return ", ".join(bits)
+
+
+def health_of(e):
+    h = x(e, "health", default={}) or {}
+    bits = []
+    if h.get("check") or h.get("gatus"):
+        g = h.get("gatus")
+        bits.append("Gatus " + (h.get("check") or f"{g['group']}/{g['name']}"))
+    if h.get("unit"):
+        bits.append(h["unit"])
+    if h.get("http") and not h.get("gatus"):
+        bits.append(h["http"]["url"])
+    return ", ".join(bits)
+
+
+def gen_wellknown(ents):
+    return json.dumps({"catalog": "saturn", "format": "docs/catalog.md (Backstage entities + x-saturn)",
+                       "entities": ents}, indent=1, ensure_ascii=False) + "\n"
+
+
+def gen_gatus(ents, alert_type="custom"):
+    out = []
+    for e in ents:
+        h = x(e, "health", default={}) or {}
+        if not isinstance(h.get("gatus"), dict):
+            continue
+        g, http = h["gatus"], h["http"]
+        ep = {"name": g["name"], "group": g["group"], "url": http["url"], "interval": g.get("interval", "1m"),
+              "conditions": ([f"[STATUS] == {http['status']}"] if "status" in http else []) + list(http.get("conditions", []))}
+        if h.get("description"):
+            ep["alerts"] = [{"type": alert_type, "description": h["description"]}]
+        out.append(ep)
+    return sorted(out, key=lambda ep: (ep["group"], ep["name"]))
+
+
+def gen_llms(ents, title, summary):
+    systems = [e for e in ents if e["kind"] == "System"]
+    short = [f"# {title}", "", f"> {summary}", "",
+             "Machine-readable: `/.well-known/saturn-catalog.json` (every entity, Backstage format + `x-saturn`). "
+             "Every entity in full: `/llms-full.txt`. Format: the Saturn product's docs/catalog.md.", ""]
+    full = list(short)
+    for s in systems:
+        members = [e for e in ents if (e.get("spec") or {}).get("system") in (s["metadata"]["name"], "system:" + s["metadata"]["name"])]
+        short += [f"## {s['metadata'].get('title', s['metadata']['name'])}", "", one_line(s["metadata"]["description"]), ""]
+        for e in members:
+            w = where_of(e)
+            short.append(f"- {e['metadata']['name']} [{kind_type(e)}]: {one_line(e['metadata']['description'])}"
+                         + (f" At: {w}." if w else ""))
+        short.append("")
+    rest = [e for e in ents if e["kind"] != "System" and not (e.get("spec") or {}).get("system")]
+    if rest:
+        short += ["## Other", ""] + [f"- {e['metadata']['name']} [{kind_type(e)}]: {one_line(e['metadata']['description'])}" for e in rest] + [""]
+    for e in ents:
+        m, spec = e["metadata"], e.get("spec") or {}
+        full += [f"## {m['name']}" + (f": {m['title']}" if m.get("title") else ""), "", one_line(m["description"]), "",
+                 f"- kind: {kind_type(e)}"]
+        for k in ("lifecycle", "owner", "system", "subcomponentOf", "parent"):
+            if spec.get(k):
+                full.append(f"- {k}: {spec[k]}")
+        for k in ("dependsOn", "providesApis", "consumesApis", "children"):
+            if spec.get(k):
+                full.append(f"- {k}: {', '.join(spec[k])}")
+        if m.get("tags"):
+            full.append(f"- tags: {', '.join(m['tags'])}")
+        for l in m.get("links") or []:
+            full.append(f"- link: [{l.get('title', l['url'])}]({l['url']})")
+        for u in x(e, "urls", default=[]):
+            flags = [f for f, on in (("tailnet only", u.get("tailnet")), ("shows health data", u.get("phi"))) if on]
+            full.append(f"- url{' ' + u['name'] if u.get('name') else ''}: {u['url']}" + (f" ({', '.join(flags)})" if flags else ""))
+        for p in x(e, "ports", default=[]):
+            full.append(f"- port: {p.get('bind', '*')}:{p['port']}" + "".join(f" {p[k]}" for k in ("protocol",) if p.get(k))
+                        + (" (tailnet)" if p.get("tailnet") else "") + (f": {p['note']}" if p.get("note") else ""))
+        a = x(e, "auth")
+        if a:
+            full.append(f"- auth: {one_line(a['method'])}" + (f"; {one_line(a['notes'])}" if a.get("notes") else ""))
+            for s in a.get("secrets", []):
+                full.append(f"  - secret {s['name']} in {s['location']}" + (f" ({one_line(s['note'])})" if s.get("note") else ""))
+        h = x(e, "health")
+        if h:
+            hb = []
+            if h.get("http"):
+                hb.append(f"GET {h['http']['url']}" + (f" -> {h['http']['status']}" if "status" in h["http"] else "")
+                          + "".join(f", {c}" for c in h["http"].get("conditions", [])))
+            if h.get("unit"):
+                hb.append(f"unit {h['unit']}")
+            if h.get("metric"):
+                hb.append(f"metric `{h['metric']}`")
+            g = h.get("check") or (h.get("gatus") and f"{h['gatus']['group']}/{h['gatus']['name']}")
+            if g:
+                hb.append(f"Gatus check {g}")
+            full.append(f"- health: {'; '.join(hb)}" + (f" (fails = {one_line(h['description'])})" if h.get("description") else ""))
+        d = x(e, "data")
+        if d:
+            full.append(f"- data: {'PHI (health data)' if d['phi'] else 'no PHI'}"
+                        + (f"; reads {', '.join(d['reads'])}" if d.get("reads") else "")
+                        + (f"; writes {', '.join(d['writes'])}" if d.get("writes") else "")
+                        + (f"; {one_line(d['notes'])}" if d.get("notes") else ""))
+        if x(e, "docs"):
+            full.append(f"- docs: {', '.join(x(e, 'docs'))}")
+        for r in x(e, "runbook", default=[]):
+            full.append(f"- runbook: {one_line(r['what'])}: `{r['cmd']}`" + (f" ({r['where']})" if r.get("where") else ""))
+        if x(e, "agents"):
+            full.append(f"- agents: {one_line(x(e, 'agents'))}")
+        full.append("")
+    return "\n".join(short).rstrip() + "\n", "\n".join(full).rstrip() + "\n"
+
+
+def _cell(s):
+    return one_line(s).replace("|", "\\|")
+
+
+def gen_agents_md(ents):
+    lines = [START, "<!-- generated by tools/catalog/catalog gen agents-md from catalog/*.yaml; edit the catalog, not this block -->",
+             "", "### Where is what (generated from the catalog)", "",
+             "| Name | Kind | What | Where | Health | Docs |", "|---|---|---|---|---|---|"]
+    for e in ents:
+        if e["kind"] == "Group":
+            continue
+        docs = x(e, "docs", default=[])
+        lines.append(f"| `{e['metadata']['name']}` | {kind_type(e)} | {_cell(e['metadata'].get('title') or e['metadata']['description'])} "
+                     f"| {_cell(where_of(e))} | {_cell(health_of(e))} | {_cell(', '.join(docs[:2]))} |")
+    lines += ["", END]
+    return "\n".join(lines)
+
+
+def replace_block(text, block, target):
+    if START not in text or END not in text or text.index(START) > text.index(END):
+        raise CatalogError(f"{target}: markers {START} ... {END} not found")
+    a, b = text.index(START), text.index(END) + len(END)
+    return text[:a] + block + text[b:]
+
+
+# ---------------------------------------------------------------- CLI
+def _write(path, text):
+    if path in (None, "-"):
+        sys.stdout.write(text)
+    else:
+        pathlib.Path(path).write_text(text, encoding="utf-8")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="catalog", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    v = sub.add_parser("validate"); v.add_argument("dirs", nargs="+")
+    m = sub.add_parser("merge"); m.add_argument("dirs", nargs="+"); m.add_argument("-o")
+    g = sub.add_parser("gen"); g.add_argument("what", choices=["wellknown", "llms", "agents-md", "gatus"])
+    g.add_argument("dirs", nargs="+"); g.add_argument("-o"); g.add_argument("--out"); g.add_argument("--target")
+    g.add_argument("--check", action="store_true"); g.add_argument("--format", choices=["yaml", "json"], default="yaml")
+    g.add_argument("--alert-type", default="custom")
+    g.add_argument("--title", default="Saturn: what runs where")
+    g.add_argument("--summary", default="Map of the Saturn deployment for agents: services, data stores, jobs, URLs, health checks, secrets (names only) and docs.")
+    a = ap.parse_args(argv)
+    try:
+        ents = validate(a.dirs)
+        if a.cmd == "validate":
+            counts = {k: sum(e["kind"] == k for e in ents) for k in KINDS}
+            print(f"ok: {len(ents)} entities ({', '.join(f'{k} {n}' for k, n in counts.items() if n)})")
+        elif a.cmd == "merge":
+            _write(a.o, "".join("---\n" + to_yaml(e) + "\n" for e in ents))
+        elif a.what == "wellknown":
+            _write(a.o, gen_wellknown(ents))
+        elif a.what == "gatus":
+            eps = gen_gatus(ents, a.alert_type)
+            _write(a.o, json.dumps(eps, indent=1) + "\n" if a.format == "json" else to_yaml({"endpoints": eps}) + "\n")
+        elif a.what == "llms":
+            if not a.out:
+                ap.error("gen llms needs --out DIR")
+            short, full = gen_llms(ents, a.title, a.summary)
+            pathlib.Path(a.out, "llms.txt").write_text(short, encoding="utf-8")
+            pathlib.Path(a.out, "llms-full.txt").write_text(full, encoding="utf-8")
+        elif a.what == "agents-md":
+            if not a.target:
+                ap.error("gen agents-md needs --target FILE")
+            t = pathlib.Path(a.target)
+            old = t.read_text(encoding="utf-8")
+            new = replace_block(old, gen_agents_md(ents), a.target)
+            if a.check:
+                if new != old:
+                    print(f"{a.target}: the 'Where is what' block is stale (run gen agents-md)", file=sys.stderr)
+                    return 1
+            elif new != old:
+                t.write_text(new, encoding="utf-8")
+    except CatalogError as e:
+        print(f"catalog: invalid\n{e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

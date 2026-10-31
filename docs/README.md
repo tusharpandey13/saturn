@@ -15,6 +15,7 @@ This repo is the **product**: code, schema, templates, generic runbooks and synt
 | How agents reason on open, unexplained problems (diagnostic loop, proposed) | [methods/diagnostic-loop.md](methods/diagnostic-loop.md) |
 | The research behind the decisions | [research/](research/README.md) |
 | Page templates and doc governance | [meta/](meta/README.md) |
+| What runs where in an environment (service catalog format, llms.txt, Gatus checks) | [catalog.md](catalog.md) |
 | Deployment-specific notes (hosts, accounts, costs, token inventory) | the environment repo, not the product |
 
 ## Picking up the work
