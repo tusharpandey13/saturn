@@ -15,7 +15,8 @@ generated: false
 **Facts as written; not advice; doctors decide.**
 
 Decision record: [ADR 012](../decisions/012-continuous-crossref.md) (proposed). This page is the design; the ADR is the
-short decision.
+short decision. Home-series baselines, change checks and the running profile extend this design in
+[health-profile.md](health-profile.md).
 
 ## 1. Goal and boundary
 
