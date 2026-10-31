@@ -308,7 +308,7 @@ The generator reads `<records>/data/kb.sqlite`, built by `tools/kb/build`, throu
 | Care team chips | `ref:party` (display name, role) | Credentials only in the doctor view, as `gen:care-team` |
 | Questions, to-dos | **not in the KB**: `docs/health/<ns>/questions.md`, `docs/health/family/actions.md` | Parsed by heading id and the `Ask/Why/Priority/Audience/Status` fields (D1) |
 | Pending tests, next appointment | **not in the KB as structured rows** | D2 |
-| Agent-inferred notes | `docs/log/analysis/*` front matter or a new `data/<ns>/inferred/*.ndjson` | Must carry `recorded_by: agent` and a `basis` list of fact ids (D6) |
+| Agent-inferred notes | `inferences/<ns>/inferences.ndjson` (`inference/1`, [tools/inference/README.md](../../tools/inference/README.md)): highest `rev` per id, then `status == active`; grouped by problem, ordered by stakes then p | Never mixed into `fact`; each row carries its evidence and "Not a diagnosis. Doctors decide." |
 | Data-quality hints | `v_needs_human`, open hard-reads | A small "n items need a human" line on Today (later) |
 
 **Rule:** any page element whose data is missing is left out, never filled with a placeholder or a guess. An IPS-required section that is empty says why.
@@ -370,7 +370,7 @@ The generator reads `<records>/data/kb.sqlite`, built by `tools/kb/build`, throu
 | D3 | Self-host a Devanagari font now or rely on the phone's system font? | System font now; self-host when Hindi ships |
 | D4 | Harm anchors and guideline bands (for example a BP category): ever shown? | Only when a doctor's documented target or a cited guideline ref exists; labelled with its source |
 | D5 | Allergies: add an `allergy` fact kind, or a condition with a tag? | Condition with category `allergy` plus an explicit "none known" statement fact |
-| D6 | Where agent-inferred notes come from | A small `data/<ns>/inferred/*.ndjson` with `basis` fact ids, so the site can link and expire them; never mixed into `fact` |
+| D6 | Where agent-inferred notes come from | Decided: `inferences/<ns>/inferences.ndjson` (inference records, product v0.9.0); the old `data/<ns>/inferred/` idea is dropped |
 | D7 | Parent access: a parent's phone on the tailnet, or only the owner's phone? | Owner's phone first; add a parent's phone after a trial |
 | D8 | Screens: is History behind Today enough, or should it be a 5th tab? | Keep 4 tabs |
 | D9 | Go-live: serve real records on the home server | Needs the owner's explicit "go" after the build passes on synthetic fixtures |
