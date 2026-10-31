@@ -1,7 +1,7 @@
 // Fixed English labels for the admin digest (ADR 011: the bot writes only to admins, in plain English; Hindi input is
 // still understood). Values shown are never LLM-generated text: they are rendered from the stored records.
 
-import type { Reading, Symptom, SymptomType } from "./types.js";
+import type { PartialReading, Reading, Symptom, SymptomType } from "./types.js";
 
 const SYMPTOM_EN: Partial<Record<SymptomType, string>> = {
   chest_pain: "chest pain/pressure",
@@ -27,9 +27,26 @@ const SYMPTOM_EN: Partial<Record<SymptomType, string>> = {
   urinary: "urinary trouble",
 };
 
-export function readingEn(r: Reading): string {
+const KIND_EN = { average: "device average", "memory-recall": "device memory recall", unknown: "screen indicator, type unclear" } as const;
+
+/** Device-summary and legibility qualifiers: "(device average "AVG AM", 7 days)", "(uncertain: pulse)". */
+function qualifiers(r: Reading | PartialReading): string {
+  const q: string[] = [];
+  if (r.kind && r.kind !== "single") q.push(`${KIND_EN[r.kind]}${r.indicator ? ` "${r.indicator}"` : ""}${r.window ? `, ${r.window}` : ""}`);
+  const missing = Object.keys(r.missing ?? {});
+  if (missing.length) q.push(`not legible: ${missing.join(", ")}`);
+  if (r.uncertain?.length) q.push(`uncertain: ${r.uncertain.join(", ")}`);
+  return q.length ? ` (${q.join("; ")})` : "";
+}
+
+export function readingEn(r: Reading | PartialReading): string {
+  return readingBase(r as Reading) + qualifiers(r);
+}
+
+function readingBase(r: Reading): string {
+  const v = (x: number | null) => (x === null ? "?" : String(x));
   switch (r.type) {
-    case "bp": return `BP ${r.value}/${r.value2}${r.value3 !== null ? `, pulse ${r.value3}` : ""}`;
+    case "bp": return `BP ${v(r.value)}/${v(r.value2)}${r.value3 !== null ? `, pulse ${r.value3}` : ""}`;
     case "weight": return `weight ${r.value} kg`;
     case "pulse": return `pulse ${r.value}`;
     case "spo2": return `SpO2 ${r.value}%`;

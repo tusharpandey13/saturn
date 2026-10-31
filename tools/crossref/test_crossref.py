@@ -393,6 +393,26 @@ class ProfileTest(unittest.TestCase):
         g = [x for x in self.shifts() if x["check"].endswith("sbp-home")]
         self.assertEqual([x["id"] for x in g], [f["id"]])
 
+    def test_device_average_memory_and_partial_screens_stay_out_of_series(self):
+        # The same high days as the sustained-shift case, but read from device average / memory / unclear-indicator /
+        # partly legible screens: not one home measurement each, so no daily value, no baseline input and no flag.
+        high = [r for r in daily_bp("2026-05-18", 3, sys_=150, wobble=(0,)) if r[3] == "bp"]
+        tags = (["device-average"], ["device-memory"], ["partial-reading", "uncertain", "needs-human"])
+        unknown = ("2026-05-18-tg.u.bp", "2026-05-18T11:00:00+05:30", "minute", "bp", (155, 90), "telegram_msg", None,
+                   ["device-type-unknown", "needs-human"])
+        add_home(self.db, daily_bp("2026-05-01", 17) + [(*r[:7], t) for r, t in zip(high, tags)] + [unknown])
+        self.run_xr("2026-05-20")
+        self.assertEqual(self.shifts(), [])
+        sys.path.insert(0, str(HERE))
+        import home_series as hs
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        kb = type("KB", (), {"q": staticmethod(lambda sql, *a: con.execute(sql, a).fetchall())})
+        unused = sorted(r["id"] for r in hs.home_readings(kb, hs.config({}), "alice") if not r["used"])
+        con.close()
+        self.assertEqual(unused, ["alice:fact:2026-05-18-tg.0.bp", "alice:fact:2026-05-18-tg.u.bp",
+                                  "alice:fact:2026-05-19-tg.1.bp", "alice:fact:2026-05-20-tg.2.bp"])
+
     def test_gap_restarts_baseline(self):
         add_home(self.db, daily_bp("2026-03-01", 15) + daily_bp("2026-05-19", 2, sys_=150, wobble=(0,)))
         self.run_xr("2026-05-20")

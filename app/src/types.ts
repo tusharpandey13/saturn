@@ -45,7 +45,26 @@ export interface Reading {
   /** Original value/unit when converted (e.g. 140 lb -> 63.5 kg). */
   sourceValue?: number;
   sourceUnit?: string;
+  /** Device screen type, set only when not a plain single reading: a stored average or memory recall, or "unknown"
+   *  when the model saw an indicator but could not tell (never set for unknown without an indicator). */
+  kind?: ReadingKind;
+  /** The memory/average indicator text or icon seen on the screen ("AVG AM", "M 3/30"), as written. */
+  indicator?: string;
+  /** Count/window of an average or memory recall, if printed ("3 readings", "7 days"). */
+  window?: string;
+  /** BP components read with low confidence. */
+  uncertain?: BpComponent[];
+  /** BP components that could not be read: component -> reason. Their values are null, never filled in. */
+  missing?: Partial<Record<BpComponent, string>>;
 }
+
+export const READING_KINDS = ["single", "average", "memory-recall", "unknown"] as const;
+export type ReadingKind = (typeof READING_KINDS)[number];
+export const BP_COMPONENTS = ["systolic", "diastolic", "pulse", "time"] as const;
+export type BpComponent = (typeof BP_COMPONENTS)[number];
+/** A BP screen with systolic or diastolic illegible (e.g. cropped): the legible parts only, stored tagged uncertain
+ *  with a needs-human row for the missing part. Not a Reading: no rules, no daily series. */
+export type PartialReading = Omit<Reading, "value" | "value2"> & { type: "bp"; value: number | null; value2: number | null; missing: Partial<Record<BpComponent, string>> };
 
 export const SYMPTOM_TYPES = [
   "chest_pain",

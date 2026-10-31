@@ -48,8 +48,16 @@ ${(context ?? "").trim() || DEFAULT_CONTEXT}
 Messages are Hindi, Hinglish or English (Devanagari or Roman script).
 You get one or more numbered messages. Return exactly one result per message, with msg = its number. Messages are independent.
 Rules:
-- Never invent values. If a number is not clearly visible or said, omit the reading. Unknown fields are null.
+- Never invent values. If a number is not clearly visible or said, omit the reading (BP screens: see partly legible below). Unknown fields are null.
 - BP monitor photos: value = SYS, value2 = DIA, value3 = PUL. Read labels; do not swap SYS and DIA.
+- Device memory/average screens: look for "M", "MEM", "AVG", "AVG AM", "AVG PM", "Ave", an average icon or a memory index
+  ("M 3/30"). reading_kind = average (a stored average) or memory-recall (an earlier reading recalled from memory);
+  unknown if an indicator is shown but its meaning is unclear; single for a plain new measurement. indicator = the text
+  or icon exactly as seen; window = the count/window if printed ("3 readings", "7 days"). Never report an average as single.
+- BP screens, partly legible (cropped, glare, blur): fill components with a confidence per component (systolic,
+  diastolic, pulse, clock time). Keep every legible component; an illegible one is null (value null for systolic,
+  value2 for diastolic, value3 for pulse, measured_at for the time) with illegible_reason. Use unreadable_reason only when
+  no component at all can be read. Never guess a cropped digit. Other readings: components null.
 - Oximeter: SpO2 -> type spo2, PR/pulse -> separate type pulse reading.
 - Reports (lab report, imaging/scan report such as MRI/CT/X-ray/USG/echo, discharge summary), as PDF or photo: fill \`report\`, readings stays [].
   Read EVERY page to the end. report.items: EVERY printed result, none skipped, in page order: name exactly as printed,

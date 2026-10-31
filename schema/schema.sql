@@ -144,7 +144,8 @@ WHERE CASE WHEN a.value_num IS NOT NULL AND b.value_num IS NOT NULL
            ELSE coalesce(a.value_num, a.value_text) IS NOT coalesce(b.value_num, b.value_text) END;
 
 -- Human queue: medicines (any statement not human/clinician-verified, or with an open hard read), anything uncertain
--- (open hard read or tag low-confidence), and observations that feed bot alerts (app/src/rules inputs).
+-- (open hard read or tag low-confidence), facts the batch flagged for a human (tag needs-human: a partly legible
+-- device screen, an unclear memory/average indicator) and observations that feed bot alerts (app/src/rules inputs).
 CREATE VIEW v_needs_human AS
 SELECT f.kind, f.id, f.ns,
        coalesce(json_extract(f.data, '$.brand'), json_extract(f.data, '$.code'), json_extract(f.data, '$.label'),
@@ -152,6 +153,7 @@ SELECT f.kind, f.id, f.ns,
        f.source_id, f.page, f.uncertain_ref,
        CASE WHEN f.kind = 'medication' AND f.verification NOT IN ('human','clinician') THEN 'medicine'
             WHEN f.uncertain_ref IS NOT NULL THEN 'uncertain'
+            WHEN EXISTS (SELECT 1 FROM json_each(f.tags) WHERE value = 'needs-human') THEN 'needs-human'
             WHEN EXISTS (SELECT 1 FROM json_each(f.tags) WHERE value = 'low-confidence') THEN 'low-confidence'
             ELSE 'alert-input' END AS reason
 FROM fact f
@@ -159,7 +161,7 @@ WHERE f.status = 'active' AND json_extract(f.data, '$.type') IS NOT 'context' AN
       (f.kind = 'medication' AND f.verification NOT IN ('human','clinician'))
    OR f.uncertain_ref IS NOT NULL
    OR (f.verification NOT IN ('human','clinician') AND (
-         EXISTS (SELECT 1 FROM json_each(f.tags) WHERE value = 'low-confidence')
+         EXISTS (SELECT 1 FROM json_each(f.tags) WHERE value IN ('low-confidence', 'needs-human'))
       OR (f.kind = 'observation' AND json_extract(f.data, '$.code') IN
           ('ref:code:weight','ref:code:bp','ref:code:pulse','ref:code:spo2','ref:code:potassium','ref:code:sodium','ref:code:creatinine')))));
 

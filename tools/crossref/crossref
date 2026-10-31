@@ -40,7 +40,9 @@ CHECK_STATUS = ("active", "disabled", "retired")
 FLAG_ACTIONS = ("useful", "noise", "snooze", "promote", "resolved")
 CLAIM_ACTIONS = ("question", "answered", "retired")
 FAMILY_TAGS = ("family-reported", "patient-reported", "user-report")
-SKIP_TAGS = ("low-confidence",)  # an uncertain or low-confidence fact never carries a flag alone (method section 2)
+# an uncertain or low-confidence fact, a device average/memory recall or a partly legible screen never carries a flag
+# alone (method section 2)
+SKIP_TAGS = ("low-confidence",) + hs.DEVICE_SKIP_TAGS
 BANDED = re.compile(r"\b(years?|yrs?|age[ds]?|male|female|men|women|adults?|child(ren)?|infants?|pregnan\w*)\b|;", re.I)
 MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 QID = re.compile(r"^[a-z][a-z0-9-]*:q:\d{4}$")
