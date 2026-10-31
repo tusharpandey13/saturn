@@ -6,13 +6,17 @@ owner: maintainer
 last_reviewed: 2026-10-31
 review_every: 90d
 status: proposed
-sources: [docs/design/continuous-crossref.md, docs/decisions/007-simplified-clinical-data-model.md, docs/decisions/010-life-context-signals.md, docs/decisions/011-group-input-only-admin-output.md, docs/decisions/012-continuous-crossref.md, schema/schema.sql, tools/kb/build, tools/kb/gen-views, app/src/rules/engine.ts, app/src/config/thresholds.ts, app/src/types.ts]
+sources: [docs/design/continuous-crossref.md, docs/decisions/007-simplified-clinical-data-model.md, docs/decisions/010-life-context-signals.md, docs/decisions/011-group-input-only-admin-output.md, docs/decisions/012-continuous-crossref.md, schema/schema.sql, tools/kb/build, tools/kb/gen-views, app/src/rules/engine.ts, app/src/config/thresholds.ts, app/src/types.ts, tools/crossref/home_series.py]
 generated: false
 ---
 
 # Running health profile from daily readings and voice logs (design, proposed)
 
 **Facts as written; not advice; doctors decide.**
+
+> **Iteration 1 built (31-Oct-2026):** `tools/crossref/home_series.py` (`v_home_daily`), the `baseline_shift`
+> operator, `docs/health/<ns>/profile.md` and the weekly digest line. See section 5.1 for what was built and how it
+> differs from this page.
 
 This page extends [continuous cross-referencing](continuous-crossref.md) (ADR 012, proposed). It does not repeat it.
 That design owns checks, flags, claims, dedup, budgets, routing, feedback and the run log. This page adds three
@@ -316,6 +320,25 @@ The admin digest gets one weekly line per person, for example: "Profile: 3 serie
   - **Span check:** `quote` must be a verbatim substring of the transcript after normalisation; otherwise the row is
     dropped and counted. A small Hindi/Hinglish/English negation cue list cross-checks `presence`. On disagreement
     the row goes to needs-human.
+- **Owner requirements for transcripts (31-Oct-2026).** A member's voice notes may describe past days and carry
+  complex life context, not just today's symptoms. Transcript processing must:
+  - **Resolve relative dates to actual dates, anchored on the message date** (the date the note was sent, not the
+    batch date). Examples: "aaj" / "today", "kal" / "yesterday", "parson", "pichhle hafte" / "last week".
+    - "kal" can mean yesterday or tomorrow. Resolve it from the verb tense; when the tense does not settle it, keep it
+      unresolved and send it to needs-human.
+    - Store the resolved date with its precision (`day`, or a week range for "pichhle hafte"), plus the phrase as
+      spoken.
+  - **Separate past events from current state.** "Last week I fell" is a past event on its resolved date, not a
+    current symptom. Only `current` rows count in the weekly profile (temporality, above). A past event lands on its
+    own date in the timeline, tagged `patient-reported`.
+  - **Attribute speakers.** Record who speaks (the patient, or a relative speaking for her) and whom each item is
+    about (experiencer). An item about someone else is not recorded as hers.
+  - **Keep negations as pertinent negatives.** For example "aaj chakkar nahi aaya" (no dizziness today) is kept as
+    `presence: absent` on the resolved date, never dropped.
+  - **Keep a verbatim quote for every extracted item.** The quote must pass the span check against the transcript.
+  - **Context and life events go through ADR 010's shadow rules.** Per-member consent applies, shadow mode applies
+    until the owner enables it, and the content is shown alongside, never as a cause. These items never become
+    symptom observations.
 - **Codes.** `ref:code` rows for each symptom type gain `data.snomed` (concept id and preferred term), mapped once by
   hand. The licence is noted on the code refs.
 
@@ -394,6 +417,45 @@ red-flag rules.
 | docs (records guide section, this page's status) | 0.25 day |
 | **Total** | **about 2 agent-days** after crossref iteration 1 (about 1.5 days for the standalone variant). Run cost: none. |
 
+### 5.1 As built (iteration 1, 31-Oct-2026)
+
+The build follows sections 3.1 to 3.3, with these differences (each chosen as the smaller option):
+
+- **`v_home_daily` is Python, not SQL.** It lives in `tools/crossref/home_series.py`, because it needs the
+  `gen-views.json` settings, medians and the duplicate rules. `schema/schema.sql` is unchanged.
+- **crossref writes the profile page, not `gen-views`.** Like `flags.md`, `profile.md` is a whole-file generated
+  page, because it needs the flag state of the same run. The batch already commits `docs/health` after crossref.
+- **Owner scope.** There are four check rows, `ref:check:baseline-shift-{sbp,dbp,pulse,weight}-home`, all `routine`.
+  DBP is in by owner request. Its `min_spread` floor of 3 mmHg is an owner parameter, like the other floors.
+  - `escalate_after_days` is not built yet. Every shift stays `routine`.
+  - The "recent" window is the 3 calendar days ending on the latest home value, which must be within `window_days`
+    of today. The baseline is the rest of the 28-day window.
+- **Duplicates.** Both collapse rules run and every collapse is listed on the page with both ids.
+  - When a timed reading and a day-precision relay match, the timed reading is kept (it carries a session).
+  - Collapsed duplicates do **not** yet raise a `data-quality` flag, and the override row that undoes a collapse
+    is not built.
+- **Exclusions.** Low-confidence readings and readings with an open hard read are listed and not used.
+- **Medicines alongside.** Only starts, stops and restarts, as recorded.
+- **Linked analyses.** The page links `profile.links[ns]` plus the 5 newest notes under `docs/log/analysis/` or
+  `docs/log/inference/` whose file name contains the namespace.
+- **Settings.** All live under `profile` in `data/meta/gen-views.json`:
+  - `persons`: null = every namespace with a home reading;
+  - `series`, `home_source_kinds`;
+  - `preferred_session`: a string, or a per-ns object; `any` turns off mixed-session marking;
+  - `sessions`: the IST windows;
+  - `problem_signals`, `links`.
+- **Medicine timing.** A reading records "before" or "after" morning medicines **only when the record says so**:
+  either `data.med_timing`, or a quote or note matching an English or Hinglish pattern ("after morning medicines",
+  "dawai se pehle", "goli ke baad"). Otherwise it is "not stated".
+
+**D1 decided (owner, 31-Oct-2026).** Readings are usually around 11 am, after breakfast and morning chores, but not
+at a rigid time.
+
+- Sessions are tagged by time window, and the page shows the spread of reading times.
+- Time variation is **not** treated as an artefact. The records set `preferred_session: any` for that person, so all
+  of a day's readings make the daily value and no day is marked `mixed-session`.
+- Readings record before/after morning medicines when the data says so.
+
 **Stop condition.** Run for 4 weeks of home data. Keep iteration 2 only if both hold:
 
 - At least 4 days a week have readings. Below that, the first problem is collection, not analysis.
@@ -403,7 +465,7 @@ red-flag rules.
 
 | Iteration | Scope | Effort | Run cost | Gate to start |
 |---|---|---|---|---|
-| **2. Voice-log symptoms** | local ASR wiring for the batch (or the existing pending-STT path with a local adapter); presence, temporality and experiencer fields; span check; Hindi/Hinglish negation cue list; SNOMED map for the symptom vocabulary; profile section 4 counts; a 20-clip hand-corrected WER and extraction eval set (kept in the records repo, never in the product) | 3–4 agent-days + about 2 owner hours for the eval set | existing Haiku budget (small) | iteration 1 kept; the owner's ASR test picks a model |
+| **2. Voice-log symptoms** | local ASR wiring for the batch (or the existing pending-STT path with a local adapter); presence, temporality and experiencer fields; relative dates resolved from the message date, past events kept apart from current state, speakers attributed, verbatim quote per item, life context via ADR 010 shadow rules (owner requirements in 3.4); span check; Hindi/Hinglish negation cue list; SNOMED map for the symptom vocabulary; profile section 4 counts; a 20-clip hand-corrected WER and extraction eval set (kept in the records repo, never in the product) | 3–4 agent-days + about 2 owner hours for the eval set | existing Haiku budget (small) | iteration 1 kept; the owner's ASR test picks a model |
 | **2b. Slow drift** | `ewma_drift` operator for weight and pulse | 1 agent-day | none | 30+ in-control days on a series |
 | **3. Structured daily check-in** | card items (owner-written), `checkin` category and codes, extraction mapping, profile trend of each item (counts of `more` / `yes` per week), red-flag routing for neuro items | 2–3 agent-days + a 2-week family trial | small | iteration 2 extraction precision ≥ 0.9 on the eval set |
 | **4. Local models** | evaluate a local extraction model (llama.cpp-class, 7–8B) against Haiku on the eval set; move ASR fully local if not already; keep Haiku as fallback only when measured agreement says so | about 1 agent-week + host time | none (local), lower API spend | iterations 2–3 eval sets exist; the host has the memory for it |
@@ -451,7 +513,7 @@ red-flag rules.
 
 | # | Decision | Proposed |
 |---|---|---|
-| D1 | Preferred session per person (morning, evening, or any) and whether to ask the family for a fixed time | morning; ask for a fixed time if coverage allows |
+| D1 | Preferred session per person (morning, evening, or any) and whether to ask the family for a fixed time | **Decided 31-Oct-2026:** readings around 11 am after breakfast and morning chores, not rigid. Sessions are tagged by window, time variation is not an artefact (`any`), and before/after morning medicines is recorded when the data says so |
 | D2 | `min_spread` floors and whether to set any `min_delta` from a doctor | floors as in 3.2; no `min_delta` until a doctor gives one |
 | D3 | Which series per person, and the problem-to-signal links | `bp`, `pulse`, `weight` for the profile person; links set by the owner |
 | D4 | Check-in channel: printed card in the voice note (no ADR change), or a member DM (amends ADR 011) | card |

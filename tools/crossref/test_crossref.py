@@ -294,5 +294,181 @@ class CrossrefTest(unittest.TestCase):
         self.assertFalse((self.rec / "docs" / "health" / "alice" / "flags.md").exists())
 
 
+# ------------------------------------------------------------------------------------------------- health profile
+def add_home(db, readings):
+    """readings: (local, at, precision, code, values, source_kind, quote, tags). bp values = (sys, dia)."""
+    con = sqlite3.connect(db)
+    for code, name in (("bp", "Blood pressure"), ("pulse", "Pulse"), ("weight", "Weight")):
+        con.execute("INSERT OR IGNORE INTO ref (id, ns, kind, name, data, recorded_by, created_at) "
+                    "VALUES (?, 'ref', 'code', ?, '{}', ?, ?)", (f"ref:code:{code}", name, *ENV))
+    for local, at, prec, code, v, kind, quote, tags in readings:
+        sid = f"alice:src:{local.split('.')[0]}"
+        con.execute("INSERT OR IGNORE INTO source (id, ns, kind, path, rank, recorded_by, created_at) "
+                    "VALUES (?, 'alice', ?, 'x', 'original', ?, ?)", (sid, kind, *ENV))
+        data = {"code": f"ref:code:{code}", "category": "vital"}
+        if code == "bp":
+            data.update(value_num=v[0], unit="mm[Hg]", components={"systolic": v[0], "diastolic": v[1]})
+        else:
+            data.update(value_num=v, unit="kg" if code == "weight" else "/min")
+        con.execute("INSERT INTO fact (id, ns, kind, at, at_precision, data, source_id, verification, status, recorded_by, "
+                    "created_at, tags, quote) VALUES (?, 'alice', 'observation', ?, ?, ?, ?, 'agent', 'active', ?, ?, ?, ?)",
+                    (f"alice:fact:{local}", at, prec, json.dumps(data), sid, *ENV, json.dumps(tags), quote))
+    con.commit()
+    con.close()
+
+
+def daily_bp(start, n, sys_=120, dia=70, hhmm="10:30", wobble=(0, 2, -1, 1, -2)):
+    import datetime as dt
+    d0 = dt.date.fromisoformat(start)
+    out = []
+    for i in range(n):
+        d = (d0 + dt.timedelta(days=i)).isoformat()
+        w = wobble[i % len(wobble)]
+        out += [(f"{d}-tg.{i}.bp", f"{d}T{hhmm}:00+05:30", "minute", "bp", (sys_ + w, dia), "telegram_msg", None, []),
+                (f"{d}-tg.{i}.pulse", f"{d}T{hhmm}:00+05:30", "minute", "pulse", 70 + w, "telegram_msg", None, [])]
+    return out
+
+
+class ProfileTest(unittest.TestCase):
+    """Synthetic home series: steady, single outlier, sustained shift, gap restart, duplicates, warming-up,
+    mixed-session, medicine timing, the weekly digest line."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = pathlib.Path(self.tmp.name)
+        self.rec, self.db = t / "rec", t / "kb.sqlite"
+        (self.rec / "docs" / "health" / "alice").mkdir(parents=True)
+        (self.rec / "docs" / "health" / "bob").mkdir(parents=True)
+        (self.rec / "records.yaml").write_text(RECORDS_YAML)
+        make_db(self.db)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_xr(self, day, *extra):
+        r = xr("--records", self.rec, "--db", self.db, "--today", day, *extra)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def shifts(self):
+        return [f for f in rows(self.rec / "crossref" / "alice" / "flags.ndjson") if "baseline-shift" in f["check"]
+                and f["state"] == "open"]
+
+    def page(self):
+        return (self.rec / "docs" / "health" / "alice" / "profile.md").read_text()
+
+    def test_steady_no_flag_band_shown(self):
+        add_home(self.db, daily_bp("2026-05-01", 20))
+        self.run_xr("2026-05-20")
+        self.assertEqual(self.shifts(), [])
+        page = self.page()
+        self.assertIn("Facts as written; not advice; doctors decide.", page)
+        self.assertRegex(page, r"\| sbp \| `[·▁-█]{28}` \| 7 / 7 \|")
+        self.assertIn("(last 3 days)", page)
+        self.assertFalse((self.rec / "docs" / "health" / "bob" / "profile.md").exists())  # no home readings
+
+    def test_single_outlier_no_flag(self):
+        add_home(self.db, daily_bp("2026-05-01", 19) + daily_bp("2026-05-20", 1, sys_=160))
+        self.run_xr("2026-05-20")
+        self.assertEqual(self.shifts(), [])
+        self.assertIn("1 above, 2 within (last 3 days)", self.page())
+
+    def test_sustained_shift_flags_routine_with_stats(self):
+        add_home(self.db, daily_bp("2026-05-01", 18) + daily_bp("2026-05-19", 2, sys_=150, wobble=(0,)))
+        self.run_xr("2026-05-20")
+        f = [x for x in self.shifts() if x["check"].endswith("sbp-home")]
+        self.assertEqual(len(f), 1)
+        f = f[0]
+        self.assertEqual(f["severity"], "routine")
+        self.assertTrue(f["subject_key"].endswith("|sbp|above"))
+        self.assertRegex(f["statement"], r"^Home systolic BP: daily values 1\d\d, 150, 150 \(18-May-2026 to 20-May-2026\) "
+                                         r"are above this person's usual band [\d.]+-[\d.]+ mmHg \(median 120 of 17 days, "
+                                         r"01-May-2026 to 17-May-2026, morning\)\.$")
+        self.assertEqual(set(f["stats"]) >= {"median", "mad", "spread", "lo", "hi", "n", "window", "session"}, True)
+        self.assertEqual(f["stats"]["n"], 17)
+        self.assertIn(f["id"], self.page())
+        # a persisting shift updates the same flag, never a second one
+        add_home(self.db, [x for x in daily_bp("2026-05-21", 1, sys_=150, wobble=(0,))])
+        self.run_xr("2026-05-21")
+        g = [x for x in self.shifts() if x["check"].endswith("sbp-home")]
+        self.assertEqual([x["id"] for x in g], [f["id"]])
+
+    def test_gap_restarts_baseline(self):
+        add_home(self.db, daily_bp("2026-03-01", 15) + daily_bp("2026-05-19", 2, sys_=150, wobble=(0,)))
+        self.run_xr("2026-05-20")
+        self.assertEqual(self.shifts(), [])
+        self.assertIn("warming-up (0/7)", self.page())
+
+    def test_warming_up(self):
+        add_home(self.db, daily_bp("2026-05-14", 7))
+        self.run_xr("2026-05-20")
+        self.assertIn("warming-up (4/7)", self.page())
+        self.assertEqual(self.shifts(), [])
+
+    def test_duplicates_collapsed_and_listed(self):
+        add_home(self.db, daily_bp("2026-05-18", 3) + [
+            # same reading sent twice, 10 min apart (another message)
+            ("2026-05-18-tg.x.bp", "2026-05-18T10:40:00+05:30", "minute", "bp", (120, 70), "telegram_msg", None, []),
+            # relayed in a chat summary with the next day's date, day precision
+            ("2026-05-21-chat.bp", "2026-05-21", "day", "bp", (119, 70), "chat", None, ["family-reported"]),
+            # a low-confidence reading is not used
+            ("2026-05-19-tg.y.bp", "2026-05-19T11:00:00+05:30", "minute", "bp", (200, 90), "telegram_msg", None,
+             ["low-confidence"]),
+        ])
+        self.run_xr("2026-05-21")
+        page = self.page()
+        self.assertIn("Duplicates collapsed: 2", page)
+        self.assertIn("| same reading sent twice (30 min) | bp | `alice:fact:2026-05-18-tg.0.bp` (18-May-2026) | "
+                      "`alice:fact:2026-05-18-tg.x.bp` (18-May-2026) |", page)
+        self.assertIn("| probable cross-channel duplicate (day precision, dates 1 day apart at most) | bp | "
+                      "`alice:fact:2026-05-20-tg.2.bp` (20-May-2026) | `alice:fact:2026-05-21-chat.bp` (21-May-2026) |", page)
+        self.assertIn("Not used (low-confidence", page)
+        self.assertIn("`alice:fact:2026-05-19-tg.y.bp`", page)
+
+    def test_mixed_session_and_med_timing(self):
+        add_home(self.db, daily_bp("2026-05-18", 2) + [
+            ("2026-05-20-tg.a.bp", "2026-05-20T15:00:00+05:30", "minute", "bp", (130, 80), "telegram_msg",
+             "bp 130/80 after morning medicines", []),
+            ("2026-05-21-tg.b.bp", "2026-05-21T09:00:00+05:30", "minute", "bp", (118, 70), "telegram_msg",
+             "dawai se pehle 118/70", []),
+            ("2026-05-21-chat.c.bp", "2026-05-21", "day", "bp", (125, 75), "chat", "bp 125 75", []),
+        ])
+        self.run_xr("2026-05-21")
+        page = self.page()
+        self.assertIn("| 20-May-2026 | afternoon | 130/80 |  |  | 1 | after | mixed-session |", page)
+        self.assertIn("| 21-May-2026 | morning | 118/70 |  |  | 1 | before |  |", page)  # the untimed one is not morning
+        self.assertIn("Mixed-session days: 1 (20-May-2026)", page)
+        # preferred session "any" (owner decision D1): every reading of the day, no mixed-session mark
+        (self.rec / "data" / "meta").mkdir(parents=True)
+        (self.rec / "data" / "meta" / "gen-views.json").write_text(json.dumps({"profile": {"preferred_session": {"alice": "any"}}}))
+        self.run_xr("2026-05-21")
+        page = self.page()
+        self.assertIn("| 21-May-2026 | morning, untimed | 121.5/72.5 |  |  | 2 | before |  |", page)
+        self.assertIn("Mixed-session days: 0", page)
+
+    def test_digest_line_weekly_no_values(self):
+        add_home(self.db, daily_bp("2026-04-20", 27) + daily_bp("2026-05-17", 2, sys_=150, wobble=(0,)))
+        dg = pathlib.Path(self.tmp.name) / "digest.txt"
+        dg.write_text("")
+        self.run_xr("2026-05-18", "--digest", dg)  # Monday = default roll-up day
+        text = dg.read_text()
+        self.assertIn("• Alice profile: 2 series, 7/7 days; 1 change flag(s) (sbp); 0 duplicate(s) collapsed; "
+                      "0 series warming up; see docs/health/alice/profile.md", text)
+        self.assertNotIn("150", text)
+        dg.write_text("")
+        self.run_xr("2026-05-19", "--digest", dg)  # not the roll-up day: routine change flags are not listed
+        self.assertNotIn("profile", dg.read_text())
+
+    def test_check_validation(self):
+        self.run_xr("2026-05-20")
+        p = self.rec / "crossref" / "checks.ndjson"
+        good = p.read_text()
+        row = json.loads(next(l for l in good.splitlines() if "baseline-shift-sbp-home" in l))
+        p.write_text(good + json.dumps(dict(row, version="1.1.0", params=dict(row["params"], series="bmi"))) + "\n")
+        r = xr("--records", self.rec, "--db", self.db, "--today", "2026-05-20")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("baseline_shift needs series", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

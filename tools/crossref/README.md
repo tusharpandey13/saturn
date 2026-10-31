@@ -27,9 +27,33 @@ Stdout carries counts only.
 | `passthrough-*` | `passthrough` | active | each `v_conflicts` pair, each `v_internal_contradictions` row, one flag per person and `v_needs_human` reason | data-quality |
 | `stale` | `stale` | **disabled** | the latest value of a key series (`data/meta/gen-views.json`, or `params.codes`) is older than `max_days` | routine |
 | `claim-differs` | `claim_differs` | active | a claim whose key appears in a later source with an incompatible `status_as_documented`; phrased as a question for the earlier claim's author | next-visit |
+| `baseline-shift-{sbp,dbp,pulse,weight}-home` | `baseline_shift` | active | 2 of the last 3 home daily values (`home_series.py`) on one side of the person's own band: median ± 3 × max(1.4826 × MAD, `min_spread`) of the 28-day window minus those 3 days; nothing below 7 baseline days | routine |
 
 Facts with an open hard read (`uncertain_ref`) or tagged `low-confidence` never carry a flag alone; they stay in the
 needs-human queue. Red-flag thresholds (`config/thresholds.yaml`) are not routed here and are never suppressed.
+
+## Running profile (health profile iteration 1)
+Design: [health-profile](../../docs/design/health-profile.md) (section 5.1, as built). `home_series.py` builds
+`v_home_daily`. It reads home readings only (bp, pulse and weight from `telegram_msg` / `chat` sources, or a method
+that says home), tags each with its IST session, and collapses duplicates. Two duplicate rules apply: the same values
+within 30 minutes, and day-precision cross-channel copies at most 1 day apart. Every collapse is listed. The daily
+value is the median of the day's readings.
+
+Each run writes `docs/health/<ns>/profile.md` for every person with home readings. The page has:
+
+- problems;
+- signals, with a 28-day text sparkline, this week's statistics, the band or `warming-up (n/7)`, and the latest
+  clinic reading;
+- daily values;
+- change flags;
+- symptoms as written;
+- life context and medicine changes, shown alongside and not as a cause;
+- data sufficiency and quality;
+- linked analysis notes.
+
+On the roll-up day, the weekly digest gets one line per person, with counts and no values. Settings live under
+`profile` in `data/meta/gen-views.json`: `persons`, `series`, `home_source_kinds`, `preferred_session` (string or
+per-ns; `any` = no mixed-session marking), `sessions`, `problem_signals` and `links`.
 
 ## Flags, dedup and the digest
 - A flag's subject key is check + major version + ns + variant + subject; its dedup key adds a hash of the input fact

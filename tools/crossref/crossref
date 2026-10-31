@@ -24,15 +24,18 @@ Records layout (all PHI, records repo only; outside data/ so the KB build never 
   crossref/runs.ndjson       run log: ids and counts only
 Python stdlib + sqlite3 only. Exit 1 on an invalid check, feedback row or config.
 """
-import argparse, datetime, hashlib, json, pathlib, re, sqlite3, sys
+import argparse, datetime, hashlib, json, pathlib, re, sqlite3, statistics, sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "kb"))  # python3 -I drops the script dir; reuse the records.yaml loader
 import records_config  # noqa: E402
+sys.path.insert(0, str(HERE))
+import home_series as hs  # noqa: E402
 
 DISCLAIMER = "Facts as written; not advice; doctors decide."
 SEVERITIES = ("next-visit", "routine", "data-quality")  # red flags stay with the batch thresholds (never routed here)
-OPERATORS = ("range_vs_printed", "delta_vs_prior", "med_list_conflict", "passthrough", "stale", "claim_differs")
+OPERATORS = ("range_vs_printed", "delta_vs_prior", "med_list_conflict", "passthrough", "stale", "claim_differs",
+             "baseline_shift")
 CHECK_STATUS = ("active", "disabled", "retired")
 FLAG_ACTIONS = ("useful", "noise", "snooze", "promote", "resolved")
 CLAIM_ACTIONS = ("question", "answered", "retired")
@@ -129,6 +132,14 @@ def load_checks(root, seed=True):
             for code, t in (r["params"].get("thresholds") or {}).items():
                 if not (isinstance(t, dict) and isinstance(t.get("abs"), (int, float)) and t.get("basis")):
                     raise CrossrefError(f"{where}: threshold {code} needs a number abs and a cited basis")
+        if r["operator"] == "baseline_shift":
+            p = dict(BS_DEFAULTS, **r["params"])
+            if p.get("series") not in hs.SERIES or not isinstance(p.get("min_spread"), (int, float)) or not all(
+                    isinstance(p[k], int) and p[k] > 0 for k in ("window_days", "recent_days", "min_baseline_days",
+                                                                  "persistence")) or p["persistence"] > p["recent_days"] \
+                    or p["window_days"] <= p["recent_days"]:
+                raise CrossrefError(f"{where}: baseline_shift needs series in {hs.SERIES}, a number min_spread and "
+                                    "positive integer windows (persistence <= recent_days < window_days)")
         if r["operator"] == "stale" and r["status"] == "active" and not isinstance(r["params"].get("max_days"), int):
             raise CrossrefError(f"{where}: an active stale check needs an integer max_days")
         checks[cid] = r
@@ -382,9 +393,51 @@ def op_claim_differs(kb, chk, ctx):
                              f"{ddmon(l['at'])}, {l['source']}). Is this still current?")
 
 
+BS_DEFAULTS = {"window_days": 28, "recent_days": 3, "min_baseline_days": 7, "k": 3, "persistence": 2}
+SERIES_LABEL = {"sbp": "systolic BP", "dbp": "diastolic BP", "pp": "pulse pressure", "pulse": "pulse", "weight": "weight"}
+
+
+def r1(x):
+    return num(round(x, 1))
+
+
+def op_baseline_shift(kb, chk, ctx):
+    """Health profile (design docs/design/health-profile.md 3.2): the person's recent home daily values vs their own
+    median/MAD band. Statistics only; nothing is written back to the KB. Below min_baseline_days it emits nothing."""
+    p = dict(BS_DEFAULTS, **chk["params"])
+    s, today = p["series"], ctx["today"].isoformat()
+    for ns in ctx["profile_ns"]:
+        h = ctx["home"](ns)
+        days = {d: v for d, v in h["daily"].get(s, {}).items() if d <= today}
+        if not days:
+            continue
+        anchor = datetime.date.fromisoformat(max(days))
+        if (ctx["today"] - anchor).days >= p["window_days"]:
+            continue  # no recent value: the stale check owns gaps
+        band = hs.baseline(days, anchor, p)
+        if band["status"] != "ok":
+            continue
+        rec = hs.recent(days, anchor, p)
+        for side in ("above", "below"):
+            if sum(1 for _, v in rec if hs.position(v["value"], band) == side) < p["persistence"]:
+                continue
+            u = hs.UNIT[s]
+            sess = h["preferred"] if h["preferred"] != "any" else "any session"
+            yield dict(ns=ns, subject=f"{s}|{side}", variant="baseline-shift", severity=chk["severity"],
+                       inputs=sorted({i for _, v in rec for i in v["inputs"]}),
+                       stats={k: (round(band[k], 2) if isinstance(band[k], float) else band[k]) for k in
+                              ("median", "mad", "spread", "lo", "hi", "n", "b1", "b2", "basis")} | {
+                           "window": p["window_days"], "session": h["preferred"], "anchor": anchor.isoformat()},
+                       statement=f"Home {SERIES_LABEL[s]}: daily values {', '.join(r1(v['value']) for _, v in rec)} "
+                                 f"({ddmon(rec[0][0])} to {ddmon(rec[-1][0])}) are {side} this person's usual band "
+                                 f"{r1(band['lo'])}-{r1(band['hi'])} {u} (median {r1(band['median'])} of {band['n']} days, "
+                                 f"{ddmon(band['b1'])} to {ddmon(band['b2'])}, {sess}"
+                                 f"{'; mixed sessions' if band['basis'] == 'mixed' else ''}).")
+
+
 OPS = {"range_vs_printed": op_range_vs_printed, "delta_vs_prior": op_delta_vs_prior,
        "med_list_conflict": op_med_list_conflict, "passthrough": op_passthrough, "stale": op_stale,
-       "claim_differs": op_claim_differs}
+       "claim_differs": op_claim_differs, "baseline_shift": op_baseline_shift}
 
 
 # ----------------------------------------------------------------------------------------------------------- claims
@@ -485,6 +538,8 @@ def update_flags(old, found, checks, today, baseline):
         row = dict(prev or {}, check=chk["id"], check_version=chk["version"], severity=it["severity"],
                    statement=it["statement"], inputs=sorted(it["inputs"]), ns=it["ns"], subject_key=skey,
                    dedup_key=f"{skey}|{fp}")
+        if it.get("stats") is not None:
+            row["stats"] = it["stats"]
         if prev is None:
             slug = chk["id"].split(":")[-1]
             row.update(id=f"{it['ns']}:flag:{t}-{slug}-{h8(skey)}", first_seen=t, changed_at=t, state="open",
@@ -641,8 +696,189 @@ def claims_page(ns, display, claims, asof):
     return b
 
 
+# ---------------------------------------------------------------------------------------------------------- profile
+def profile_page(ns, display, kb, h, cfg, checks, rows, feedback, claims, root, asof, today):
+    """docs/health/<ns>/profile.md (design 3.3): problem-oriented running profile from home readings. Facts and
+    statistics only; interpretation stays in the linked analysis notes."""
+    t, week0, w28 = today.isoformat(), (today - datetime.timedelta(days=6)).isoformat(), \
+        (today - datetime.timedelta(days=27)).isoformat()
+    bs = {c["params"].get("series"): dict(BS_DEFAULTS, **c["params"]) for c in checks.values()
+          if c["operator"] == "baseline_shift" and c["status"] == "active"}
+    live = [(r, *flag_view(r, feedback, today)) for r in rows]
+    shift = [(r, st) for r, st, _ in live if r["check"] in {c["id"] for c in checks.values()
+                                                            if c["operator"] == "baseline_shift"}
+             and st in ("open", "snoozed", "promoted")]
+    pref = h["preferred"]
+    b = [f"# Running profile: {display}", "", f"**{DISCLAIMER}**", "",
+         f"_Generated by `tools/crossref` from home readings in the KB (data as of {ddmon(asof)}; week "
+         f"{ddmon(week0)} to {ddmon(t)}). Don't edit this page._", "",
+         "Home readings compared with this person's own recent readings, with ids. A band is this person's usual "
+         "range, not a target. A steady series is not reassurance: home weight and BP trends miss many changes; "
+         "symptoms and the doctors decide. Change flags are `routine` and appear in the weekly roll-up.", ""]
+    # 1. problems
+    conds = [c for c in claims if c["kind"] == "condition"]
+    links = (cfg["problem_signals"] or {}).get(ns) or {}
+    b += ["## 1. Problems as documented", "",
+          f"{len(conds)} condition claim(s) on record: see [problems.md](problems.md) and [claims.md](claims.md).", ""]
+    if links:
+        byfact = {c["fact"]: c for c in conds}
+        b += table(["problem (as written)", "status as documented", "date", "fact", "signals"],
+                   [[byfact[f]["text_as_written"] if f in byfact else "(not an active condition fact)",
+                     (byfact.get(f) or {}).get("status_as_documented") or "", ddmon((byfact.get(f) or {}).get("at", "")),
+                     f"`{f}`", ", ".join(sr)] for f, sr in sorted(links.items())]) + [""]
+    else:
+        b += ["No problem-to-signal links set yet (`profile.problem_signals` in `data/meta/gen-views.json`, owner "
+              "decision D3).", ""]
+    # 2. signals
+    b += ["## 2. Signals", "",
+          f"Daily value = median of the day's home readings in the `{pref}` session"
+          + ("" if pref == "any" else " (other sessions when that one has none: `mixed-session`)")
+          + ". Band = median ± k × max(1.4826 × MAD, floor) of the baseline days (window minus the last days), "
+            "shown once enough days exist.", ""]
+    srows = []
+    for s in hs.SERIES:
+        days = h["daily"].get(s, {})
+        if not days and s not in bs:
+            continue
+        wk = [days[d]["value"] for d in sorted(days) if week0 <= d <= t]
+        nread = sum(days[d]["n"] for d in days if week0 <= d <= t)
+        p = bs.get(s) or dict(BS_DEFAULTS, min_spread=0)
+        band, status = None, "no data"
+        past = {d: v for d, v in days.items() if d <= t}
+        if past:
+            anchor = datetime.date.fromisoformat(max(past))
+            if (today - anchor).days >= p["window_days"]:
+                status = f"no value in {p['window_days']} days"
+            else:
+                band = hs.baseline(past, anchor, p)
+                if band["status"] != "ok":
+                    status = f"warming-up ({band['n']}/{band['need']})"
+                else:
+                    pos = [hs.position(v["value"], band) for _, v in hs.recent(past, anchor, p)]
+                    status = ", ".join(f"{pos.count(x)} {x}" for x in ("above", "within", "below") if pos.count(x)) \
+                        + f" (last {p['recent_days']} days)"
+        code = hs.SERIES_CODE[s]
+        clinic = kb.q("SELECT t.at, t.id FROM v_trend t JOIN source s ON s.id = t.source_id WHERE t.ns = ? AND t.code = ? "
+                      f"AND s.kind NOT IN ({','.join('?' * len(cfg['home_source_kinds']))}) "
+                      "AND lower(coalesce(t.method, '')) NOT LIKE '%home%' ORDER BY t.at DESC LIMIT 1",
+                      ns, f"ref:code:{code}", *cfg["home_source_kinds"])
+        sd = f"{statistics.stdev(wk):.1f}" if len(wk) >= 3 else ""
+        cv = f" (CV {statistics.stdev(wk) / statistics.mean(wk) * 100:.0f}%)" if s == "sbp" and len(wk) >= 3 else ""
+        srows.append([f"{s}{'' if s in bs else ' (shown only)'}", f"`{hs.sparkline(past, today)}`",
+                      f"{nread} / {len(wk)}", r1(statistics.median(wk)) if wk else "",
+                      f"{r1(min(wk))}-{r1(max(wk))}" if wk else "", sd + cv,
+                      f"{r1(band['lo'])}-{r1(band['hi'])} (median {r1(band['median'])}, n {band['n']}, {band['basis']})"
+                      if band and band["status"] == "ok" else "", status,
+                      f"{ddmon(clinic[0]['at'])} `{clinic[0]['id']}`" if clinic else ""])
+    b += table(["series", f"last 28 days ({ddmon(w28)} to {ddmon(t)}; · = none)", "this week: readings / days",
+                "median", "min-max", "SD", "band", "status", "latest clinic reading"], srows) + [""]
+    show = sorted({d for s in h["daily"].values() for d in s if (today - datetime.timedelta(days=13)).isoformat() <= d <= t},
+                  reverse=True)
+    if show:
+        g = lambda s, d: h["daily"].get(s, {}).get(d)
+        cell = lambda s, d: r1(g(s, d)["value"]) if g(s, d) else ""
+        drows = []
+        for d in show:
+            entries = [g(s, d) for s in ("sbp", "pulse", "weight") if g(s, d)]
+            sess = sorted({x for e in entries for x in e["sessions"]})
+            marks = sorted({e["mark"] for e in entries if e["mark"]})
+            mt = sorted({e["med_timing"] for e in entries if e["med_timing"]})
+            drows.append([ddmon(d), ", ".join(sess), f"{cell('sbp', d)}/{cell('dbp', d)}" if g("sbp", d) else "",
+                          cell("pulse", d), cell("weight", d), max(e["n"] for e in entries),
+                          ", ".join(mt) or "not stated", ", ".join(marks)])
+        b += ["Daily values, last 14 days:", ""] + table(
+            ["day", "session(s)", "BP", "pulse", "weight", "readings", "vs morning medicines", "marks"], drows) + [""]
+    # 3. change flags
+    b += ["## 3. Change flags", ""]
+    if shift:
+        b += table(["flag", "statement", "first seen", "state"],
+                   [[f"`{r['id']}`", r["statement"], ddmon(r["first_seen"]), st] for r, st in shift]) + [""]
+    else:
+        b += ["No open `baseline-shift` flag.", ""]
+    b += ["All flags: [flags.md](flags.md).", ""]
+    # 4. symptoms
+    sym = kb.q("SELECT t.at, t.id, coalesce(t.value_text, t.quote) AS what, s.kind FROM v_trend t JOIN fact f ON f.id = t.id "
+               "JOIN source s ON s.id = t.source_id WHERE t.ns = ? AND json_extract(f.data, '$.category') = 'symptom' "
+               "AND substr(t.at, 1, 10) BETWEEN ? AND ? ORDER BY t.at, t.id", ns, week0, t)
+    b += ["## 4. Symptoms this week, as written", ""]
+    b += (table(["day", "as written", "source kind", "fact"], [[ddmon(r["at"]), r["what"] or "", r["kind"], f"`{r['id']}`"]
+                                                                for r in sym]) if sym else ["None recorded."]) + [""]
+    # 5. alongside
+    ctxr = kb.q("SELECT at, end_at, category, summary, id FROM v_context WHERE ns = ? AND end_at >= ? AND substr(at, 1, 10) <= ? "
+                "ORDER BY at, id", ns, w28, t)
+    meds, last = [], {}  # medicine changes only: a first statement, a stop, or a statement after a stop
+    for r in kb.q("SELECT f.at, f.id, coalesce(json_extract(f.data, '$.brand'), json_extract(f.data, '$.drug_id')) AS drug, "
+                  "coalesce(json_extract(f.data, '$.drug_id'), lower(json_extract(f.data, '$.brand'))) AS k, "
+                  "json_extract(f.data, '$.status') AS st FROM fact f WHERE f.ns = ? AND f.kind = 'medication' AND "
+                  "f.status = 'active' AND substr(f.at, 1, 10) <= ? ORDER BY f.at, f.id", ns, t):
+        prev = last.get(r["k"])
+        if r["at"][:10] >= w28 and (prev is None or r["st"] == "stopped" != prev or prev == "stopped" != r["st"]):
+            meds.append(r)
+        last[r["k"]] = r["st"]
+    b += ["## 5. Alongside (last 28 days)", "", "Shown alongside, not as a cause.", ""]
+    b += (table(["from", "to", "life context", "summary", "fact"], [[ddmon(r["at"]), ddmon(r["end_at"]), r["category"],
+                                                                      r["summary"] or "", f"`{r['id']}`"] for r in ctxr])
+          if ctxr else ["No life-context rows."]) + [""]
+    b += (["Medicines started, stopped or restarted, as recorded:", ""] + table(["day", "medicine (as written)", "statement", "fact"], [[ddmon(r["at"]), r["drug"] or "", r["st"] or "",
+                                                                         f"`{r['id']}`"] for r in meds])
+          if meds else ["No medicine started, stopped or restarted in these days (as recorded)."]) + [""]
+    # 6. data quality and sufficiency
+    rd = h["readings"]
+    timed = [r for r in rd if r["session"] != "untimed"]
+    sess_n = {x: sum(1 for r in rd if r["session"] == x) for x in ("morning", "afternoon", "evening", "untimed")}
+    pulse_src = {r["source"] for r in rd if r["code"] == "pulse"}
+    no_pulse = [r for r in rd if r["code"] == "bp" and r["source"] not in pulse_src]
+    unused = [r for r in rd if not r["used"]]
+    mixed = sorted({d for s in h["daily"].values() for d, v in s.items() if v["mark"]})
+    first = min((r["day"] for r in rd), default=None)
+    b += ["## 6. Data sufficiency and quality", ""]
+    suf = []
+    for s in ("sbp", "pulse", "weight"):
+        days = h["daily"].get(s, {})
+        p = bs.get(s) or BS_DEFAULTS
+        suf.append([s, sum(1 for d in days if week0 <= d <= t), sum(1 for d in days if w28 <= d <= t),
+                    ddmon(min(days)) if days else "", ddmon(max(days)) if days else "",
+                    f"{p['min_baseline_days']} baseline days + {p['recent_days']} recent"])
+    b += table(["series", "days this week (of 7)", "days in 28", "first home day", "latest home day", "a band needs"],
+               suf) + [""]
+    b += [f"- Home readings: {len(rd)} ({len(rd) - len(unused)} used), first {ddmon(first) if first else 'none'}. "
+          f"Sessions: morning {sess_n['morning']}, afternoon {sess_n['afternoon']}, evening {sess_n['evening']}, "
+          f"untimed {sess_n['untimed']}"
+          + (f"; timed readings between {min(r['at'][11:16] for r in timed)} and {max(r['at'][11:16] for r in timed)} IST"
+             if timed else "") + ". Time is the message time unless the record states the reading time.",
+          f"- Preferred session: `{pref}`. Mixed-session days: {len(mixed)}"
+          + (f" ({', '.join(ddmon(d) for d in mixed)})" if mixed else "") + ".",
+          f"- Before/after morning medicines stated on {sum(1 for r in rd if r['med_timing'])} reading(s).",
+          f"- BP readings without a pulse in the same source: {len(no_pulse)}.",
+          f"- Duplicates collapsed: {len(h['merges'])} (each counted once until a human confirms; listed below)."]
+    if unused:
+        b += [f"- Not used (low-confidence or open hard read; see [data-quality.md](data-quality.md)): "
+              + ", ".join(f"`{r['id']}`" for r in unused) + "."]
+    b += [""]
+    if h["merges"]:
+        b += table(["rule", "code", "kept", "counted once with"],
+                   [[m["rule"], m["code"], f"`{m['kept']}` ({ddmon(m['kept_day'])})",
+                     f"`{m['dropped']}` ({ddmon(m['dropped_day'])})"] for m in h["merges"]]) + [""]
+    # 7. linked analyses
+    paths = list((cfg["links"] or {}).get(ns) or [])
+    for sub in ("analysis", "inference"):
+        base = root / "docs" / "log" / sub
+        if base.is_dir():
+            found = sorted((x for x in base.rglob("*.md") if ns in x.name and x.name != "README.md"),
+                           key=lambda x: x.name, reverse=True)
+            paths += [str(x.relative_to(root)) for x in found[:5]]
+    b += ["## 7. Linked analyses", "",
+          "Offline notes; any interpretation stays in them, labelled as it is there (agent-inferred where marked).", ""]
+    b += ([f"- [{x}](../../../{x})" for x in dict.fromkeys(paths)] or ["None."]) + [""]
+    summary = dict(series=sum(1 for s in ("sbp", "pulse", "weight") if h["daily"].get(s)),
+                   days=len({d for s in h["daily"].values() for d in s if week0 <= d <= t}),
+                   flags=sorted({r["subject_key"].split("|")[4] for r, _ in shift}), merges=len(h["merges"]),
+                   warming=sum(1 for x in srows if x[7].startswith("warming-up")))
+    return b, summary
+
+
 # ----------------------------------------------------------------------------------------------------------- digest
-def digest_section(per_ns, display, feedback, today, cfg, first_run, claims_by_ns):
+def digest_section(per_ns, display, feedback, today, cfg, first_run, claims_by_ns, profiles=None):
     out = []
     lines = []
     for ns, (shown, waiting, _) in per_ns.items():
@@ -675,6 +911,11 @@ def digest_section(per_ns, display, feedback, today, cfg, first_run, claims_by_n
         prec = precision([r for v in per_ns.values() for r in v[2]], feedback)
         voted = [f"{k.split(':')[-1]} {v['useful']}/{v['useful'] + v['noise']}" for k, v in sorted(prec.items())
                  if v["useful"] + v["noise"]]
+        for ns, p in (profiles or {}).items():
+            fl = f"{len(p['flags'])} change flag(s)" + (f" ({', '.join(p['flags'])})" if p["flags"] else "")
+            roll.append(f"• {display.get(ns, ns)} profile: {p['series']} series, {p['days']}/7 days; {fl}; "
+                        f"{p['merges']} duplicate(s) collapsed; {p['warming']} series warming up; "
+                        f"see docs/health/{ns}/profile.md")
         if roll:
             out += ["", "Cross-check weekly roll-up:"] + roll
             out.append("• precision (useful/marked): " + (", ".join(voted) if voted else "no marks yet"))
@@ -694,9 +935,20 @@ def run(a):
     _, feedback = load_feedback(root)
     kb = KB(sqlite3.connect(f"file:{db}?mode=ro", uri=True))
     gv = root / "data" / "meta" / "gen-views.json"
-    key_series = json.loads(gv.read_text(encoding="utf-8")).get("key_series", {}) if gv.exists() else {}
+    gvc = json.loads(gv.read_text(encoding="utf-8")) if gv.exists() else {}
+    key_series = gvc.get("key_series", {})
+    pcfg = hs.config(gvc)
     claims = build_claims(kb, feedback)
-    ctx = {"today": today, "persons": rc["persons"], "key_series": key_series, "claims": claims}
+    home = {}
+
+    def home_of(ns):
+        if ns not in home:
+            home[ns] = hs.v_home_daily(kb, pcfg, ns)
+        return home[ns]
+    profile_ns = [ns for ns in rc["persons"] if (pcfg["persons"] is None and home_of(ns)["readings"])
+                  or ns in (pcfg["persons"] or [])]
+    ctx = {"today": today, "persons": rc["persons"], "key_series": key_series, "claims": claims,
+           "profile_ns": profile_ns, "home": home_of}
     found = []
     for chk in sorted(checks.values(), key=lambda c: c["id"]):
         if chk["status"] == "active":
@@ -705,7 +957,7 @@ def run(a):
     digest_ok = a.dry_run or bool(a.digest and pathlib.Path(a.digest).exists())
     xdir = root / "crossref"
     per_ns, totals, changed_files = {}, {"new": 0, "changed": 0, "closed": 0, "reopened": 0}, []
-    claims_by_ns = {}
+    claims_by_ns, profiles = {}, {}
     for c in claims:
         claims_by_ns.setdefault(c["ns"], []).append(c)
     for ns in rc["namespaces"]:
@@ -735,9 +987,15 @@ def run(a):
             if ns_claims and write_page(hdir / "claims.md", f"Claims register ({ns})", [f"crossref/{ns}/claims.ndjson"],
                                         claims_page(ns, disp, ns_claims, asof), today, a.dry_run):
                 changed_files.append(hdir / "claims.md")
+        if hdir.is_dir() and ns in profile_ns:
+            body, profiles[ns] = profile_page(ns, rc["display"].get(ns, ns), kb, home_of(ns), pcfg, checks, rows,
+                                              feedback, ns_claims, root, asof, today)
+            if write_page(hdir / "profile.md", f"Running profile ({ns})", [f"crossref/{ns}/flags.ndjson", "data/kb.sqlite"],
+                          body, today, a.dry_run):
+                changed_files.append(hdir / "profile.md")
     first_run = all(r.get("digest_day") == "baseline" for v in per_ns.values() for r in v[2]) and totals["new"] > 0 \
         and totals["new"] == sum(len(v[2]) for v in per_ns.values())
-    digest = digest_section(per_ns, rc["display"], feedback, today, cfg, first_run, claims_by_ns)
+    digest = digest_section(per_ns, rc["display"], feedback, today, cfg, first_run, claims_by_ns, profiles)
     counts = {
         "run": f"run:{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%MZ')}-l1",
         "day": today.isoformat(), "data_as_of": asof, "kb_fingerprint": fp[:16], "facts": nfacts, **totals,
