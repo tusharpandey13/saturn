@@ -35,7 +35,8 @@ export DIGEST_FILE="${DIGEST_FILE:-${RUNNER_TEMP:-$PRODUCT/app/.batch}/digest.tx
 run() { (cd "$PRODUCT/app" && npx tsx batch/run.ts "$@" --records "$records"); }
 commit() { "$PRODUCT/deploy/scripts/commit-push.sh" "$records" "$@"; }
 # Variables that must never be visible to the AI step (model auth CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY is the
-# only credential it gets). Any other *TOKEN / *_KEY / *SECRET* / *PASSWORD* / *PRIVATE* name also fails the check.
+# only credential it gets). Any other name ENDING in TOKEN, _KEY, SECRET, PASSWORD, PRIVATE_KEY, CREDENTIAL(S) or _PAT
+# also fails the check (names like SECRETS_EXTRACT, a list of SOPS file paths, or CLAUDE_TOKEN_CREATED, a date, do not).
 FORBIDDEN="SOPS_AGE_KEY SOPS_AGE_KEY_FILE GITHUB_TOKEN GH_TOKEN RECORDS_TOKEN BATCH_SIGNING_KEY RECORDS_APP_PRIVATE_KEY
 PRODUCT_DEPLOY_KEY ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL CLOUDFLARE_D1_TOKEN
 CLOUDFLARE_R2_TOKEN CLOUDFLARE_API_TOKEN CLOUDFLARE_DEPLOY_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_WEBHOOK_SECRET GIT_CONFIG_PARAMETERS
@@ -45,7 +46,7 @@ assert_isolated() {
   for v in $FORBIDDEN; do [ -z "${!v:-}" ] || bad+=("$v"); done
   while IFS= read -r v; do
     case "$v" in CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY) ;; *) bad+=("$v") ;; esac
-  done < <(compgen -e | grep -E '(TOKEN|_KEY|SECRET|PASSWORD|PRIVATE|CREDENTIAL)' || true)
+  done < <(compgen -e | grep -E '(TOKEN|_KEY|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIALS?|_PAT)$' || true)
   for v in $(compgen -e | grep -E '^GIT_CONFIG_(KEY|VALUE)_' || true); do
     case "${!v}" in *extraheader*|*AUTHORIZATION*|*credential*|*signingkey*) bad+=("$v") ;; esac
   done

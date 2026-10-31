@@ -28,11 +28,12 @@ beforeEach(() => {
 afterEach(() => rmSync(d, { recursive: true, force: true }));
 
 describe("assert-isolated (the AI step)", () => {
-  it("passes with model auth only", () => {
-    const r = batch({ CLAUDE_CODE_OAUTH_TOKEN: "tok" }, "assert-isolated");
+  it("passes with model auth only (and the workflow's non-secret names: SOPS file lists, token dates)", () => {
+    const r = batch({ CLAUDE_CODE_OAUTH_TOKEN: "tok", SECRETS_EXTRACT: "secrets/claude-ci.sops.env", SECRETS_KEYS: "secrets/github.sops.env",
+      CLAUDE_TOKEN_CREATED: "2026-10-25", EXTRACT_MAX_MEDIA_CALLS: "30" }, "assert-isolated");
     expect(r.status, r.stderr).toBe(0);
   });
-  it.each(["SOPS_AGE_KEY", "GH_TOKEN", "GITHUB_TOKEN", "RECORDS_TOKEN", "BATCH_SIGNING_KEY", "RECORDS_APP_PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "SOME_NEW_TOKEN"])("fails when %s is visible (names only in the log)", (v) => {
+  it.each(["SOPS_AGE_KEY", "GH_TOKEN", "GITHUB_TOKEN", "RECORDS_TOKEN", "BATCH_SIGNING_KEY", "RECORDS_APP_PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "SOME_NEW_TOKEN", "OTHER_API_KEY", "DB_PASSWORD"])("fails when %s is visible (names only in the log)", (v) => {
     const r = batch({ CLAUDE_CODE_OAUTH_TOKEN: "tok", [v]: "s3cr3t-value" }, "assert-isolated");
     expect(r.status).toBe(1);
     expect(r.stderr).toContain(v);
