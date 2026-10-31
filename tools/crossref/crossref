@@ -861,15 +861,17 @@ def profile_page(ns, display, kb, h, cfg, checks, rows, feedback, claims, root, 
                      f"`{m['dropped']}` ({ddmon(m['dropped_day'])})"] for m in h["merges"]]) + [""]
     # 7. linked analyses
     paths = list((cfg["links"] or {}).get(ns) or [])
-    for sub in ("analysis", "inference"):
-        base = root / "docs" / "log" / sub
-        if base.is_dir():
-            found = sorted((x for x in base.rglob("*.md") if ns in x.name and x.name != "README.md"),
-                           key=lambda x: x.name, reverse=True)
-            paths += [str(x.relative_to(root)) for x in found[:5]]
-    b += ["## 7. Linked analyses", "",
-          "Offline notes; any interpretation stays in them, labelled as it is there (agent-inferred where marked).", ""]
-    b += ([f"- [{x}](../../../{x})" for x in dict.fromkeys(paths)] or ["None."]) + [""]
+    base = root / "docs" / "log" / "analysis"
+    if base.is_dir():
+        found = sorted((x for x in base.rglob("*.md") if ns in x.name and x.name != "README.md"),
+                       key=lambda x: x.name, reverse=True)
+        paths += [str(x.relative_to(root)) for x in found[:5]]
+    b += ["## 7. Linked analyses and inferences", "",
+          "Offline notes and agent-inferred records; any interpretation stays in them, labelled as it is there.", ""]
+    if (root / "docs" / "health" / ns / "status.md").exists():
+        b += ["- [status.md](status.md) (agent-inferred records, `tools/inference`)"]
+    b += [f"- [{x}](../../../{x})" for x in dict.fromkeys(paths)]
+    b += ([] if b[-1].startswith("- ") else ["None."]) + [""]
     summary = dict(series=sum(1 for s in ("sbp", "pulse", "weight") if h["daily"].get(s)),
                    days=len({d for s in h["daily"].values() for d in s if week0 <= d <= t}),
                    flags=sorted({r["subject_key"].split("|")[4] for r, _ in shift}), merges=len(h["merges"]),

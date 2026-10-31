@@ -49,7 +49,7 @@ Each run writes `docs/health/<ns>/profile.md` for every person with home reading
 - symptoms as written;
 - life context and medicine changes, shown alongside and not as a cause;
 - data sufficiency and quality;
-- linked analysis notes.
+- linked analysis notes and the inference `status.md`.
 
 On the roll-up day, the weekly digest gets one line per person, with counts and no values. Settings live under
 `profile` in `data/meta/gen-views.json`: `persons`, `series`, `home_source_kinds`, `preferred_session` (string or

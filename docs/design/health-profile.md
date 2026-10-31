@@ -436,8 +436,10 @@ The build follows sections 3.1 to 3.3, with these differences (each chosen as th
     is not built.
 - **Exclusions.** Low-confidence readings and readings with an open hard read are listed and not used.
 - **Medicines alongside.** Only starts, stops and restarts, as recorded.
-- **Linked analyses.** The page links `profile.links[ns]` plus the 5 newest notes under `docs/log/analysis/` or
-  `docs/log/inference/` whose file name contains the namespace.
+- **Linked analyses.** The page links three things:
+  - the person's inference status page `status.md` (`tools/inference`, ADR 013), when it exists;
+  - `profile.links[ns]`;
+  - the 5 newest notes under `docs/log/analysis/` whose file name contains the namespace.
 - **Settings.** All live under `profile` in `data/meta/gen-views.json`:
   - `persons`: null = every namespace with a home reading;
   - `series`, `home_source_kinds`;

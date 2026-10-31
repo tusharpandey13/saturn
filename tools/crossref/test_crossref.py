@@ -424,6 +424,14 @@ class ProfileTest(unittest.TestCase):
                       "`alice:fact:2026-05-20-tg.2.bp` (20-May-2026) | `alice:fact:2026-05-21-chat.bp` (21-May-2026) |", page)
         self.assertIn("Not used (low-confidence", page)
         self.assertIn("`alice:fact:2026-05-19-tg.y.bp`", page)
+        self.assertIn("## 7. Linked analyses and inferences\n\nOffline notes and agent-inferred records; any interpretation "
+                      "stays in them, labelled as it is there.\n\nNone.", page)
+        (self.rec / "docs" / "health" / "alice" / "status.md").write_text("x")
+        (self.rec / "docs" / "log" / "analysis").mkdir(parents=True)
+        (self.rec / "docs" / "log" / "analysis" / "2026-05-20-alice-note.md").write_text("x")
+        self.run_xr("2026-05-21")
+        self.assertIn("- [status.md](status.md) (agent-inferred records, `tools/inference`)\n- [docs/log/analysis/"
+                      "2026-05-20-alice-note.md](../../../docs/log/analysis/2026-05-20-alice-note.md)", self.page())
 
     def test_mixed_session_and_med_timing(self):
         add_home(self.db, daily_bp("2026-05-18", 2) + [
