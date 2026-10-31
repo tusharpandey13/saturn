@@ -52,6 +52,6 @@ repos:
       - id: no-binaries-outside-fixtures
         name: binary files only under fixtures/
         language: fail
-        entry: binary files belong under fixtures/ (synthetic only)
+        entry: binary files belong under fixtures/ or design mockup screenshots (synthetic only)
         types: [binary]
-        exclude: ^fixtures/
+        exclude: ^(fixtures/|docs/design/[^/]+-mockup/shots/)
