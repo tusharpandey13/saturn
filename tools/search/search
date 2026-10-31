@@ -1,0 +1,490 @@
+#!/usr/bin/env -S python3 -I
+"""Semantic search over a records repo, through a local embedding server (llama.cpp llama-server --embeddings).
+
+Usage:
+  tools/search/search index --records DIR [--db PATH] [--endpoint URL] [--full] [--dry-run]
+  tools/search/search query "TEXT" [--ns NS] [--kind KIND] [-k 10] [--json] [--db PATH] [--endpoint URL]
+  tools/search/search stats [--prom] [--probe TEXT] [--db PATH] [--endpoint URL]
+
+Stdlib + sqlite3 only; run as `python3 -I`. The index (vectors + chunk text) is a local SQLite file outside any repo:
+it holds record text, so it stays where the records may live (default $SATURN_SEARCH_DB, else
+~/.cache/saturn-search/index.sqlite). Endpoint: --endpoint, else $SATURN_EMBED_URL, else http://127.0.0.1:8095.
+
+What is indexed (paths relative to the records root; README.md has the table):
+  fact         data/<ns>/**/*.ndjson fact rows with status active: kind, code/drug, value, date and the source quote
+  ocr          sources/**/*.ocr.md            transcript  sources/**/*.transcript.md
+  source-text  other sources/**/*.md          analysis    docs/log/analysis/**/*.md
+  extraction   docs/log/extraction/**/*.md    hard-read   docs/log/hard-reads/**/*.md
+  questions    docs/health/<ns>/questions.md
+Incremental: a file is re-embedded only when its sha256 changes (fact files also when data/ref/ changes, since ref
+names go into the text). A different embedding model or prompt style re-embeds everything. Deleted files drop out.
+Each chunk keeps its metadata: kind, ns, ref_id (the fact id, or a q/ans/act id found in the chunk), path, page.
+"""
+import argparse, array, hashlib, json, operator, os, pathlib, re, sqlite3, sys, time, urllib.error, urllib.request
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "kb"))  # python3 -I drops the script dir; records.yaml loader lives in tools/kb
+import records_config  # noqa: E402
+
+DEFAULT_ENDPOINT = "http://127.0.0.1:8095"
+SCHEMA_VERSION = "1"
+CHUNK_CHARS = 900
+BATCH = 16
+DOC_ID_RE = re.compile(r"\b[a-z][a-z0-9-]*:(?:q|ans|act):\d{4}\b")
+
+# (kind, matcher on the relative posix path); first match wins
+KINDS = [
+    ("fact", lambda p: p.startswith("data/") and p.endswith(".ndjson")
+     and not p.startswith(("data/ref/", "data/meta/", "data/telegram/", "data/queue/"))),
+    ("ocr", lambda p: p.startswith("sources/") and p.endswith(".ocr.md")),
+    ("transcript", lambda p: p.startswith("sources/") and p.endswith(".transcript.md")),
+    ("source-text", lambda p: p.startswith("sources/") and p.endswith(".md")),
+    ("analysis", lambda p: p.startswith("docs/log/analysis/") and p.endswith(".md")),
+    ("extraction", lambda p: p.startswith("docs/log/extraction/") and p.endswith(".md")),
+    ("hard-read", lambda p: p.startswith("docs/log/hard-reads/") and p.endswith(".md")),
+    ("questions", lambda p: re.fullmatch(r"docs/health/[^/]+/questions\.md", p) is not None),
+]
+
+
+def die(msg, code=1):
+    print(f"search: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------- embedding server ----------
+
+class Embedder:
+    def __init__(self, endpoint, prompt_style="auto", timeout=600):
+        self.endpoint, self.timeout, self.calls = endpoint.rstrip("/"), timeout, 0
+        self.model = self._model()
+        self.style = prompt_style if prompt_style != "auto" else ("gemma" if "gemma" in self.model.lower() else "none")
+
+    def _req(self, path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.endpoint + path, data=data, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.load(r)
+        except (urllib.error.URLError, OSError) as e:
+            die(f"embedding server {self.endpoint}{path}: {e}", 2)
+
+    def _model(self):
+        d = self._req("/v1/models").get("data") or [{}]
+        return str(d[0].get("id") or "unknown")
+
+    def query_text(self, t):
+        return f"task: search result | query: {t}" if self.style == "gemma" else t
+
+    def doc_text(self, title, t):
+        return f"title: {title or 'none'} | text: {t}" if self.style == "gemma" else (f"{title}\n{t}" if title else t)
+
+    def embed(self, texts):
+        out = []
+        for i in range(0, len(texts), BATCH):
+            part = texts[i:i + BATCH]
+            self.calls += 1
+            d = self._req("/v1/embeddings", {"input": part}).get("data") or []
+            vecs = [None] * len(part)
+            for e in d:
+                vecs[e["index"]] = e["embedding"]
+            if any(v is None for v in vecs):
+                die("embedding server returned fewer vectors than inputs", 2)
+            out.extend(normalize(v) for v in vecs)
+        return out
+
+
+def normalize(v):
+    n = sum(x * x for x in v) ** 0.5 or 1.0
+    return [x / n for x in v]
+
+
+def pack(v):
+    return array.array("f", v).tobytes()
+
+
+def unpack(b):
+    a = array.array("f")
+    a.frombytes(b)
+    return a
+
+
+# ---------- records walk and chunking ----------
+
+def kind_of(rel):
+    for k, m in KINDS:
+        if m(rel):
+            return k
+    return None
+
+
+def walk(root):
+    out = {}
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root).as_posix()
+        if p.is_file() and not rel.startswith(".") and "/." not in rel:
+            k = kind_of(rel)
+            if k:
+                out[rel] = k
+    return out
+
+
+def ns_of(rel, namespaces):
+    parts = rel.split("/")
+    if parts[0] in ("data", "sources") and len(parts) > 1 and parts[1] in namespaces:
+        return parts[1]
+    if parts[:2] == ["docs", "health"] and len(parts) > 2 and parts[2] in namespaces:
+        return parts[2]
+    for tok in re.split(r"[/_.\-]+", rel):
+        if tok in namespaces:
+            return tok
+    return None
+
+
+def split_long(text, limit=CHUNK_CHARS):
+    if len(text) <= limit:
+        return [text]
+    out, cur = [], ""
+    for s in re.split(r"(?<=[.!?।])\s+|\n", text):
+        while len(s) > limit:
+            if cur:
+                out.append(cur); cur = ""
+            out.append(s[:limit]); s = s[limit:]
+        if cur and len(cur) + 1 + len(s) > limit:
+            out.append(cur); cur = s
+        else:
+            cur = f"{cur} {s}".strip()
+    if cur:
+        out.append(cur)
+    return out
+
+
+def md_chunks(text):
+    """-> [(title, page, text)]: front matter dropped (its title kept), split at headings, paragraphs packed."""
+    doc_title = None
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end > 0:
+            m = re.search(r"^title:\s*(.+)$", text[4:end], re.M)
+            doc_title = m.group(1).strip().strip("\"'") if m else None
+            text = text[end + 4:]
+    sections, heads, buf = [], [], []
+
+    def flush():
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((" / ".join(h for h in ([doc_title] if doc_title else []) + heads), body))
+        buf.clear()
+
+    for line in text.splitlines():
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            flush()
+            lvl = len(m.group(1))
+            heads[:] = heads[:lvl - 1] + [m.group(2).strip()]
+        else:
+            buf.append(line)
+    flush()
+    out = []
+    for title, body in sections:
+        page_m = re.search(r"\bpage\s+(\d+)\b", title, re.I)
+        page = int(page_m.group(1)) if page_m else None
+        cur = ""
+        for para in [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]:
+            para = re.sub(r"[ \t]+", " ", para)
+            for piece in split_long(para):
+                if cur and len(cur) + 2 + len(piece) > CHUNK_CHARS:
+                    out.append((title, page, cur)); cur = piece
+                else:
+                    cur = f"{cur}\n\n{piece}".strip()
+        if cur:
+            out.append((title, page, cur))
+    return out
+
+
+def ref_names(root):
+    names = {}
+    for f in sorted((root / "data" / "ref").glob("*.ndjson")):
+        for line in f.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("id") and r.get("name"):
+                names[r["id"]] = str(r["name"])
+    return names
+
+
+def _ref_label(v, names):
+    if isinstance(v, str) and v.startswith("ref:"):
+        return names.get(v) or v.split(":")[-1].replace("-", " ")
+    return v
+
+
+def fact_chunks(text, names):
+    """-> [(title, page, text, ref_id, path_override, ns)] for active fact rows; source rows give the source path."""
+    rows = []
+    for line in text.splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            rows.append(r)
+    src_path = {r["id"]: r.get("path") for r in rows if r.get("rt") == "source" and r.get("id")}
+    out = []
+    for r in rows:
+        if r.get("rt") != "fact" or r.get("status", "active") != "active":
+            continue
+        d = r.get("data") or {}
+        what = [_ref_label(d.get(k), names) for k in ("code", "name_raw", "drug_id", "brand", "label", "type")
+                if isinstance(d.get(k), str)]
+        what += [_ref_label(x, names) for x in d.get("drug_ids") or [] if isinstance(x, str)]
+        val = []
+        for k in ("value_num", "value_text", "value_raw", "unit", "flag", "ref_text", "body_site", "method",
+                  "strength", "dose_m", "dose_n", "dose_e", "schedule_raw", "route", "duration_text", "status",
+                  "status_as_documented", "text_as_written", "icd10", "category", "summary", "detail", "reason_text"):
+            if d.get(k) not in (None, "", []):
+                val.append(f"{k}={d[k]}")
+        at = (r.get("at") or "")[:16]
+        parts = [r.get("kind") or "fact", " ".join(what), " ".join(val), at]
+        if r.get("quote"):
+            parts.append(f'quote: "{r["quote"]}"')
+        title = f"{r.get('kind') or 'fact'} {' '.join(what)}".strip()
+        out.append((title, r.get("page"), " | ".join(p for p in parts if p), r.get("id"),
+                    src_path.get(r.get("source_id")), r.get("ns")))
+    return out
+
+
+# ---------- database ----------
+
+DDL = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, kind TEXT, n_chunks INTEGER,
+                                  indexed_at INTEGER);
+CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY, file TEXT NOT NULL, kind TEXT NOT NULL, ns TEXT,
+                                   ref_id TEXT, path TEXT NOT NULL, page INTEGER, title TEXT, text TEXT NOT NULL,
+                                   vec BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file);
+"""
+
+
+def default_db():
+    return os.environ.get("SATURN_SEARCH_DB") or str(pathlib.Path.home() / ".cache" / "saturn-search" / "index.sqlite")
+
+
+def open_db(path, readonly=False):
+    p = pathlib.Path(path)
+    if readonly:
+        if not p.is_file():
+            die(f"no index at {p} (run: search index --records DIR)")
+        return sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        db = sqlite3.connect(str(p))
+    finally:
+        os.umask(old)
+    db.executescript(DDL)
+    db.execute("PRAGMA synchronous=NORMAL")
+    return db
+
+
+def meta(db):
+    return dict(db.execute("SELECT key, value FROM meta"))
+
+
+def set_meta(db, **kv):
+    db.executemany("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   [(k, str(v)) for k, v in kv.items()])
+
+
+# ---------- commands ----------
+
+def cmd_index(a):
+    root = pathlib.Path(a.records).resolve()
+    if not root.is_dir():
+        die(f"--records {root}: not a directory", 3)
+    try:
+        cfg = records_config.load(root)
+        namespaces = set(cfg["namespaces"])
+    except records_config.RecordsError as e:
+        die(str(e), 3)
+    t0 = time.time()
+    files = walk(root)
+    refs_path = root / "data" / "ref"
+    refs_digest = hashlib.sha256(b"".join(f.read_bytes() for f in sorted(refs_path.glob("*.ndjson")))).hexdigest() \
+        if refs_path.is_dir() else ""
+    hashes = {}
+    for rel, kind in files.items():
+        h = hashlib.sha256((root / rel).read_bytes())
+        if kind == "fact":
+            h.update(refs_digest.encode())
+        hashes[rel] = h.hexdigest()
+
+    db = open_db(a.db)
+    m = meta(db)
+    emb = None if a.dry_run else Embedder(a.endpoint, a.prompt_style)
+    if emb and (a.full or m.get("model") != emb.model or m.get("prompt_style") != emb.style
+                or m.get("schema") != SCHEMA_VERSION):
+        with db:
+            db.execute("DELETE FROM chunks"); db.execute("DELETE FROM files")
+            db.execute("DELETE FROM meta")
+            set_meta(db, model=emb.model, prompt_style=emb.style, schema=SCHEMA_VERSION)
+    known = dict(db.execute("SELECT path, sha256 FROM files"))
+    changed = [r for r in files if known.get(r) != hashes[r]]
+    removed = [r for r in known if r not in files]
+    summary = {"records": str(root), "files_total": len(files), "files_changed": len(changed),
+               "files_removed": len(removed)}
+    if a.dry_run:
+        print(json.dumps(summary | {"dry_run": True}))
+        return 0 if not (changed or removed) else 1
+
+    names = ref_names(root) if any(files[r] == "fact" for r in changed) else {}
+    added = 0
+    for rel in removed:
+        with db:
+            db.execute("DELETE FROM chunks WHERE file = ?", (rel,)); db.execute("DELETE FROM files WHERE path = ?", (rel,))
+    for rel in changed:
+        kind = files[rel]
+        text = (root / rel).read_text(encoding="utf-8", errors="replace")
+        rows = []  # (kind, ns, ref_id, path, page, title, text)
+        if kind == "fact":
+            for title, page, t, ref_id, src, ns in fact_chunks(text, names):
+                rows.append((kind, ns or ns_of(rel, namespaces), ref_id, src or rel, page, title, t))
+        else:
+            ns = ns_of(rel, namespaces)
+            for title, page, t in md_chunks(text):
+                ids = DOC_ID_RE.findall(t)
+                rows.append((kind, ns, ids[0] if ids else None, rel, page, title, t))
+        vecs = emb.embed([emb.doc_text(r[5], r[6]) for r in rows]) if rows else []
+        if vecs:
+            dims = len(vecs[0])
+            if m.get("dims") and int(m["dims"]) != dims and known:
+                die("vector size changed under the same model name: run with --full", 1)
+            m["dims"] = str(dims)
+        with db:
+            db.execute("DELETE FROM chunks WHERE file = ?", (rel,))
+            db.executemany("INSERT INTO chunks(file, kind, ns, ref_id, path, page, title, text, vec) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           [(rel,) + r + (pack(v),) for r, v in zip(rows, vecs)])
+            db.execute("INSERT INTO files(path, sha256, kind, n_chunks, indexed_at) VALUES (?, ?, ?, ?, ?) "
+                       "ON CONFLICT(path) DO UPDATE SET sha256=excluded.sha256, kind=excluded.kind, "
+                       "n_chunks=excluded.n_chunks, indexed_at=excluded.indexed_at",
+                       (rel, hashes[rel], kind, len(rows), int(time.time())))
+        added += len(rows)
+    dt = time.time() - t0
+    with db:
+        set_meta(db, last_index_at=int(time.time()), last_index_seconds=round(dt, 2), records=str(root),
+                 last_changed=len(changed) + len(removed), **({"dims": m["dims"]} if m.get("dims") else {}))
+    total = db.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    print(json.dumps(summary | {"chunks_embedded": added, "chunks_total": total, "embed_requests": emb.calls,
+                                "model": emb.model, "prompt_style": emb.style, "seconds": round(dt, 2)}))
+    return 0
+
+
+def search(db, emb, text, ns=None, kind=None, k=10):
+    qv = array.array("f", emb.embed([emb.query_text(text)])[0])
+    sql, args = "SELECT kind, ns, ref_id, path, page, title, text, vec FROM chunks", []
+    where = []
+    if ns:
+        where.append("(ns = ? OR ns IS NULL)"); args.append(ns)
+    if kind:
+        where.append("kind = ?"); args.append(kind)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    scored = []
+    mul = operator.mul
+    for row in db.execute(sql, args):
+        s = sum(map(mul, qv, unpack(row[7])))
+        scored.append((s, row[:7]))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    for s, (kd, n, ref_id, path, page, title, t) in scored[:k]:
+        snip = re.sub(r"\s+", " ", t).strip()
+        out.append({"score": round(s, 4), "kind": kd, "ns": n, "id": ref_id, "path": path, "page": page,
+                    "title": title, "snippet": snip[:240] + ("…" if len(snip) > 240 else "")})
+    return out
+
+
+def cmd_query(a):
+    db = open_db(a.db, readonly=True)
+    m = meta(db)
+    emb = Embedder(a.endpoint, m.get("prompt_style") or "auto")
+    if m.get("model") and m["model"] != emb.model:
+        die(f"index was built with {m['model']}, server runs {emb.model}: re-index", 1)
+    t0 = time.time()
+    res = search(db, emb, a.text, a.ns, a.kind, a.k)
+    ms = round((time.time() - t0) * 1000)
+    if a.json:
+        print(json.dumps({"query_ms": ms, "results": res}, ensure_ascii=False))
+        return 0
+    for i, r in enumerate(res, 1):
+        loc = r["path"] + (f" p{r['page']}" if r["page"] else "")
+        print(f"{i:2}. {r['score']:.3f}  [{r['kind']}{'/' + r['ns'] if r['ns'] else ''}]  {r['id'] or '-'}  {loc}")
+        print(f"     {r['snippet']}")
+    print(f"({len(res)} results, {ms} ms)", file=sys.stderr)
+    return 0
+
+
+def cmd_stats(a):
+    db = open_db(a.db, readonly=True)
+    m = meta(db)
+    by_kind = dict(db.execute("SELECT kind, count(*) FROM chunks GROUP BY kind"))
+    st = {"chunks": sum(by_kind.values()), "files": db.execute("SELECT count(*) FROM files").fetchone()[0],
+          "by_kind": by_kind, "db_bytes": os.path.getsize(a.db), "model": m.get("model"), "dims": m.get("dims"),
+          "prompt_style": m.get("prompt_style"), "last_index_at": int(m.get("last_index_at") or 0),
+          "last_index_seconds": float(m.get("last_index_seconds") or 0), "last_changed": int(m.get("last_changed") or 0)}
+    if a.probe:
+        emb = Embedder(a.endpoint, m.get("prompt_style") or "auto")
+        t0 = time.time()
+        search(db, emb, a.probe, k=1)
+        st["probe_query_seconds"] = round(time.time() - t0, 3)
+    if not a.prom:
+        print(json.dumps(st))
+        return 0
+    lines = [
+        "# HELP saturn_search_chunks Chunks in the search index, by kind.", "# TYPE saturn_search_chunks gauge",
+        *[f'saturn_search_chunks{{kind="{k}"}} {v}' for k, v in sorted(by_kind.items())],
+        "# TYPE saturn_search_files gauge", f"saturn_search_files {st['files']}",
+        "# TYPE saturn_search_db_bytes gauge", f"saturn_search_db_bytes {st['db_bytes']}",
+        "# TYPE saturn_search_last_index_timestamp_seconds gauge",
+        f"saturn_search_last_index_timestamp_seconds {st['last_index_at']}",
+        "# TYPE saturn_search_last_index_duration_seconds gauge",
+        f"saturn_search_last_index_duration_seconds {st['last_index_seconds']}",
+        "# TYPE saturn_search_last_index_changed_files gauge", f"saturn_search_last_index_changed_files {st['last_changed']}",
+    ]
+    if "probe_query_seconds" in st:
+        lines += ["# TYPE saturn_search_probe_query_seconds gauge",
+                  f"saturn_search_probe_query_seconds {st['probe_query_seconds']}"]
+    print("\n".join(lines))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="search", description=__doc__.split("\n")[0])
+    ap.add_argument("--db", default=default_db())
+    ap.add_argument("--endpoint", default=os.environ.get("SATURN_EMBED_URL") or DEFAULT_ENDPOINT)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("index", help="(re)index changed files of a records repo")
+    p.add_argument("--records", required=True)
+    p.add_argument("--full", action="store_true", help="re-embed everything")
+    p.add_argument("--dry-run", action="store_true", help="report changed/removed files, embed nothing (exit 1 = changes)")
+    p.add_argument("--prompt-style", choices=["auto", "gemma", "none"], default="auto",
+                   help="auto: EmbeddingGemma prompts when the server's model id contains 'gemma'")
+    q = sub.add_parser("query", help="search the index")
+    q.add_argument("text")
+    q.add_argument("--ns")
+    q.add_argument("--kind", choices=[k for k, _ in KINDS])
+    q.add_argument("-k", type=int, default=10)
+    q.add_argument("--json", action="store_true")
+    s = sub.add_parser("stats", help="index size and freshness (JSON, or Prometheus text with --prom)")
+    s.add_argument("--prom", action="store_true")
+    s.add_argument("--probe", help="also time one query (needs the server)")
+    a = ap.parse_args(argv)
+    for opt in ("db",):
+        setattr(a, opt, os.path.expanduser(getattr(a, opt)))
+    return {"index": cmd_index, "query": cmd_query, "stats": cmd_stats}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

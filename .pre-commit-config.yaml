@@ -67,6 +67,12 @@ repos:
         entry: python3 -I tools/catalog/test_catalog.py
         pass_filenames: false
         files: ^(tools/catalog/|schema/catalog\.schema\.json|fixtures/catalog-example/)
+      - id: search
+        name: search indexer (synthetic records, mock embedding server)
+        language: system
+        entry: python3 -I tools/search/test_search.py
+        pass_filenames: false
+        files: ^(tools/search/|tools/kb/records_config.py|fixtures/records-example/)
       - id: no-binaries-outside-fixtures
         name: binary files only under fixtures/
         language: fail

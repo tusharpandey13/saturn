@@ -39,6 +39,7 @@ jobs:
           python3 -I tools/inference/test_inference.py
           python3 -I tools/site/test_site.py
           python3 -I tools/catalog/test_catalog.py
+          python3 -I tools/search/test_search.py
   doc-scan:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

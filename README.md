@@ -82,7 +82,7 @@ go-live gate.
 app/          Worker (src/), batch entrypoint (batch/), D1 migrations, tests, scripts (render, e2e)
 adapters/     llm/ (claude-cli), stt/ (sarvam)
 schema/       KB JSON Schemas + schema.sql (ADR 007)
-tools/        kb/ (build, gen-views), research/ (citation verifier), ocr/, doc-scan/, docs-site/
+tools/        kb/ (build, gen-views), research/ (citation verifier), search/ (local semantic search), ocr/, doc-scan/, docs-site/
 agent-tasks/  task pack for agent-server (PR target = the records repo, set by the env)
 deploy/       wrangler template, deploy.sh, batch.sh, thin workflow templates, env.example.yaml
 fixtures/     records-example/ (synthetic records), app/ (synthetic Telegram and extraction fixtures)
