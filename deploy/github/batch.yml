@@ -4,7 +4,11 @@
 # Triggers: schedule + workflow_dispatch only (never push / pull_request / pull_request_target).
 # Secrets: ONE standing GitHub secret, SOPS_AGE_KEY. Each step decrypts only the SOPS files it needs (scripts/ci run).
 # Records are written with a per-job GitHub App token (records repo only, contents write, no workflows); the token
-# action revokes it in its post step.
+# action revokes it in its post step. The records checkout keeps NO credential (persist-credentials: false): only the
+# deterministic commit steps get the token (RECORDS_TOKEN) and the batch SSH signing key (BATCH_SIGNING_KEY); they
+# refuse changes outside the batch paths and sign every commit. The AI step (extract: `claude -p`, no tools) gets the
+# model token only; `scripts/ci run` unsets SOPS_AGE_KEY before the command, and batch.sh extract fails if any write
+# credential is visible (assert-isolated). Voice notes: whisper.cpp built at a pinned tag + pinned model, cached.
 name: batch
 
 on:
@@ -34,7 +38,7 @@ permissions: {}
 jobs:
   batch:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read # this env repo only; records writes use the App token
       actions: write # dispatch records-validate after the batch
@@ -43,7 +47,8 @@ jobs:
       #      SOPS_AGE_KEY to environment "production" and add `environment:` to this job) ----
       SECRETS_KEYS: secrets/github.sops.env # PRODUCT_DEPLOY_KEY, RECORDS_APP_PRIVATE_KEY
       SECRETS_PULL: secrets/cloudflare-d1.sops.env secrets/cloudflare-r2-read.sops.env secrets/telegram-bot.sops.env
-      SECRETS_EXTRACT: secrets/claude-ci.sops.env
+      SECRETS_EXTRACT: secrets/claude-ci.sops.env # CLAUDE_CODE_OAUTH_TOKEN only
+      SECRETS_COMMIT: secrets/batch-signing.sops.env # BATCH_SIGNING_KEY (SSH; public half in guard/records-allowed-signers)
       SECRETS_FINISH: secrets/cloudflare-d1.sops.env secrets/telegram-bot.sops.env
       # ---- end secrets: batch ----
     steps:
@@ -97,14 +102,15 @@ jobs:
           repositories: ${{ env.RECORDS_NAME }}
           permission-contents: write
 
-      - name: Checkout records (job-scoped App token kept for the push; no artifacts are uploaded)
+      - name: Checkout records (no credential kept; the commit steps get the token)
         if: env.SKIP != '1'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.RECORDS_REPO }}
           ref: ${{ env.TARGET_BRANCH }}
           token: ${{ steps.app.outputs.token }}
           path: records
+          persist-credentials: false
 
       - name: Records schema_version supported by this product
         if: env.SKIP != '1'
@@ -121,15 +127,41 @@ jobs:
           (cd product/app && npm ci --ignore-scripts --no-audit --no-fund)
           if [ -n "$CLAUDE_CODE_VERSION" ]; then npm install -g --ignore-scripts --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; fi
 
+      - name: Speech-to-text cache (whisper.cpp build + model, keyed on the pinned setup script)
+        if: env.SKIP != '1' && env.STT_ADAPTER == 'whisper-cpp'
+        id: whisper-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/whisper
+          key: whisper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('product/deploy/scripts/whisper-setup.sh') }}
+
+      - name: Speech-to-text setup (no secrets; on failure voice notes wait as stt_pending)
+        if: env.SKIP != '1' && env.STT_ADAPTER == 'whisper-cpp'
+        continue-on-error: true
+        run: |
+          product/deploy/scripts/whisper-setup.sh "$RUNNER_TEMP/whisper"
+          { echo "WHISPER_BIN=$RUNNER_TEMP/whisper/bin/whisper-cli"; echo "WHISPER_MODEL=$RUNNER_TEMP/whisper/models/ggml-large-v3-turbo-q5_0.bin"; } >> "$GITHUB_ENV"
+
       - name: Pull (raw first)
         if: env.SKIP != '1'
+        id: pull
         env:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
         run: |
           # shellcheck disable=SC2086 # file lists split on spaces by design
           scripts/ci run $SECRETS_PULL -- product/deploy/batch.sh pull --records records
 
-      - name: Extract + KB + pages
+      - name: Commit raw (deterministic; batch paths only; signed)
+        if: env.SKIP != '1'
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          RECORDS_TOKEN: ${{ steps.app.outputs.token }}
+          REQUIRE_SIGNED: "1"
+        run: |
+          # shellcheck disable=SC2086
+          scripts/ci run $SECRETS_COMMIT -- product/deploy/batch.sh commit raw --records records
+
+      - name: Extract + KB + pages (AI step; model token only, no write credential)
         if: env.SKIP != '1'
         id: extract
         continue-on-error: true
@@ -141,8 +173,20 @@ jobs:
           # shellcheck disable=SC2086
           scripts/ci run $SECRETS_EXTRACT -- product/deploy/batch.sh extract --records records ${RETRY:+"$RETRY"}
 
+      - name: Commit batch (deterministic; batch paths only; signed)
+        if: always() && env.SKIP != '1' && steps.pull.outcome == 'success'
+        id: commit-batch
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          RECORDS_TOKEN: ${{ steps.app.outputs.token }}
+          REQUIRE_SIGNED: "1"
+        run: |
+          # shellcheck disable=SC2086
+          scripts/ci run $SECRETS_COMMIT -- product/deploy/batch.sh commit batch --records records
+
       - name: Finish
         if: always() && env.SKIP != '1' && steps.lock.outcome == 'success'
+        id: finish
         env:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           NO_DIGEST: ${{ (github.event_name == 'workflow_dispatch' && !inputs.send_digest) && '--no-digest' || '' }}
@@ -151,6 +195,16 @@ jobs:
           # shellcheck disable=SC2086
           scripts/ci run $SECRETS_FINISH -- product/deploy/batch.sh finish --records records ${NO_DIGEST:+"$NO_DIGEST"} ${FORCE_DIGEST:+"$FORCE_DIGEST"}
 
+      - name: Commit digest log (deterministic; signed)
+        if: always() && env.SKIP != '1' && steps.lock.outcome == 'success' && steps.app.outcome == 'success'
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          RECORDS_TOKEN: ${{ steps.app.outputs.token }}
+          REQUIRE_SIGNED: "1"
+        run: |
+          # shellcheck disable=SC2086
+          scripts/ci run $SECRETS_COMMIT -- product/deploy/batch.sh commit digest --records records
+
       - name: Validate records after the batch
         if: always() && env.SKIP != '1'
         env:
@@ -158,7 +212,7 @@ jobs:
         run: gh workflow run records-validate.yml --ref "$GITHUB_REF_NAME"
 
       - name: Fail loudly
-        if: steps.extract.outcome == 'failure'
+        if: steps.extract.outcome == 'failure' || steps.commit-batch.outcome == 'failure'
         run: |
-          echo "extract failed or was delayed; raw data is committed. See the step logs." >&2
+          echo "extract or its commit failed (or extraction was delayed); raw data is committed. See the step logs." >&2
           exit 1

@@ -7,6 +7,7 @@
 import { PRODUCT_NAME } from "../product.js";
 import { readingEn, symptomEn } from "../replies.js";
 import type { Alert, Reading, Symptom } from "../types.js";
+import { durationEn } from "../extract/voice.js";
 
 export interface DigestEntry {
   /** Message key; the later entry for a key replaces an earlier one (a voice note transcribed after being pending). */
@@ -41,6 +42,8 @@ export const FOR_HINT = "Wrong member? Reply /for <name> to the original message
 export const PRIVATE_NOTE = "🔒 private message kept (not read)";
 export const CONTEXT_HEAD = "Context (shadow): life-context notes, unverified, shown to the admin only. Alongside, not as a cause. Facts as written; not advice; doctors decide.";
 export const STT_PENDING_NOTE = "voice note: transcription pending";
+export const LISTEN_HEAD = "Voice notes that need a listener (machine transcripts are unchecked; after listening, add the note to data/telegram/listened.ndjson):";
+export const LISTEN_MAX = 15;
 export const ANNOTATION_NOTE = "unverified; doctor sign-off pending";
 export const EMPTY_LINE = "No new messages.";
 export const QUESTIONS_HEAD = "Questions (reply to this message; start with the member's name so the answer is logged for them):";
@@ -59,6 +62,8 @@ export function buildDigest(o: {
   thresholdsStatus: string;
   /** Messages not read for context this run because the daily cap was reached (shadow mode). */
   contextSkipped?: number;
+  /** Every voice note without a listened marker (standing list until a person marks it). */
+  listen?: { person: string; ts: string; durationSec: number; transcribed: boolean }[];
 }): string {
   const day = new Intl.DateTimeFormat("en-IN", { timeZone: o.timeZone, day: "numeric", month: "short" }).format(new Date(o.now));
   const dayFmt = (iso: string) => new Intl.DateTimeFormat("en-IN", { timeZone: o.timeZone, day: "numeric", month: "short" }).format(new Date(iso));
@@ -99,6 +104,12 @@ export function buildDigest(o: {
   if (ctx.length || o.contextSkipped) {
     out.push("", CONTEXT_HEAD, ...ctx.map((l) => `• ${l}`));
     if (o.contextSkipped) out.push(`• ${o.contextSkipped} message(s) not read for context (daily cap reached)`);
+  }
+
+  if (o.listen?.length) {
+    const full = (iso: string) => `${dayFmt(iso)} ${hm(iso)}`;
+    out.push("", LISTEN_HEAD, ...o.listen.slice(0, LISTEN_MAX).map((v) => `• ${v.person} ${full(v.ts)}, ${durationEn(v.durationSec)}${v.transcribed ? "" : " (not transcribed yet)"}`));
+    if (o.listen.length > LISTEN_MAX) out.push(`• … and ${o.listen.length - LISTEN_MAX} more`);
   }
 
   const questions = entries.flatMap((e) => e.questions.map((q) => `${e.person} ${time(e.ts)} ${e.snippet ? `"${e.snippet}"` : kindEn(e.kind)}: ${q}`));

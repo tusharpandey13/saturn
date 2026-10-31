@@ -11,6 +11,9 @@ export interface ExtractInput {
   replyTo?: string;
   /** Read this message for life-context signals too (ADR 010 pre-filter passed). Header `context: yes|no`. */
   context?: boolean;
+  /** A voice note: `text` is its machine transcript in the source language (timed lines). Header `voice: yes`;
+   *  read with the voice schema and rules (src/extract/voice.ts) on the transcript model. */
+  voice?: { durationSec: number };
 }
 
 /** Raw (unvalidated) model JSON per input, in input order; an Error for an input that could not be extracted. */

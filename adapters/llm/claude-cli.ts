@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ExtractInput, type Extractor, ExtractorStopError, systemPrompt } from "../../app/src/extract/adapter.js";
 import { EXTRACTION_SCHEMA } from "../../app/src/extract/schema.js";
+import { VOICE_RULES, VOICE_SCHEMA } from "../../app/src/extract/voice.js";
 export { type ExtractInput, type Extractor, ExtractorStopError, oneByOne } from "../../app/src/extract/adapter.js";
 
 /** Full model ID, not the alias, so a new Haiku does not change extraction silently. The CLI version is pinned in
@@ -55,6 +56,40 @@ export const BATCH_SCHEMA = {
   },
 } as const;
 
+/** Voice notes: one transcript per call, the voice schema (extraction fields + verbatim statements). */
+export const VOICE_BATCH_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["results"],
+  properties: {
+    results: {
+      type: "array",
+      items: {
+        ...VOICE_SCHEMA,
+        required: ["msg", ...VOICE_SCHEMA.required],
+        properties: { msg: { type: "integer", description: "the message number" }, ...VOICE_SCHEMA.properties },
+      },
+    },
+  },
+} as const;
+/** Default for voice-note transcripts (Hindi source text, relative dates, negations, speakers). */
+export const TRANSCRIPT_MODEL = "claude-sonnet-5-5";
+
+/** The ONLY variables the `claude` child process gets: auth, locale, paths and CLI switches. Everything else in the
+ *  batch environment (SOPS_AGE_KEY, GitHub/App tokens, Cloudflare and Telegram secrets, runner tokens) is dropped, so
+ *  the AI step can never see a write credential even if one is present in the parent. Pure prompt-in/JSON-out:
+ *  --tools "" (no Bash, no file read/write), --max-turns 1, no MCP, an empty scratch cwd. */
+export const CHILD_ENV_ALLOW = [
+  "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "DISABLE_AUTOUPDATER",
+  "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "CLAUDE_CONFIG_DIR", "NODE_EXTRA_CA_CERTS",
+] as const;
+export function childEnv(parent: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const k of CHILD_ENV_ALLOW) if (parent[k]) env[k] = parent[k]; // empty secret = unset
+  env.DISABLE_AUTOUPDATER = "1";
+  return env;
+}
+
 export const MAX_PER_CALL = 20;
 /** Piped stdin is capped at 10 MB by the CLI; base64 media per call stays well under it. */
 export const MAX_MEDIA_B64_PER_CALL = 6_000_000;
@@ -71,7 +106,9 @@ export function pdfPages(data: Uint8Array): number {
 
 const b64 = (data: Uint8Array) => Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("base64");
 
-function blocksFor(n: number, { text, media, now, replyTo, context }: ExtractInput): Block[] {
+function blocksFor(n: number, { text, media, now, replyTo, context, voice }: ExtractInput): Block[] {
+  if (voice)
+    return [{ type: "text", text: `Message ${n}: received at ${now} (Asia/Kolkata context). context: ${context ? "yes" : "no"}. voice: yes (${Math.round(voice.durationSec)} s). Machine transcript, verbatim, [mm:ss] per segment:\n"""\n${text ?? ""}\n"""` }];
   const ctx = replyTo ? ` It replies to: """${replyTo.slice(0, 500)}""" (context only; extract from the reply itself).` : "";
   const pdf = media?.mimeType === "application/pdf";
   const pages = pdf ? pdfPages(media.data) : 0;
@@ -96,6 +133,8 @@ export interface ClaudeCliOptions {
   /** Model for text-only messages (default MODEL, Haiku) and for photos/PDFs (default MEDIA_MODEL, Sonnet). */
   textModel?: string;
   mediaModel?: string;
+  /** Model for voice-note transcripts (default TRANSCRIPT_MODEL, Sonnet; env EXTRACT_MODEL_TRANSCRIPT). */
+  transcriptModel?: string;
   /** Usage guard: photo/PDF calls per run (default MAX_MEDIA_CALLS); over it, inputs wait as delayed. */
   maxMediaCalls?: number;
 }
@@ -112,6 +151,7 @@ export class ClaudeCliExtractor implements Extractor {
   /** The text model (Haiku by default); photos and PDFs use `mediaModel` (see modelFor). */
   readonly model: string;
   readonly mediaModel: string;
+  readonly transcriptModel: string;
   private readonly maxMediaCalls: number;
   private blocked: ClaudeCliError | null = null;
   private readonly backoffMs: number[];
@@ -124,11 +164,12 @@ export class ClaudeCliExtractor implements Extractor {
     this.backoffMs = o.backoffMs ?? [5_000, 20_000, 60_000];
     this.model = pickModel(o.textModel, MODEL);
     this.mediaModel = pickModel(o.mediaModel, MEDIA_MODEL);
+    this.transcriptModel = pickModel(o.transcriptModel, TRANSCRIPT_MODEL);
     this.maxMediaCalls = o.maxMediaCalls ?? MAX_MEDIA_CALLS;
   }
 
   modelFor(input: ExtractInput): string {
-    return input.media ? this.mediaModel : this.model;
+    return input.voice ? this.transcriptModel : input.media ? this.mediaModel : this.model;
   }
 
   async extract(inputs: ExtractInput[]): Promise<(unknown | Error)[]> {
@@ -142,7 +183,7 @@ export class ClaudeCliExtractor implements Extractor {
       size = 0;
     };
     for (let i = 0; i < inputs.length; i++) {
-      if (inputs[i].media) continue;
+      if (inputs[i].media || inputs[i].voice) continue;
       if (chunk.length >= MAX_PER_CALL) await flush(false);
       chunk.push(i);
     }
@@ -162,10 +203,12 @@ export class ClaudeCliExtractor implements Extractor {
       if (pdf) await flush(true); // a PDF always goes alone: the model's whole attention on its pages
     }
     await flush(true);
+    // Voice notes: one transcript per call on the transcript model, voice schema and rules.
+    for (let i = 0; i < inputs.length; i++) if (inputs[i].voice) await this.runChunk(inputs, [i], out, false, true);
     return out;
   }
 
-  private async runChunk(inputs: ExtractInput[], idx: number[], out: (unknown | Error)[], media: boolean): Promise<void> {
+  private async runChunk(inputs: ExtractInput[], idx: number[], out: (unknown | Error)[], media: boolean, voice = false): Promise<void> {
     if (media && this.mediaCalls >= this.maxMediaCalls) {
       // Usage guard: kept as delayed (transient), so the inbox rows stay new and the next run reads them.
       for (const i of idx) out[i] = new ClaudeCliError(0, "media_call_cap");
@@ -173,7 +216,7 @@ export class ClaudeCliExtractor implements Extractor {
     }
     try {
       if (media) this.mediaCalls++;
-      const so = (await this.call(idx.flatMap((i, k) => blocksFor(k + 1, inputs[i])), media ? this.mediaModel : this.model)) as { results?: { msg?: unknown }[] };
+      const so = (await this.call(idx.flatMap((i, k) => blocksFor(k + 1, inputs[i])), voice ? this.transcriptModel : media ? this.mediaModel : this.model, voice)) as { results?: { msg?: unknown }[] };
       const byMsg = new Map<number, Record<string, unknown>>();
       for (const r of Array.isArray(so?.results) ? so.results : []) if (typeof r?.msg === "number" && !byMsg.has(r.msg)) byMsg.set(r.msg, r);
       idx.forEach((i, k) => {
@@ -186,17 +229,17 @@ export class ClaudeCliExtractor implements Extractor {
       });
     } catch (err) {
       // One refused or unusable message must not fail the whole chunk: retry those one by one.
-      if (err instanceof ExtractorStopError && idx.length > 1) for (const i of idx) await this.runChunk(inputs, [i], out, media);
+      if (err instanceof ExtractorStopError && idx.length > 1) for (const i of idx) await this.runChunk(inputs, [i], out, media, voice);
       else for (const i of idx) out[i] = err as Error;
     }
   }
 
   /** One CLI call with retries; returns structured_output. */
-  private async call(blocks: Block[], model: string): Promise<unknown> {
+  private async call(blocks: Block[], model: string, voice = false): Promise<unknown> {
     for (let attempt = 0; ; attempt++) {
       if (this.blocked) throw this.blocked; // auth or usage limit hit earlier in this run: do not hammer
       try {
-        return await this.once(blocks, model);
+        return await this.once(blocks, model, voice);
       } catch (err) {
         if (!(err instanceof ClaudeCliError)) throw err;
         if (err.status === 401 || attempt >= this.backoffMs.length) {
@@ -209,21 +252,20 @@ export class ClaudeCliExtractor implements Extractor {
     }
   }
 
-  private async once(blocks: Block[], model: string): Promise<unknown> {
+  private async once(blocks: Block[], model: string, voice = false): Promise<unknown> {
     this.calls++;
     const stream = blocks.some((b) => b.type !== "text");
-    const effort = stream ? "medium" : "low";
+    const effort = stream || voice ? "medium" : "low";
     const args = [
       "-p", "--model", model, "--effort", effort, "--tools", "", "--max-turns", "1",
-      "--system-prompt", systemPrompt(this.o.context), "--json-schema", JSON.stringify(BATCH_SCHEMA),
+      "--system-prompt", systemPrompt(this.o.context) + (voice ? VOICE_RULES : ""), "--json-schema", JSON.stringify(voice ? VOICE_BATCH_SCHEMA : BATCH_SCHEMA),
       "--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands",
       ...(stream ? ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] : ["--output-format", "json"]),
     ];
     const input = stream
       ? `${JSON.stringify({ type: "user", message: { role: "user", content: blocks } })}\n`
       : blocks.map((b) => (b as { text: string }).text).join("\n\n");
-    const env = { ...(this.o.env ?? process.env) };
-    for (const k of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) if (!env[k]) delete env[k]; // empty secret = unset
+    const env = childEnv(this.o.env ?? process.env); // allowlist: no write tokens, no SOPS key reach the AI process
     // Empty scratch cwd: no project settings, hooks or CLAUDE.md from the repo are picked up.
     const cwd = mkdtempSync(join(tmpdir(), "hl-claude-"));
     try {

@@ -107,6 +107,18 @@ Never create a new list of questions, to-dos or gaps. Add to `questions.md` or `
 - ADRs change status only, with forward links both ways.
 - Answered questions move to "Answered" with the answer and its source. Never strike through in place.
 
+### Voice notes (machine transcripts)
+
+With the `whisper-cpp` STT adapter the batch writes a transcript next to each voice note: `sources/<ns>/media/telegram/<audio-name>.transcript.md` (verbatim, in the spoken language, timed; engine, model, settings and timing in the front matter; a "machine transcript — needs a listener" banner). If a person already put a transcript at that path, the batch leaves it alone and writes `<audio-name>.batch.transcript.md`. Items extracted from it are tagged `machine-transcript` and `patient-reported` (the patient speaking) or `family-reported`, each with a verbatim quote; nothing is translated.
+
+The admin digest lists every voice note, with its length, until someone has listened to it. After listening, append one line to **`data/telegram/listened.ndjson`** (append-only; the transcript banner shows the exact line):
+
+```json
+{"update_id": 900000004, "by": "owner", "at": "2026-10-31", "note": "checked against the audio; transcript fine"}
+```
+
+`tools/kb/build` fails on a row without `update_id` (int), `by` and `at` (YYYY-MM-DD), with other keys, or for an update that is not a recorded voice note. To correct a fact from a voice note, supersede it (section 7) citing the audio.
+
 ### Telegram messages handled manually
 
 Facts the KB build derives from Telegram (`data/telegram/YYYY-MM.ndjson`) cannot be superseded by hand. When the owner ingests a Telegram document properly as a manual source, or the same photo was sent twice before the batch's media dedup (v0.8.0; it checks new messages only, not pairs already extracted), append one line to **`data/telegram/handled-manually.ndjson`**:

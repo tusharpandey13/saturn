@@ -3,7 +3,7 @@
 // -> pull -> extract (LLM mocked, STT stubbed) -> NDJSON -> tools/kb/build -> digest text -> finish.
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -609,5 +609,109 @@ describe("photos and PDFs: model per kind, full reports, duplicate files (synthe
     const r2nd = await extract({ repo, extractor: new MediaAwareExtractor(), stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
     expect(r2nd.extracted).toBe(1);
     expect(ndjson(repo).find((x) => x.id === `${GROUP}:44`)).toMatchObject({ extraction_status: "duplicate", duplicate_of: `${GROUP}:41` });
+  });
+});
+
+// ---------------------------------------------------------------- voice notes (local STT, machine transcripts)
+class LocalStt {
+  readonly local = true;
+  calls = 0;
+  constructor(private accepted = true, private text = "कल रात चक्कर आया था आज चक्कर नहीं आया") {}
+  async transcribe(): Promise<import("../src/types.js").Transcript> {
+    this.calls++;
+    return { text: this.text, languageCode: "hi", languageProbability: 0.97, segments: [{ start: 0, end: 3.5, text: "कल रात चक्कर आया था" }, { start: 3.5, end: 7, text: "आज चक्कर नहीं आया" }],
+      meta: { engine: "whisper.cpp test", model: "test-model", settings: "-l hi --max-context 0", attempts: [{ language: "hi", temperature: 0, detected: "hi", verdict: this.accepted ? "ok" : "repetition:segments", elapsedSec: 1 }], audioSec: 7, elapsedSec: 1, accepted: this.accepted } };
+  }
+  startBatch(): Promise<string> { throw new Error("no"); }
+  pollBatch(): Promise<null> { throw new Error("no"); }
+}
+class VoiceExtractor implements Extractor {
+  readonly model = "claude-haiku-5-5";
+  calls: ExtractInput[] = [];
+  modelFor(i: ExtractInput) { return i.voice ? "claude-sonnet-5-5" : this.model; }
+  async extract(inputs: ExtractInput[]): Promise<unknown[]> {
+    this.calls.push(...inputs);
+    return inputs.map(() => ({ readings: [], media_kind: "none", confidence: 0.9, unreadable_reason: null, subject_hint: null, context: [],
+      symptoms: [{ symptom_type: "dizziness", location: null, side: "unknown", character: [], severity: null, duration_min: null, at_rest: null, associated: [], triggers: [], onset_at: "2026-10-24T22:00", free_text: "कल रात चक्कर आया था" }],
+      statements: [
+        { category: "symptom", summary: "dizziness last night", quote: "कल रात चक्कर आया था", negated: false, time_frame: "past", when_text: "kal raat", when: "2026-10-24", speaker: "sender", speaker_name: null, about: null, confidence: 0.9 },
+        { category: "symptom", summary: "no dizziness today", quote: "आज चक्कर नहीं आया", negated: true, time_frame: "current", when_text: "aaj", when: "2026-10-25", speaker: "sender", speaker_name: null, about: null, confidence: 0.9 },
+        { category: "symptom", summary: "fainted", quote: "बेहोश हो गई", negated: false, time_frame: "past", when_text: null, when: null, speaker: "sender", speaker_name: null, about: null, confidence: 0.9 },
+      ] }));
+  }
+}
+
+describe("voice notes: local transcript, verbatim statements, needs a listener", () => {
+  const setup = async () => {
+    const voice = fixture("voice");
+    const { store, r2, t, repo } = await ingestAll([voice], { voice1: new TextEncoder().encode("OggS-synthetic") });
+    await pull({ store, r2, tg: t.tg, repo });
+    const key = `${GROUP}:${(voice as any).message.message_id}`;
+    return { repo, key, updateId: (voice as any).update_id as number };
+  };
+
+  it("pending notes are backfilled: transcript file next to the audio, Hindi to the model, statements tagged, digest asks for a listener", async () => {
+    const { repo, key, updateId } = await setup();
+    await extract({ repo, extractor: new VoiceExtractor(), stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW }); // stt_pending first
+    const llm = new VoiceExtractor();
+    const r = await extract({ repo, extractor: llm, stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r).toMatchObject({ extracted: 1, sttPending: 0, voice: { notes: 1, rejected: 0, statements: 2, dropped: 1 } });
+    const md = readFileSync(join(root, "sources/alice/media/telegram/u-voice1.transcript.md"), "utf8");
+    expect(md).toMatch(/^---\ngenerator: saturn-batch/);
+    expect(md).toContain("Machine transcript — needs a listener");
+    expect(md).toContain("[00:00.0 → 00:03.5] कल रात चक्कर आया था");
+    expect(md).toContain(`"update_id": ${updateId}`);
+    expect(llm.calls[0].voice).toBeTruthy();
+    expect(llm.calls[0].text).toContain("[00:03] आज चक्कर नहीं आया"); // source language, timed; no translation
+    const rows = ndjson(repo);
+    expect(rows.find((x) => x.id === key)).toMatchObject({ extraction_status: "ok", transcript_path: "sources/alice/media/telegram/u-voice1.transcript.md", extracted_by: "claude-sonnet-5-5" });
+    expect(rows.filter((x) => x.rt === "d1.statements").map((x) => [x.quote, x.negated])).toEqual([["कल रात चक्कर आया था", 0], ["आज चक्कर नहीं आया", 1]]);
+    expect(r.digest).toContain("voice note (7 s): machine transcript, 2 item(s) recorded; needs a listener");
+    expect(r.digest).toMatch(/need a listener[\s\S]*• Alice .*7 s/);
+    expect(kbBuild()).toMatch(/^ok:/);
+    const db = new DatabaseSync(join(root, "kb.sqlite"));
+    const facts = db.prepare("SELECT tags, quote, at FROM fact WHERE locator = ? ORDER BY at").all(`tg:${key}`) as { tags: string; quote: string; at: string }[];
+    expect(facts.map((f) => JSON.parse(f.tags))).toEqual([expect.arrayContaining(["patient-reported", "machine-transcript"]), expect.arrayContaining(["patient-reported", "machine-transcript", "negated"])]);
+    expect(facts[0].at).toBe("2026-10-24");
+    const sym = db.prepare("SELECT tags FROM fact WHERE source_id = (SELECT source_id FROM fact WHERE locator = ? LIMIT 1) AND kind = 'observation'").all(`tg:${key}`) as { tags: string }[];
+    expect(JSON.parse(sym[0].tags)).toEqual(expect.arrayContaining(["patient-reported", "machine-transcript"]));
+
+    // A person listens and marks it: the standing digest line goes away; the KB build checks the marker.
+    writeFileSync(join(root, "data/telegram/listened.ndjson"), JSON.stringify({ update_id: updateId, by: "owner", at: "2026-10-26" }) + "\n");
+    const r2nd = await extract({ repo, extractor: llm, stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: "2026-10-26T15:30:00.000Z" });
+    expect(r2nd.digest).not.toContain("need a listener");
+    expect(kbBuild()).toMatch(/^ok:/);
+    writeFileSync(join(root, "data/telegram/listened.ndjson"), JSON.stringify({ update_id: 1, by: "owner", at: "2026-10-26" }) + "\n");
+    expect(() => kbBuild()).toThrow(/not a recorded voice note/);
+  });
+
+  it("a looping transcript is not extracted: kept, asked, queued for a listener", async () => {
+    const { repo, key } = await setup();
+    const llm = new VoiceExtractor();
+    const r = await extract({ repo, extractor: llm, stt: new LocalStt(false), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(llm.calls).toHaveLength(0);
+    expect(r.voice.rejected).toBe(1);
+    expect(ndjson(repo).find((x) => x.id === key)).toMatchObject({ extraction_status: "failed" });
+    expect(readFileSync(join(root, "sources/alice/media/telegram/u-voice1.transcript.md"), "utf8")).toContain("REJECTED");
+    expect(r.digest).toContain("could not be transcribed reliably; needs a listener");
+    expect(repo.queue()[0]).toMatchObject({ reasons: ["transcript_rejected"] });
+  });
+
+  it("a person's transcript is never overwritten; the per-run audio cap defers the rest", async () => {
+    const { repo, key } = await setup();
+    mkdirSync(join(root, "sources/alice/media/telegram"), { recursive: true });
+    writeFileSync(join(root, "sources/alice/media/telegram/u-voice1.transcript.md"), "# hand-made transcript\n");
+    await extract({ repo, extractor: new VoiceExtractor(), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(readFileSync(join(root, "sources/alice/media/telegram/u-voice1.transcript.md"), "utf8")).toBe("# hand-made transcript\n");
+    expect(existsSync(join(root, "sources/alice/media/telegram/u-voice1.batch.transcript.md"))).toBe(true);
+    expect(ndjson(repo).find((x) => x.id === key)).toMatchObject({ transcript_path: "sources/alice/media/telegram/u-voice1.batch.transcript.md" });
+
+    // Deadline already passed: the note waits as stt_pending (no engine call).
+    const { repo: repo2 } = await (async () => { rmSync(root, { recursive: true, force: true }); return setup(); })();
+    const stt = new LocalStt();
+    const r = await extract({ repo: repo2, extractor: new VoiceExtractor(), stt, thresholds: THRESHOLDS, persons: PERSONS, now: NOW, sttDeadline: Date.now() - 1 });
+    expect(stt.calls).toBe(0);
+    expect(r.sttPending).toBe(1);
+    expect(r.digest).toContain("transcription waits for the next run");
   });
 });

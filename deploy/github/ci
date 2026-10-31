@@ -10,7 +10,8 @@
 #   ci records-schema RECORDS PRODUCT   fail unless records.yaml schema_version is one the product reads
 #   ci output FILE NAME...              decrypt NAMEs from FILE into step outputs (masked first; multi-line ok)
 #   ci mask FILE...                     register every non-empty value line of FILEs with the log masker
-#   ci run FILE... -- CMD [ARG...]      run CMD with the values of FILEs in its environment (masked first)
+#   ci run FILE... -- CMD [ARG...]      run CMD with the values of FILEs in its environment (masked first). CMD never
+#                                       sees SOPS_AGE_KEY: it is unset after the last decryption.
 # Needs: bash, jq, yq (preinstalled on GitHub's ubuntu images); SOPS_AGE_KEY for output/mask/run.
 set -euo pipefail
 
@@ -54,6 +55,10 @@ case "$cmd" in
       echo "EXTRACT_MODEL_TEXT=$(y .batch.extract_model_text "$ENV_FILE")"
       echo "EXTRACT_MODEL_MEDIA=$(y .batch.extract_model_media "$ENV_FILE")"
       echo "EXTRACT_MAX_MEDIA_CALLS=$(y .batch.extract_max_media_calls "$ENV_FILE")"
+      echo "EXTRACT_MODEL_TRANSCRIPT=$(y .batch.extract_model_transcript "$ENV_FILE")"
+      echo "STT_ADAPTER=$(y .batch.stt_adapter "$ENV_FILE")"
+      echo "STT_MAX_AUDIO_MIN=$(y .batch.stt_max_audio_min "$ENV_FILE")"
+      echo "STT_MAX_RUNTIME_MIN=$(y .batch.stt_max_runtime_min "$ENV_FILE")"
     } >> "${GITHUB_ENV:-/dev/stdout}" ;;
   verify-lock)
     want=$(y .commit "$LOCK_FILE"); got=$(git -C "${1:?dir}" rev-parse HEAD)
@@ -75,7 +80,7 @@ case "$cmd" in
   run)
     files=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do files+=("$1"); shift; done
     [ "${1:-}" = "--" ] || die "usage: ci run FILE... -- CMD"; shift
-    [ ${#files[@]} -gt 0 ] || exec "$@"
+    [ ${#files[@]} -gt 0 ] || { unset SOPS_AGE_KEY SOPS_AGE_KEY_FILE; exec "$@"; }
     [ -n "${CI_MASKED:-}" ] || { for f in "${files[@]}"; do dec "$f" | mask_json; done; export CI_MASKED=1; }
     rest=""; [ ${#files[@]} -lt 2 ] || rest=$(printf '%q ' "${files[@]:1}")
     exec sops exec-env "${files[0]}" "$(printf '%q' "$0") run $rest -- $(printf '%q ' "$@")" ;;

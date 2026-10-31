@@ -17,9 +17,43 @@ export interface Transcript {
   languageCode?: string | null;
   /** 0-1 language-detection confidence, when reported. */
   languageProbability?: number | null;
+  /** Local engines (whisper.cpp): timed segments, kept verbatim in the transcript file. */
+  segments?: TranscriptSegment[];
+  /** Local engines: how it was made (engine, model, settings, attempts, timing). Counts and settings only. */
+  meta?: TranscriptMeta;
+}
+
+export interface TranscriptSegment {
+  /** Seconds from the start of the audio. */
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface TranscriptAttempt {
+  language: string;
+  temperature: number;
+  /** Detected/forced language the engine reported. */
+  detected: string | null;
+  /** Post-check verdict: ok, or why the output was rejected (repetition, empty, script). */
+  verdict: string;
+  elapsedSec: number;
+}
+
+export interface TranscriptMeta {
+  engine: string;
+  model: string;
+  settings: string;
+  attempts: TranscriptAttempt[];
+  audioSec: number;
+  elapsedSec: number;
+  /** false: every attempt failed the post-check; the text is the least bad attempt and must not be extracted. */
+  accepted: boolean;
 }
 
 export interface SpeechToText {
+  /** Local engine (whisper.cpp): transcribe() takes any length; startBatch/pollBatch are not used. */
+  readonly local?: boolean;
   /** Synchronous transcription for short clips (Sarvam REST: < 30 s). */
   transcribe(audio: Media): Promise<Transcript>;
   /** Long clips: start an async batch job; returns a job id to poll. */

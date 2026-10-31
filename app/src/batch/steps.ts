@@ -20,6 +20,8 @@ import { SARVAM_REST_MAX_SEC, SttJobFailedError } from "../../../adapters/stt/sa
 import { HEALTH_MEDIA_KINDS, IMAGE_CLASS, type Media, type PartialReading, type Person, type Reading, type SpeechToText, type Symptom, type Transcript } from "../types.js";
 import { parseVitals } from "../vitals.js";
 import { buildDigest, type DigestEntry, PRIVATE_NOTE, STT_PENDING_NOTE } from "./digest.js";
+import { durationEn, parseStatements, type ParsedStatement } from "../extract/voice.js";
+import { renderTranscript } from "./transcript.js";
 import { CONTEXT_DAILY_CAP, contextEligible, type ContextMode, type ContextSignal, isPrivate, parseContext } from "../extract/context.js";
 
 /** Ops line (admin DM only): extraction or STT failed for some messages (auth, usage limit, outage). */
@@ -130,6 +132,10 @@ export interface ExtractDeps {
   contextConsented?: Set<string>;
   /** Messages read for context per IST day (default CONTEXT_DAILY_CAP). */
   contextDailyCap?: number;
+  /** Local STT (whisper.cpp) budget per run: audio seconds (STT_MAX_AUDIO_MIN) and a wall-clock deadline (epoch ms,
+   *  from STT_MAX_RUNTIME_MIN). Over either, the remaining voice notes stay stt_pending for the next run. */
+  sttMaxAudioSec?: number;
+  sttDeadline?: number;
 }
 
 /** Who a message is about: a records override (or an admin's /for), else the Worker's subject_id, else a name prefix,
@@ -151,7 +157,9 @@ export interface ExtractResult {
   extracted: number;
   pending: number; // missing media + delayed: retried by the next run, inbox rows stay new
   delayed: number; // extraction/STT service failed (auth, usage limit, outage)
-  sttPending: number; // voice notes stored without a transcript (no STT key)
+  sttPending: number; // voice notes stored without a transcript (no STT engine, or over this run's audio/time cap)
+  /** Voice notes transcribed this run: audio seconds, wall seconds, rejected (loop post-check), statements kept/dropped. */
+  voice: { notes: number; audioSec: number; elapsedSec: number; rejected: number; statements: number; dropped: number };
   queued: number;
   changed: string[];
   digest: string;
@@ -215,6 +223,10 @@ type Base = {
   context_status?: string;
   /** extraction_status duplicate: the message key whose identical file (same bytes, same subject) was recorded. */
   duplicate_of?: string;
+  /** Voice notes: length (Telegram), the transcript file next to the audio, and the engine that made it. */
+  duration_sec?: number;
+  transcript_path?: string;
+  transcript_engine?: string;
 };
 interface Item {
   raw: RawRow;
@@ -227,6 +239,7 @@ interface Item {
   extractedBy?: string;
   error?: unknown;
   context?: ContextSignal[];
+  statements?: ParsedStatement[];
 }
 
 export async function extract(d: ExtractDeps): Promise<ExtractResult> {
@@ -242,6 +255,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   let pending = 0;
   let delayed = 0;
   let sttPending = 0;
+  const voice = { notes: 0, audioSec: 0, elapsedSec: 0, rejected: 0, statements: 0, dropped: 0 };
   const mode = d.contextMode ?? "off";
   const consented = d.contextConsented ?? new Set<string>();
   // Daily cap: messages already read for context today (IST), not counting messages this run re-extracts.
@@ -322,6 +336,19 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
         seenMedia.set(k, msg.key);
       }
       if (msg.kind === "audio" && media) {
+        const dur = msg.durationSec ?? 0;
+        base.duration_sec = dur;
+        const capped = d.stt?.local && ((voice.notes > 0 && voice.audioSec + dur > (d.sttMaxAudioSec ?? Infinity)) || Date.now() > (d.sttDeadline ?? Infinity));
+        if (capped) {
+          // Per-run audio/time budget used up: kept as stt_pending, transcribed by the next run.
+          out.push({ ...base, extraction_status: "stt_pending", note: "voice note stored; transcription waits for the next run (per-run audio cap)" });
+          replaced.add(msg.key);
+          entry.pending!.push(`voice note (${durationEn(dur)}): transcription waits for the next run`);
+          entries.push(entry);
+          items.pop();
+          sttPending++;
+          continue;
+        }
         if (!d.stt) {
           // Stored (raw + media are in git); transcribed by the first run that has an STT key.
           out.push({ ...base, extraction_status: "stt_pending", note: "voice note stored; transcription pending (no STT key)" });
@@ -332,7 +359,27 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
           sttPending++;
           continue;
         }
-        transcript = await transcribe(d.stt, d, media, msg.durationSec ?? 0);
+        transcript = await transcribe(d.stt, d, media, dur);
+        if (transcript.meta) {
+          // Local engine: the transcript file sits next to the audio (verbatim, timed, "needs a listener").
+          voice.notes++;
+          voice.audioSec += transcript.meta.audioSec || dur;
+          voice.elapsedSec += transcript.meta.elapsedSec;
+          base.transcript_engine = `${transcript.meta.engine}; ${transcript.meta.model}`;
+          base.transcript_path = d.repo.writeTranscript(raw.media_path!, renderTranscript({ t: transcript, mediaPath: raw.media_path!, messageId: msg.key, updateId: raw.update_id, receivedAt: msg.ts, durationSec: dur, sender: nameOf(raw.person_id), subject: nameOf(subject.id), now: d.now, audioSha256: sha(media.data) }));
+          if (!transcript.meta.accepted) {
+            // Every attempt failed the loop/script post-check: nothing is extracted from it; a person listens.
+            voice.rejected++;
+            out.push({ ...base, extraction_status: "failed", note: "machine transcript rejected by the post-check (repetition/empty); needs a listener" });
+            replaced.add(msg.key);
+            entry.questions.push(`voice note (${durationEn(dur)}) could not be transcribed reliably; needs a listener. Transcript attempt: ${base.transcript_path}`);
+            deep.push(deepEntry(d.now, { ...raw, subject_id: subject.id }, msg, null, ["transcript_rejected"], null));
+            entry.deep = "transcript_rejected";
+            entries.push(entry);
+            items.pop();
+            continue;
+          }
+        }
         Object.assign(base, { transcript: transcript.text, transcript_language: transcript.languageCode ?? null, transcript_confidence: transcript.languageProbability ?? null });
       }
       const text = transcript?.text ?? msg.text;
@@ -344,6 +391,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
         item.extractedBy = "vitals-parser";
       } else {
         item.input = { text, media: msg.kind === "audio" ? undefined : media, now: msg.ts, replyTo: msg.replyToText };
+        if (transcript?.segments?.length) item.input = { ...item.input, text: timedLines(transcript), voice: { durationSec: transcript.meta?.audioSec || msg.durationSec || 0 }, replyTo: undefined };
         const forwarded = ["forward_origin", "forward_from", "forward_date", "forward_sender_name"].some((k) => k in ((raw.update.message ?? raw.update.edited_message ?? {}) as object));
         if (contextEligible({ mode, senderConsented: consented.has(raw.person_id), text, forwarded, vitalsOnly: !!vit?.complete })) {
           if (contextLeft > 0) {
@@ -373,6 +421,13 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     }
     it.base.extraction_json = typeof r === "string" ? r : JSON.stringify(r);
     it.ex = parseExtraction(r, it.msg.ts);
+    if (it.input!.voice) {
+      // Verbatim check against the transcript: a quote that is not in it is dropped, never repaired.
+      const st = parseStatements(r, it.msg.ts, it.base.transcript ?? "");
+      it.statements = st.statements;
+      voice.statements += st.statements.length;
+      voice.dropped += st.dropped;
+    }
     it.extractedBy = d.extractor.modelFor?.(it.input!) ?? d.extractor.model ?? "llm";
     if (it.input!.context) {
       // Context never touches the health result above; anything the minimisation checks reject is dropped, not trimmed.
@@ -383,7 +438,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   });
 
   // 3. Records, questions, deep-read queue, annotations.
-  for (const { raw, msg, subject, entry, base, ex, extractedBy, error, context } of items) {
+  for (const { raw, msg, subject, entry, base, ex, extractedBy, error, context, statements } of items) {
     if (error !== undefined || !ex) {
       const err = error as Error;
       if (isTransient(err)) {
@@ -407,7 +462,9 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     // Only a message attributed to its sender by default is checked: a prefix or an override is explicit.
     const hint = subject.source === "sender" ? ex.subjectHint ?? usualSubject(history, raw.person_id, nameOf) : null;
     base.subject_hint = hint;
-    out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now), ...contextRows(msg.key, raw.person_id, context ?? [], mode, extractedBy!, d.now));
+    out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now), ...statementRows(msg.key, subject.id, raw.person_id, statements ?? [], ex.confidence, extractedBy!, d.now),
+      ...contextRows(msg.key, raw.person_id, context ?? [], mode, extractedBy!, d.now));
+    if (statements) entry.notes = [...(entry.notes ?? []), `voice note (${durationEn(base.duration_sec ?? 0)}): machine transcript, ${statements.length} item(s) recorded; needs a listener`];
     replaced.add(msg.key);
     ctx.signals += context?.length ?? 0;
     if (mode === "shadow" && context?.length)
@@ -491,13 +548,33 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     ...[...replaced].filter((k) => !seenKeys.has(k)).map((k) => ({ key: k, recorded_at: d.now, entry: null })),
   ]);
   const digest = buildDigest({ entries: d.repo.undeliveredDigestEntries(), pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status,
-    contextSkipped: mode === "shadow" ? ctx.skippedCap : 0 });
+    contextSkipped: mode === "shadow" ? ctx.skippedCap : 0, listen: unlistened(d.repo, nameOf) });
   const ops = [...(d.warnings ?? []), ...(delayed ? [DELAYED_OPS(delayed)] : [])];
-  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, ops, context: ctx };
+  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, ops, context: ctx, voice };
+}
+
+/** "[mm:ss] text" per segment: what the extraction model reads for a voice note. */
+function timedLines(t: Transcript): string {
+  const mmss = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+  return (t.segments ?? []).map((s) => `[${mmss(s.start)}] ${s.text}`).join("\n");
+}
+
+/** Every recorded voice note without a `listened` marker (data/telegram/listened.ndjson), oldest first. */
+export function unlistened(repo: Repo, nameOf: (id: string) => string): { person: string; ts: string; durationSec: number; transcribed: boolean }[] {
+  const heard = repo.listenedUpdateIds();
+  const dur = new Map<string, number>();
+  for (const raw of repo.rawRows()) {
+    const ev = parseUpdate(raw.update);
+    if (ev?.type === "message" && ev.msg.kind === "audio") dur.set(ev.msg.key, ev.msg.durationSec ?? 0);
+  }
+  return repo.kbRows()
+    .filter((r) => r.rt === "d1.messages" && r.kind === "audio" && !["private", "duplicate"].includes(String(r.extraction_status)) && !heard.has(Number(String(r.external_id ?? "").replace(/^tg:/, ""))))
+    .map((r) => ({ person: nameOf(String(r.person_id)), ts: String(r.received_at), durationSec: Number(r.duration_sec ?? dur.get(String(r.id)) ?? 0), transcribed: !!r.transcript }))
+    .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
 }
 
 async function transcribe(stt: SpeechToText, d: ExtractDeps, media: Media, durationSec: number): Promise<Transcript> {
-  if (durationSec <= SARVAM_REST_MAX_SEC) return stt.transcribe(media);
+  if (stt.local || durationSec <= SARVAM_REST_MAX_SEC) return stt.transcribe(media);
   const job = await stt.startBatch(media);
   const end = Date.now() + (d.sttTimeoutMs ?? 15 * 60_000);
   for (;;) {
@@ -546,6 +623,17 @@ function recordRows(messageId: string, personId: string, ex: Extraction, by: str
       associated: json(s.associated), triggers: json(s.triggers), free_text: s.freeText, observed_at: s.observedAt, ...common,
     })),
   ];
+}
+
+/** d1.statements rows: what a voice note says, one row per item, each with its verbatim quote (src/extract/voice.ts).
+ *  tools/kb/build maps them to event facts tagged machine-transcript + patient-reported / family-reported. */
+function statementRows(messageId: string, personId: string, sender: string, statements: ParsedStatement[], confidence: number, by: string, at: string): Row[] {
+  return statements.map((s, i) => ({
+    rt: "d1.statements", id: `${messageId}:t${i}`, source_message_id: messageId, person_id: personId, sender_person_id: sender,
+    category: s.category, summary: s.summary, quote: s.quote, negated: s.negated ? 1 : 0, time_frame: s.timeFrame, when_text: s.whenText,
+    when: s.when, speaker: s.speaker, speaker_name: s.speakerName, about: s.about, confidence: Math.min(confidence, s.confidence),
+    confirmed: 0, extracted_by: by, extracted_at: at,
+  }));
 }
 
 /** d1.context rows (ADR 010), mapped by tools/kb/build to event facts with data.type context. No quote, no message text. */

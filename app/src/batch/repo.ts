@@ -63,7 +63,7 @@ export interface SubjectOverride {
 
 export type Row = Record<string, unknown> & { rt: string };
 
-const TABLE_ORDER = ["d1.persons", "d1.chats", "d1.messages", "d1.readings", "d1.report_items", "d1.symptoms", "d1.context"];
+const TABLE_ORDER = ["d1.persons", "d1.chats", "d1.messages", "d1.readings", "d1.report_items", "d1.symptoms", "d1.statements", "d1.context"];
 
 /** Asia/Kolkata calendar day (YYYY-MM-DD) of an instant: the digest's "today". */
 export function dayOf(iso: string): string {
@@ -113,6 +113,11 @@ function writeIfChanged(path: string, text: string): boolean {
   writeFileSync(path, text);
   return true;
 }
+
+/** First line of every transcript file the batch writes (src/batch/transcript.ts). */
+export const TRANSCRIPT_MARK = "---\ngenerator: saturn-batch";
+/** Listened markers: one line per voice note a person has listened to ({"update_id", "by", "at", "note"?}). */
+export const LISTENED_FILE = "listened.ndjson";
 
 export class Repo {
   constructor(readonly root: string, private readonly personMap: PersonMap = {}) {}
@@ -204,10 +209,26 @@ export class Repo {
     return new Uint8Array(readFileSync(this.p(rel)));
   }
 
+  /** Write the machine transcript next to its audio: `<audio-name>.transcript.md`. A file there that the batch did not
+   *  write (a person's transcript) is never overwritten: the batch then writes `<audio-name>.batch.transcript.md`.
+   *  Returns the path written (records-relative). */
+  writeTranscript(audioRel: string, md: string): string {
+    const stem = audioRel.replace(/\.[^./]+$/, "");
+    let rel = `${stem}.transcript.md`;
+    if (existsSync(this.p(rel)) && !readFileSync(this.p(rel), "utf8").startsWith(TRANSCRIPT_MARK)) rel = `${stem}.batch.transcript.md`;
+    writeIfChanged(this.p(rel), md);
+    return rel;
+  }
+
+  /** update_ids a person has listened to (data/telegram/listened.ndjson; append-only, see the records guide). */
+  listenedUpdateIds(): Set<number> {
+    return new Set(readLines<{ update_id?: unknown }>(this.p("data/telegram", LISTENED_FILE)).map((r) => Number(r.update_id)).filter(Number.isInteger));
+  }
+
   // ---------- extracted rows ----------
 
   kbRows(): Row[] {
-    return this.files("data/telegram", ".ndjson").filter((f) => !f.endsWith("directory.ndjson") && !f.endsWith("subject-overrides.ndjson") && !f.endsWith("handled-manually.ndjson")).flatMap((f) => readLines<Row>(f));
+    return this.files("data/telegram", ".ndjson").filter((f) => !f.endsWith("directory.ndjson") && !f.endsWith("subject-overrides.ndjson") && !f.endsWith("handled-manually.ndjson") && !f.endsWith(LISTENED_FILE)).flatMap((f) => readLines<Row>(f));
   }
 
   /**

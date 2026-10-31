@@ -39,7 +39,7 @@ LINKS = {"source": {"duplicate_of": "source", "org_id": "ref:party", "practition
          "ref": {"supersedes": "ref"}}
 
 # ---- Telegram (D1 export) -> source + fact ---------------------------------------------------------------------
-D1_TABLES = {"persons", "chats", "messages", "readings", "report_items", "symptoms", "alerts", "context"}  # context (ADR 010), report_items: batch-only
+D1_TABLES = {"persons", "chats", "messages", "readings", "report_items", "symptoms", "alerts", "context", "statements"}  # context (ADR 010), report_items: batch-only
 D1_PERSON = {}  # D1 person id -> KB ns (same id otherwise); records.yaml d1_person_map
 # reading type -> (code local, category, canonical unit)
 D1_READING = {
@@ -160,6 +160,10 @@ def _envelope(row, msg, quote, ns, src_id):
         tags.append("document")  # read from a photo/PDF (device screen, report): not a typed or spoken claim
     elif _reporter(msg):
         tags.append("family-reported")  # typed/spoken by another member for this subject
+    elif (msg or {}).get("kind") == "audio":
+        tags.append("patient-reported")  # the subject's own voice note
+    if (msg or {}).get("kind") == "audio" and (msg or {}).get("transcript_engine"):
+        tags.append("machine-transcript")  # read from a local speech-recognition transcript; needs a listener
     return {
         "ns": ns, "source_id": src_id, "quote": quote[:200] if quote else None,
         "recorded_by": row.get("extracted_by") or (msg or {}).get("extracted_by") or "telegram-bot",
@@ -270,7 +274,7 @@ def telegram_records(rows, root, codes=None, handled=None):
         except KeyError as e:
             errors.append(f"{where}: d1.{t} row missing {e}")
     for where, t, r in rows:
-        if t in ("context", "report_items", "readings", "symptoms") and r.get("source_message_id") in skip:
+        if t in ("context", "report_items", "readings", "symptoms", "statements") and r.get("source_message_id") in skip:
             continue  # handled manually (handled-manually.ndjson): no facts from this message
         if t == "context":  # life-context signal (ADR 010) -> event fact, data.type context; summaries only, no quote
             try:
@@ -290,6 +294,37 @@ def telegram_records(rows, root, codes=None, handled=None):
                     "created_at": r.get("extracted_at") or (msg or {}).get("received_at") or r["start"]}))
             except KeyError as e:
                 errors.append(f"{where}: d1.context row missing {e}")
+            continue
+        if t == "statements":  # what a voice note says (machine transcript): event fact, verbatim source-language quote
+            try:
+                ns = D1_PERSON.get(r["person_id"], r["person_id"])
+                msg = msgs.get(r["source_message_id"]) or {}
+                sender = D1_PERSON.get(r.get("sender_person_id") or "", r.get("sender_person_id"))
+                when = r.get("when") or ""
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", when):
+                    at, prec, id_ts = when, "day", when + "T12:00:00+05:30"
+                elif re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", when):
+                    at, prec, id_ts = when + "+05:30", "minute", when + ":00+05:30"
+                else:
+                    at, prec, id_ts = ist(msg.get("received_at") or r["extracted_at"])[:16] + "+05:30", "minute", msg.get("received_at") or r["extracted_at"]
+                own = r.get("speaker") == "sender" and sender == ns
+                conf = r.get("confidence")
+                tags = (["patient-reported"] if own else ["family-reported"]) + ["machine-transcript"] \
+                    + (["negated"] if r.get("negated") else []) + (["low-confidence"] if conf is not None and conf < 0.8 else []) \
+                    + (["subject-hint"] if msg.get("subject_hint") or r.get("about") else [])
+                detail = {k: r[k] for k in ("category", "time_frame", "when_text", "speaker", "speaker_name", "about") if r.get(k) not in (None, "")}
+                detail["negated"] = bool(r.get("negated"))
+                out.append((where, "fact", {
+                    "id": f"{ns}:fact:{tg_local(id_ts, r['id'])}", "kind": "event", "at": at, "at_precision": prec, "ns": ns,
+                    "locator": f"tg:{r['source_message_id']}",
+                    "source_id": src_ids.get(r["source_message_id"], f"{ns}:src:missing-tg.{r['source_message_id']}"),
+                    "data": {"type": "other", "label": ("voice (machine transcript): " + ("NOT: " if r.get("negated") else "") + r["summary"])[:200],
+                             "detail": detail},
+                    "quote": (r.get("quote") or "")[:300] or None, "verification": "unverified", "status": "active", "tags": tags,
+                    "recorded_by": r.get("extracted_by") or "telegram-bot",
+                    "created_at": r.get("extracted_at") or msg.get("received_at")}))
+            except KeyError as e:
+                errors.append(f"{where}: d1.statements row missing {e}")
             continue
         if t == "report_items":  # a report's printed values / findings / impression -> observation facts (document)
             try:
@@ -524,7 +559,23 @@ def main(argv):
                    if f.parent != data_dir / "telegram" and (data_dir / "meta") not in f.parents)
     overrides = tg_dir / "subject-overrides.ndjson"  # read by the batch (app/src/batch/repo.ts), only checked here
     handled_file = tg_dir / "handled-manually.ndjson"  # owner-marked messages whose automatic facts are dropped
-    files += sorted(f for f in tg_dir.glob("*.ndjson") if f not in (overrides, handled_file))
+    listened_file = tg_dir / "listened.ndjson"  # voice notes a person has listened to (the batch digest reads it)
+    files += sorted(f for f in tg_dir.glob("*.ndjson") if f not in (overrides, handled_file, listened_file))
+    listened = []  # (where, update_id): checked against the recorded messages below
+    if listened_file.is_file():
+        for n, line in enumerate(listened_file.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            where = f"{show(listened_file)}:{n}"
+            try:
+                h = json.loads(line)
+            except json.JSONDecodeError as e:
+                errors.append(f"{where}: bad JSON ({e})"); continue
+            if not isinstance(h.get("update_id"), int) or not h.get("by") or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(h.get("at") or "")) \
+                    or set(h) - {"update_id", "by", "at", "note"}:
+                errors.append(f"{where}: listened row needs update_id (int), by, at (YYYY-MM-DD), optional note; no other keys")
+            else:
+                listened.append((where, h["update_id"]))
     handled = {}  # update_id -> (where, row)
     if handled_file.is_file():
         for n, line in enumerate(handled_file.read_text().splitlines(), 1):
@@ -586,6 +637,8 @@ def main(argv):
             records[t].append((where, f, r))
 
     mapped, tg_errors = telegram_records(tg_rows, root, code_index(r for _, _, r in records["ref"]), handled)
+    audio_uids = {_update_id(r) for _, t, r in tg_rows if t == "messages" and r.get("kind") == "audio"}
+    tg_errors += [f"{where}: listened update_id {uid} is not a recorded voice note" for where, uid in listened if uid not in audio_uids]
     known_src = {r.get("id") for _, _, r in records["source"]}
     for where, h in handled.values():
         if h.get("replaced_by") and h["replaced_by"] not in known_src:

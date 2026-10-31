@@ -23,7 +23,7 @@ BLOCK = re.compile(r"(<!-- gen:([a-z-]+) start -->\n)(.*?)(<!-- gen:\2 end -->)"
 FAMILY_TAGS = ("family-reported", "patient-reported", "user-report", "secondhand")
 FLAG_TAGS = ("low-confidence", "internal-contradiction", "text-table-mismatch", "written-stopped", "owner-unconfirmed",
              "identity-unconfirmed", "subject-hint", "device-average", "device-memory", "device-type-unknown",
-             "partial-reading", "uncertain")
+             "partial-reading", "uncertain", "machine-transcript", "negated")
 MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 GLANCE_DAYS = 180
 # Life-context events (ADR 010) render only in gen:context; every other block and the header count leave them out, so

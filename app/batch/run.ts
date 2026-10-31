@@ -15,7 +15,11 @@
 //          $DIGEST_FILE, else $RUNNER_TEMP or app/.batch/digest.txt), --now ISO.
 // Env: pull/finish CLOUDFLARE_D1_TOKEN (fallback CLOUDFLARE_API_TOKEN), CLOUDFLARE_R2_TOKEN (optional), CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID, R2_BUCKET, TELEGRAM_BOT_TOKEN;
 //      extract CLAUDE_CODE_OAUTH_TOKEN (or a local `claude` login; ANTHROPIC_API_KEY, if set, takes precedence in the CLI),
-//      CLAUDE_TOKEN_CREATED (YYYY-MM-DD, expiry warning), CLAUDE_BIN (default claude), SARVAM_API_KEY (optional),
+//      CLAUDE_TOKEN_CREATED (YYYY-MM-DD, expiry warning), CLAUDE_BIN (default claude),
+//      STT_ADAPTER (whisper-cpp | sarvam | none; default: sarvam when SARVAM_API_KEY is set, else none),
+//      whisper-cpp: WHISPER_BIN (default whisper-cli), WHISPER_MODEL (ggml model path, required), FFMPEG_BIN,
+//      STT_MAX_AUDIO_MIN (audio minutes per run, default 30), STT_MAX_RUNTIME_MIN (STT wall minutes per run, default 20);
+//      SARVAM_API_KEY (sarvam adapter), EXTRACT_MODEL_TRANSCRIPT (voice transcripts; default claude-sonnet-5-5),
 //      CONTEXT_MODE (off default | shadow | on; ADR 010 life-context signals),
 //      EXTRACT_MODEL_TEXT (default claude-haiku-5-5), EXTRACT_MODEL_MEDIA (photos/PDFs; default claude-sonnet-5-5),
 //      EXTRACT_MAX_MEDIA_CALLS (usage guard per run, default 30);
@@ -31,6 +35,7 @@ import { TelegramAdapter } from "../src/channel/telegram.js";
 import { ClaudeCliExtractor, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
 import { Store } from "../src/store.js";
 import { parseVocab, SarvamSpeechToText } from "../../adapters/stt/sarvam.js";
+import { WhisperCppSpeechToText } from "../../adapters/stt/whisper-cpp.js";
 import { loadRecords } from "../src/batch/records.js";
 import type { Person } from "../src/types.js";
 import { aliasesFromRecords } from "../src/subject.js";
@@ -72,7 +77,13 @@ async function main(cmd: string | undefined) {
       if (w) warnings.push(w);
       if (env.CLAUDE_CODE_OAUTH_TOKEN && !env.CLAUDE_TOKEN_CREATED) console.log("::warning::CLAUDE_TOKEN_CREATED is not set; no token-expiry warning to the admins");
     }
-    if (!env.SARVAM_API_KEY) console.log("extract: no SARVAM_API_KEY; voice notes are stored as stt_pending");
+    const sttAdapter = env.STT_ADAPTER || (env.SARVAM_API_KEY ? "sarvam" : "none");
+    const whisper = sttAdapter === "whisper-cpp" && env.WHISPER_MODEL && existsSync(env.WHISPER_MODEL)
+      ? new WhisperCppSpeechToText({ bin: env.WHISPER_BIN || undefined, model: env.WHISPER_MODEL, ffmpeg: env.FFMPEG_BIN || undefined }) : null;
+    const stt = whisper ?? (sttAdapter === "sarvam" && env.SARVAM_API_KEY ? new SarvamSpeechToText(env.SARVAM_API_KEY, undefined, undefined, parseVocab(records.sttVocab ?? "")) : null);
+    if (sttAdapter === "whisper-cpp" && !whisper) console.log("::warning::extract: STT_ADAPTER whisper-cpp but WHISPER_MODEL is missing; voice notes stay stt_pending");
+    if (!stt) console.log(`extract: no STT (${sttAdapter}); voice notes are stored as stt_pending`);
+    const minutes = (v: string | undefined, dflt: number) => (Number(v) > 0 ? Number(v) : dflt);
     if (records.thresholds.status === "disabled") console.log("extract: rule annotations off (records config/thresholds.yaml not configured)");
     // Life context (ADR 010): env context_mode -> CONTEXT_MODE; consent from records.yaml context_consent (true only).
     const contextMode = parseContextMode(env.CONTEXT_MODE);
@@ -80,13 +91,15 @@ async function main(cmd: string | undefined) {
     const maxMedia = Number(env.EXTRACT_MAX_MEDIA_CALLS);
     const extractor = new ClaudeCliExtractor({
       bin: env.CLAUDE_BIN || "claude", context: records.extractionContext, textModel: env.EXTRACT_MODEL_TEXT || undefined,
-      mediaModel: env.EXTRACT_MODEL_MEDIA || undefined, maxMediaCalls: Number.isInteger(maxMedia) && maxMedia > 0 ? maxMedia : undefined,
+      mediaModel: env.EXTRACT_MODEL_MEDIA || undefined, transcriptModel: env.EXTRACT_MODEL_TRANSCRIPT || undefined, maxMediaCalls: Number.isInteger(maxMedia) && maxMedia > 0 ? maxMedia : undefined,
     });
-    console.log(`extract: models text ${extractor.model}, photo/PDF ${extractor.mediaModel}`);
+    console.log(`extract: models text ${extractor.model}, photo/PDF ${extractor.mediaModel}, voice transcript ${extractor.transcriptModel}; stt ${stt ? sttAdapter : "none"}`);
     const r = await extract({
       repo, persons, now, thresholds: records.thresholds, warnings, aliases, contextMode, contextConsented,
       extractor,
-      stt: env.SARVAM_API_KEY ? new SarvamSpeechToText(env.SARVAM_API_KEY, undefined, undefined, parseVocab(records.sttVocab ?? "")) : null,
+      stt,
+      sttMaxAudioSec: minutes(env.STT_MAX_AUDIO_MIN, 30) * 60,
+      sttDeadline: Date.now() + minutes(env.STT_MAX_RUNTIME_MIN, 20) * 60_000,
       retryFailed: args.includes("--retry-failed"),
     });
     // A delayed run writes no digest: finish then sends the ops DM only; the next full run sends the digest.
@@ -98,6 +111,9 @@ async function main(cmd: string | undefined) {
     console.log(`extract: ${r.extracted} messages; pending ${r.pending} (delayed ${r.delayed}); stt_pending ${r.sttPending}; queued for deep read ${r.queued}; changed ${r.changed.join(", ") || "nothing"}`);
     for (const [m, u] of Object.entries(extractor.usage))
       console.log(`usage ${m}: ${u.calls} call(s), ${u.inputTokens} input / ${u.outputTokens} output tokens, ~$${u.costUsd.toFixed(3)} API-equivalent`);
+    for (const w of whisper?.runs ?? [])
+      console.log(`stt whisper-cpp: audio ${w.audioSec} s, wall ${w.elapsedSec} s (x${w.audioSec ? (w.elapsedSec / w.audioSec).toFixed(2) : "?"} realtime), attempts ${w.attempts}, accepted ${w.accepted}, language ${w.language ?? "?"}`);
+    console.log(`voice: ${r.voice.notes} note(s) transcribed, audio ${Math.round(r.voice.audioSec)} s, wall ${Math.round(r.voice.elapsedSec)} s; rejected ${r.voice.rejected}; statements kept ${r.voice.statements}, dropped (not verbatim/invalid) ${r.voice.dropped}`);
     console.log(`context (${contextMode}; consented ${contextConsented.size}): read ${r.context.read}; signals ${r.context.signals}; dropped ${r.context.dropped}; skipped (daily cap) ${r.context.skippedCap}`);
     // The workflow commits and builds whenever the outputs were written, even when it fails the job for a delay.
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `completed=true\ndelayed=${r.delayed}\n`);

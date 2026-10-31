@@ -4,20 +4,22 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ClaudeCliError, ClaudeCliExtractor, type ExtractInput, ExtractorStopError, MAX_PER_CALL, MEDIA_MODEL, MODEL, parseResult, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
+import { CHILD_ENV_ALLOW, childEnv, ClaudeCliError, ClaudeCliExtractor, TRANSCRIPT_MODEL, type ExtractInput, ExtractorStopError, MAX_PER_CALL, MEDIA_MODEL, MODEL, parseResult, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
 import { parseExtraction } from "../src/extract/schema.js";
 
 const FAKE = `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
-fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ args, stdin, apiKey: "ANTHROPIC_API_KEY" in process.env, oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null }) + "\\n");
+// Test settings come from a file next to the fake: the adapter passes the CLI an allowlisted env only.
+const cfg = JSON.parse(fs.readFileSync(require("node:path").join(__dirname, "cfg.json"), "utf8"));
+fs.appendFileSync(cfg.log, JSON.stringify({ args, stdin, apiKey: "ANTHROPIC_API_KEY" in process.env, oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null, envKeys: Object.keys(process.env).sort() }) + "\\n");
 const stream = args.includes("stream-json");
 let texts = [], media = 0;
 if (stream) for (const b of JSON.parse(stdin).message.content) { if (b.type === "text") texts.push(b.text); else media++; }
 else texts = [stdin];
 const msgs = [...texts.join("\\n").matchAll(/Message (\\d+): [^\\n]*/g)].map((m) => ({ n: Number(m[1]), text: m[0] }));
-const mode = process.env.FAKE_CLAUDE_MODE || "ok";
+const mode = cfg.mode || "ok";
 const out = (o) => { if (stream) console.log(JSON.stringify({ type: "system", subtype: "init" })); console.log(JSON.stringify({ type: "result", subtype: "success", ...o })); };
 if (mode === "auth") { out({ is_error: true, api_error_status: 401, terminal_reason: "api_error", result: "Failed to authenticate. API Error: 401 OAuth access token is invalid." }); process.exit(1); }
 if (mode === "nologin") { out({ is_error: true, api_error_status: null, terminal_reason: "api_error", result: "Not logged in · Please run /login" }); process.exit(1); }
@@ -39,11 +41,13 @@ let log: string;
 const calls = () => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 const NOW = "2026-10-25T10:00:00.000Z";
 const text = (t: string): ExtractInput => ({ text: t, now: NOW });
-const cli = (mode: string, extra: Record<string, string> = {}, sleeps: number[] = []) =>
-  new ClaudeCliExtractor({
-    env: { PATH: `${dir}:${process.env.PATH}`, FAKE_CLAUDE_LOG: log, FAKE_CLAUDE_MODE: mode, ...extra },
+const cli = (mode: string, extra: Record<string, string> = {}, sleeps: number[] = []) => {
+  writeFileSync(join(dir, "cfg.json"), JSON.stringify({ log, mode }));
+  return new ClaudeCliExtractor({
+    env: { PATH: `${dir}:${process.env.PATH}`, ...extra },
     sleep: async (ms) => void sleeps.push(ms),
   });
+};
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "fake-claude-"));
@@ -117,7 +121,8 @@ describe("ClaudeCliExtractor (fake claude on PATH)", () => {
 
   it("models are configurable (Opus for media); an invalid id falls back to the default", async () => {
     const photo: ExtractInput = { now: NOW, media: { data: new Uint8Array([1]), mimeType: "image/png" } };
-    const env = { PATH: `${dir}:${process.env.PATH}`, FAKE_CLAUDE_LOG: log, FAKE_CLAUDE_MODE: "ok" };
+    writeFileSync(join(dir, "cfg.json"), JSON.stringify({ log, mode: "ok" }));
+    const env = { PATH: `${dir}:${process.env.PATH}` };
     const x = new ClaudeCliExtractor({ env, mediaModel: "claude-opus-5-5", textModel: "rm -rf" });
     await x.extract([photo, text("a")]);
     const c = calls();
@@ -126,7 +131,8 @@ describe("ClaudeCliExtractor (fake claude on PATH)", () => {
 
   it("usage guard: photo/PDF calls over maxMediaCalls wait as delayed (transient), text still runs", async () => {
     const photo: ExtractInput = { now: NOW, media: { data: new Uint8Array([1]), mimeType: "application/pdf" } };
-    const env = { PATH: `${dir}:${process.env.PATH}`, FAKE_CLAUDE_LOG: log, FAKE_CLAUDE_MODE: "ok" };
+    writeFileSync(join(dir, "cfg.json"), JSON.stringify({ log, mode: "ok" }));
+    const env = { PATH: `${dir}:${process.env.PATH}` };
     const out = await new ClaudeCliExtractor({ env, maxMediaCalls: 1 }).extract([photo, photo, text("a")]);
     expect(calls()).toHaveLength(2);
     expect(out[0]).not.toBeInstanceOf(Error);
@@ -189,6 +195,56 @@ describe("parseResult (real CLI shapes, 2.1.30x)", () => {
     const e = (() => { try { parseResult(JSON.stringify({ type: "result", is_error: true, api_error_status: 529, terminal_reason: "api_error" }), 1); } catch (x) { return x as ClaudeCliError; } })();
     expect(e?.status).toBe(529);
     expect(() => parseResult("garbage", 1)).toThrow(ClaudeCliError);
+  });
+});
+
+describe("AI step isolation (no write credentials reach claude -p)", () => {
+  // Every credential the batch job can hold. None may be visible to the extraction model's process.
+  const SECRETS = {
+    SOPS_AGE_KEY: "AGE-SECRET-KEY-1X", SOPS_AGE_KEY_FILE: "/k", GITHUB_TOKEN: "ghs_x", GH_TOKEN: "ghs_x", RECORDS_PUSH_TOKEN: "ghs_x",
+    RECORDS_APP_PRIVATE_KEY: "-----BEGIN", PRODUCT_DEPLOY_KEY: "-----BEGIN", BATCH_SIGNING_KEY: "-----BEGIN", ACTIONS_RUNTIME_TOKEN: "x",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "x", ACTIONS_ID_TOKEN_REQUEST_URL: "https://x", CLOUDFLARE_D1_TOKEN: "x", CLOUDFLARE_R2_TOKEN: "x",
+    CLOUDFLARE_API_TOKEN: "x", TELEGRAM_BOT_TOKEN: "1:x", SARVAM_API_KEY: "x", GIT_CONFIG_PARAMETERS: "'http.extraheader=AUTHORIZATION: basic x'",
+  };
+  it("the CLI child gets only the allowlist: auth for the model, no SOPS key, GitHub, App, Cloudflare or Telegram token", async () => {
+    await cli("ok", { CLAUDE_CODE_OAUTH_TOKEN: "tok", ...SECRETS }).extract([text("BP 120/80")]);
+    const seen: string[] = calls()[0].envKeys;
+    for (const k of Object.keys(SECRETS)) expect(seen).not.toContain(k);
+    expect(seen.filter((k) => !(CHILD_ENV_ALLOW as readonly string[]).includes(k) && !k.startsWith("__CF") && k !== "PWD" && k !== "SHLVL" && k !== "_")).toEqual([]);
+    expect(calls()[0].oauth).toBe("tok");
+  });
+  it("childEnv drops every token-like variable that is not model auth", () => {
+    const env = childEnv({ ...SECRETS, PATH: "/bin", CLAUDE_CODE_OAUTH_TOKEN: "tok", SOME_OTHER_TOKEN: "x", MY_SECRET: "y" });
+    const bad = Object.keys(env).filter((k) => /TOKEN|KEY|SECRET|PASSWORD|AUTH/i.test(k) && k !== "CLAUDE_CODE_OAUTH_TOKEN");
+    expect(bad).toEqual([]);
+  });
+  it("no tools, one turn, no MCP, no slash commands, empty cwd (pure prompt in, JSON out)", async () => {
+    await cli("ok", { CLAUDE_CODE_OAUTH_TOKEN: "tok" }).extract([text("BP 120/80")]);
+    const a: string[] = calls()[0].args;
+    expect(a[a.indexOf("--tools") + 1]).toBe("");
+    expect(a[a.indexOf("--max-turns") + 1]).toBe("1");
+    for (const f of ["--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--json-schema"]) expect(a).toContain(f);
+    expect(a).not.toContain("--dangerously-skip-permissions");
+    expect(a).not.toContain("--allowedTools");
+  });
+});
+
+describe("voice-note transcripts", () => {
+  it("go one per call to the transcript model with the voice schema and rules, after text", async () => {
+    const v: ExtractInput = { text: "[00:00] आज चक्कर नहीं आया", now: NOW, voice: { durationSec: 12 } };
+    const x = cli("ok", { CLAUDE_CODE_OAUTH_TOKEN: "tok" });
+    expect(x.modelFor(v)).toBe(TRANSCRIPT_MODEL);
+    await x.extract([v, text("BP 120/80"), { ...v }]);
+    const c = calls();
+    expect(c).toHaveLength(3);
+    const voiceCalls = c.filter((k: { args: string[] }) => k.args[k.args.indexOf("--model") + 1] === TRANSCRIPT_MODEL);
+    expect(voiceCalls).toHaveLength(2);
+    for (const k of voiceCalls) {
+      expect(k.stdin).toMatch(/voice: yes \(12 s\)/);
+      expect(k.stdin).toContain("आज चक्कर नहीं आया"); // the source-language text, untranslated
+      expect(k.args[k.args.indexOf("--system-prompt") + 1]).toMatch(/do NOT translate/);
+      expect(JSON.parse(k.args[k.args.indexOf("--json-schema") + 1]).properties.results.items.required).toContain("statements");
+    }
   });
 });
 
