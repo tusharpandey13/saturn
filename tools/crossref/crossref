@@ -702,6 +702,7 @@ def run(a):
         if chk["status"] == "active":
             found += [(chk, it) for it in OPS[chk["operator"]](kb, chk, ctx)]
     fp, nfacts, asof = kb.fingerprint()
+    digest_ok = a.dry_run or bool(a.digest and pathlib.Path(a.digest).exists())
     xdir = root / "crossref"
     per_ns, totals, changed_files = {}, {"new": 0, "changed": 0, "closed": 0, "reopened": 0}, []
     claims_by_ns = {}
@@ -715,7 +716,8 @@ def run(a):
         for k in totals:
             totals[k] += n[k]
         rows = sorted(rows.values(), key=lambda r: r["id"])
-        shown, waiting = pick_digest(rows, feedback, today, cfg["daily_cap"])
+        # flags are picked for the digest only when there is a digest to carry them (a delayed batch run has none)
+        shown, waiting = pick_digest(rows, feedback, today, cfg["daily_cap"] if digest_ok else 0)
         per_ns[ns] = (shown, waiting, rows)
         ns_claims = claims_by_ns.get(ns, [])
         if not a.dry_run:

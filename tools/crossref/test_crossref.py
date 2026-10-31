@@ -198,7 +198,9 @@ class CrossrefTest(unittest.TestCase):
         self.run_xr("2026-06-02", "--digest", dg)
         self.assertEqual(len([f for f in self.flags().values() if f["digest_day"] == "2026-06-02"]), 3)
         # next day: the waiting ones
-        self.run_xr("2026-06-03")
+        self.run_xr("2026-06-03")  # no digest file (delayed run): nothing is picked
+        self.assertFalse(any(f["digest_day"] == "2026-06-03" for f in self.flags().values()))
+        self.run_xr("2026-06-03", "--digest", dg)
         self.assertTrue(any(f["digest_day"] == "2026-06-03" for f in self.flags().values()))
 
     def test_digest_needs_existing_file(self):

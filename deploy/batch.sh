@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Daily batch (ADR 005), one step per call so the caller can scope secrets per step:
 #   deploy/batch.sh pull    --records DIR                 D1 inbox + media -> records (raw first), commit + push
-#   deploy/batch.sh extract --records DIR [--retry-failed]  STT + LLM extraction -> KB build -> generated pages, commit
+#   deploy/batch.sh extract --records DIR [--retry-failed]  STT + LLM extraction -> KB build -> generated pages ->
+#                                                         cross-check flags (digest section), commit
 #   deploy/batch.sh finish  --records DIR [--no-digest] [--force-digest]
 #                                                         mark inbox rows done, assert the webhook, DM the digest to
 #                                                         the admins (once per IST day), commit data/telegram/digests.jsonl
@@ -54,7 +55,13 @@ case "$step" in
     if [ "$code" != 0 ] && [ "$code" != 3 ]; then exit "$code"; fi
     # The extracted rows are committed even when the KB build fails (as before the split); the job still fails.
     built=0; python3 -I "$PRODUCT/tools/kb/build" --records "$records" && python3 -I "$PRODUCT/tools/kb/gen-views" --records "$records" || built=$?
-    commit "data: telegram batch $(stamp)" data/telegram data/queue docs/health
+    # Cross-check (ADR 012, tools/crossref): after a good build; appends its section to the digest file when there is
+    # one. It never blocks the digest or the commit; its log line is counts only.
+    if [ "$built" = 0 ]; then
+      python3 -I "$PRODUCT/tools/crossref/crossref" --records "$records" --digest "$DIGEST_FILE" \
+        || echo "batch.sh: crossref failed; the digest goes out without its section" >&2
+    fi
+    commit "data: telegram batch $(stamp)" data/telegram data/queue docs/health crossref
     if [ "$built" != 0 ]; then echo "batch.sh: KB build or gen-views failed; extracted rows are committed" >&2; exit 1; fi
     if [ "$code" = 0 ]; then ok=1; fi
     exit "$code" ;;
