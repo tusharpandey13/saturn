@@ -1,0 +1,823 @@
+#!/usr/bin/env -S python3 -I
+"""Continuous cross-referencing, iteration 1 (ADR 012, design docs/design/continuous-crossref.md): deterministic checks
+over the KB, a claims register, flags with dedup / daily cap / weekly roll-up / owner feedback, generated pages and a
+digest section. No LLM, no network. Record and flag only: every statement is a fixed template filled from facts.
+
+Usage (from a product checkout, after tools/kb/build):
+  tools/crossref/crossref --records DIR [--db PATH] [--today YYYY-MM-DD] [--digest FILE] [--dry-run]
+      run the checks; write <records>/crossref/<ns>/{flags,claims}.ndjson, docs/health/<ns>/{flags,claims}.md and
+      append a run row to crossref/runs.ndjson (only when something changed). --digest FILE appends the admin digest
+      section to FILE when FILE exists (the batch's digest; a delayed run has none). --dry-run writes nothing and
+      prints the digest section.
+  tools/crossref/crossref --records DIR feedback TARGET ACTION [--days N] [--question ID] [--answer ID] [--reason TEXT]
+      append one owner feedback row to crossref/feedback.ndjson. TARGET is a flag or claim id.
+      Flag actions: useful | noise | snooze (--days) | promote (--question <ns>:q:NNNN) | resolved (--reason)
+      Claim actions: question (--question) | answered (--answer <ns>:ans:NNNN) | retired (--reason)
+
+Records layout (all PHI, records repo only; outside data/ so the KB build never reads it):
+  crossref/checks.ndjson     check definitions (seeded from tools/crossref/default-checks.ndjson when absent); append
+                             a row with the same id and a higher version to change one; the last row per id wins
+  crossref/config.json       {"daily_cap": 3, "rollup_weekday": 1}  (ISO weekday of the weekly roll-up; optional)
+  crossref/feedback.ndjson   owner feedback, append-only; the latest row per target wins
+  crossref/<ns>/flags.ndjson derived flag state, one row per flag (rewritten each run; git is the history)
+  crossref/<ns>/claims.ndjson derived claims register (rewritten each run)
+  crossref/runs.ndjson       run log: ids and counts only
+Python stdlib + sqlite3 only. Exit 1 on an invalid check, feedback row or config.
+"""
+import argparse, datetime, hashlib, json, pathlib, re, sqlite3, sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "kb"))  # python3 -I drops the script dir; reuse the records.yaml loader
+import records_config  # noqa: E402
+
+DISCLAIMER = "Facts as written; not advice; doctors decide."
+SEVERITIES = ("next-visit", "routine", "data-quality")  # red flags stay with the batch thresholds (never routed here)
+OPERATORS = ("range_vs_printed", "delta_vs_prior", "med_list_conflict", "passthrough", "stale", "claim_differs")
+CHECK_STATUS = ("active", "disabled", "retired")
+FLAG_ACTIONS = ("useful", "noise", "snooze", "promote", "resolved")
+CLAIM_ACTIONS = ("question", "answered", "retired")
+FAMILY_TAGS = ("family-reported", "patient-reported", "user-report")
+SKIP_TAGS = ("low-confidence",)  # an uncertain or low-confidence fact never carries a flag alone (method section 2)
+BANDED = re.compile(r"\b(years?|yrs?|age[ds]?|male|female|men|women|adults?|child(ren)?|infants?|pregnan\w*)\b|;", re.I)
+MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+QID = re.compile(r"^[a-z][a-z0-9-]*:q:\d{4}$")
+ANSID = re.compile(r"^[a-z][a-z0-9-]*:ans:\d{4}$")
+DEFAULT_CONFIG = {"daily_cap": 3, "rollup_weekday": 1}
+
+
+class CrossrefError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------------------------------------- helpers
+def ddmon(at):
+    """'2026-09-20...' -> '20-Sep-2026' (month / year precision kept)."""
+    s = (at or "")[:10]
+    p = s.split("-")
+    if len(p) == 3 and all(x.isdigit() for x in p):
+        return f"{p[2]}-{MON[int(p[1]) - 1]}-{p[0]}"
+    if len(p) == 2:
+        return f"{MON[int(p[1]) - 1]}-{p[0]}"
+    return s
+
+
+def num(v):
+    if v is None:
+        return "?"
+    f = float(v)
+    return str(int(f)) if f == int(f) else f"{f:.4g}"
+
+
+def h8(s):
+    return hashlib.sha256(s.encode()).hexdigest()[:8]
+
+
+def read_ndjson(path):
+    rows = []
+    if path.exists():
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise CrossrefError(f"{path}:{n}: bad JSON ({e.msg})")
+    return rows
+
+
+def write_ndjson(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in rows)
+    if not path.exists() or path.read_text(encoding="utf-8") != text:
+        path.write_text(text, encoding="utf-8")
+        return True
+    return False
+
+
+def vtuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        raise CrossrefError(f"check version {v!r} is not N.N.N")
+
+
+# ----------------------------------------------------------------------------------------------------------- checks
+def load_checks(root, seed=True):
+    """Last row per id wins; versions must increase. Seeds crossref/checks.ndjson from the defaults when absent."""
+    path = root / "crossref" / "checks.ndjson"
+    if not path.exists() and seed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text((HERE / "default-checks.ndjson").read_text(encoding="utf-8"), encoding="utf-8")
+    rows = read_ndjson(path) if path.exists() else read_ndjson(HERE / "default-checks.ndjson")
+    checks = {}
+    for r in rows:
+        cid = r.get("id", "")
+        where = f"{path.name}: {cid or '?'}"
+        if r.get("rt") != "check" or not re.fullmatch(r"ref:check:[a-z0-9][a-z0-9-]*", cid):
+            raise CrossrefError(f"{where}: rt must be check and id ref:check:<slug>")
+        if r.get("operator") not in OPERATORS:
+            raise CrossrefError(f"{where}: unknown operator {r.get('operator')!r}")
+        if r.get("status") not in CHECK_STATUS:
+            raise CrossrefError(f"{where}: status must be one of {CHECK_STATUS}")
+        if r.get("severity") not in SEVERITIES:
+            raise CrossrefError(f"{where}: severity must be one of {SEVERITIES}")
+        if not isinstance(r.get("params"), dict) or not isinstance(r.get("sources"), list) or not r["sources"]:
+            raise CrossrefError(f"{where}: params must be an object and sources a non-empty list (the basis)")
+        if cid in checks and vtuple(r.get("version")) <= vtuple(checks[cid]["version"]):
+            raise CrossrefError(f"{where}: version {r.get('version')} does not increase on {checks[cid]['version']}")
+        vtuple(r.get("version"))
+        if r["operator"] == "delta_vs_prior":
+            for code, t in (r["params"].get("thresholds") or {}).items():
+                if not (isinstance(t, dict) and isinstance(t.get("abs"), (int, float)) and t.get("basis")):
+                    raise CrossrefError(f"{where}: threshold {code} needs a number abs and a cited basis")
+        if r["operator"] == "stale" and r["status"] == "active" and not isinstance(r["params"].get("max_days"), int):
+            raise CrossrefError(f"{where}: an active stale check needs an integer max_days")
+        checks[cid] = r
+    return checks
+
+
+def load_config(root):
+    path = root / "crossref" / "config.json"
+    cfg = dict(DEFAULT_CONFIG)
+    if path.exists():
+        try:
+            user = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise CrossrefError(f"{path}: bad JSON ({e.msg})")
+        for k, v in user.items():
+            if k.startswith("_"):
+                continue
+            if k not in DEFAULT_CONFIG or not isinstance(v, int) or isinstance(v, bool):
+                raise CrossrefError(f"{path}: unknown key or non-integer value: {k}")
+            cfg[k] = v
+    if not 1 <= cfg["rollup_weekday"] <= 7 or cfg["daily_cap"] < 0:
+        raise CrossrefError(f"{path}: rollup_weekday 1..7, daily_cap >= 0")
+    return cfg
+
+
+def load_feedback(root):
+    rows = read_ndjson(root / "crossref" / "feedback.ndjson")
+    latest = {}
+    for r in rows:
+        validate_feedback(r)
+        latest[r["target"]] = r  # append-only; the latest row per target wins
+    return rows, latest
+
+
+def validate_feedback(r):
+    t, a = r.get("target", ""), r.get("action")
+    if ":flag:" in t:
+        ok = a in FLAG_ACTIONS
+    elif ":claim:" in t:
+        ok = a in CLAIM_ACTIONS
+    else:
+        raise CrossrefError(f"feedback: target {t!r} is not a flag or claim id")
+    if not ok:
+        raise CrossrefError(f"feedback {t}: action {a!r} not allowed for this target")
+    if a == "snooze" and not (isinstance(r.get("days"), int) and r["days"] > 0):
+        raise CrossrefError(f"feedback {t}: snooze needs days > 0")
+    if a in ("promote", "question") and not QID.match(r.get("question") or ""):
+        raise CrossrefError(f"feedback {t}: {a} needs question <ns>:q:NNNN")
+    if a == "answered" and not ANSID.match(r.get("answer") or ""):
+        raise CrossrefError(f"feedback {t}: answered needs answer <ns>:ans:NNNN")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", r.get("at") or ""):
+        raise CrossrefError(f"feedback {t}: at must be an ISO date")
+
+
+# --------------------------------------------------------------------------------------------------------------- KB
+class KB:
+    def __init__(self, con):
+        con.row_factory = sqlite3.Row
+        self.con = con
+        self._names = {r["id"]: r["name"] for r in self.q("SELECT id, name FROM ref")}
+        self.skip = {r["id"] for r in self.q(
+            "SELECT id FROM fact f WHERE status = 'active' AND (uncertain_ref IS NOT NULL OR EXISTS (SELECT 1 FROM "
+            f"json_each(f.tags) WHERE value IN ({','.join('?' * len(SKIP_TAGS))})))", *SKIP_TAGS)}
+
+    def q(self, sql, *args):
+        return self.con.execute(sql, args).fetchall()
+
+    def name(self, ref_id):
+        if not ref_id:
+            return "?"
+        if ref_id.startswith("brand:"):
+            return ref_id[6:]
+        return self._names.get(ref_id) or ref_id.split(":")[-1]
+
+    def fingerprint(self):
+        rows = self.q("SELECT id, created_at FROM fact WHERE status = 'active' ORDER BY id")
+        h = hashlib.sha256("".join(f"{r['id']}|{r['created_at']}\n" for r in rows).encode()).hexdigest()
+        asof = self.q("SELECT max(substr(at, 1, 10)) AS m FROM fact WHERE status = 'active' "
+                      "AND json_extract(data, '$.type') IS NOT 'context'")[0]["m"]
+        return h, len(rows), asof
+
+
+# -------------------------------------------------------------------------------------------------------- operators
+# Each operator yields dicts: ns, subject, severity, statement, inputs (fact ids that decide the outcome).
+def op_range_vs_printed(kb, chk, ctx):
+    for r in kb.q("SELECT t.*, json_extract(f.data, '$.ref_low') AS lo, json_extract(f.data, '$.ref_high') AS hi, "
+                  "json_extract(f.data, '$.flag_basis') AS basis FROM v_trend t JOIN fact f ON f.id = t.id "
+                  "WHERE t.value_num IS NOT NULL ORDER BY t.ns, t.code, t.at, t.id"):
+        if r["id"] in kb.skip:
+            continue
+        v, lo, hi, printed = r["value_num"], r["lo"], r["hi"], r["flag"]
+        what = f"{kb.name(r['code'])} {num(v)}{' ' + r['unit'] if r['unit'] else ''} on {ddmon(r['at'])}"
+        rng = r["ref_text"] or (f"{num(lo) if lo is not None else ''}-{num(hi) if hi is not None else ''}")
+        base = dict(ns=r["ns"], subject=r["id"], inputs=[r["id"]])
+        if printed in ("H", "L"):
+            yield dict(base, variant="outside", severity=chk["severity"],
+                       statement=f"{what} is marked {printed} on its report (range as printed: {rng}).")
+        computed = None
+        if lo is not None or hi is not None:
+            computed = "H" if hi is not None and v > hi else "L" if lo is not None and v < lo else "N"
+        if computed is None or printed in (None, "") and computed == "N":
+            continue
+        if computed != (printed or "N") and not (printed in ("H", "L") and computed == printed):
+            if r["ref_text"] and BANDED.search(r["ref_text"]):
+                yield dict(base, variant="banded", severity="data-quality",
+                           statement=f"{what}: the printed range is banded ({r['ref_text']}); the check does not pick a "
+                                     "band. Needs a human.")
+            else:
+                yield dict(base, variant="mismatch", severity="data-quality",
+                           statement=f"{what}: the printed flag ({printed or 'none'}) differs from its position against "
+                                     f"the printed limits ({computed}; range {rng}). Needs a human.")
+
+
+def op_delta_vs_prior(kb, chk, ctx):
+    thresholds = chk["params"].get("thresholds") or {}
+    series = {}
+    for r in kb.q("SELECT * FROM v_trend WHERE value_num IS NOT NULL ORDER BY ns, code, at, id"):
+        if r["id"] not in kb.skip:
+            series.setdefault((r["ns"], r["code"], r["body_site"]), []).append(r)
+    # Comparable = same ns, code (alias-resolved) and body site; same method, or one of them does not say (as v_conflicts)
+    for (ns, code, site), rows in series.items():
+        last = rows[-1]
+        method = last["method"]
+        prior = [r for r in rows if r["at"][:10] < last["at"][:10]
+                 and (r["method"] == method or r["method"] is None or method is None)]
+        if not prior:
+            continue
+        p = prior[-1]
+        if (p["unit"] or "") != (last["unit"] or ""):
+            continue
+        d = last["value_num"] - p["value_num"]
+        if d == 0:
+            continue
+        unit = f" {last['unit']}" if last["unit"] else ""
+        pct = f", {d / p['value_num'] * 100:+.0f}%" if p["value_num"] else ""
+        where = f", {site}" if site else ""
+        st = (f"{kb.name(code)}{where} was {num(p['value_num'])}{unit} on {ddmon(p['at'])} and {num(last['value_num'])}"
+              f"{unit} on {ddmon(last['at'])} (changed by {'+' if d > 0 else ''}{num(d)}{unit}{pct}).")
+        sev = chk["severity"]
+        t = thresholds.get(code.split(":")[-1])
+        if t and abs(d) >= t["abs"] and (t.get("unit") in (None, last["unit"])):
+            sev = t.get("severity", "next-visit")
+            st += f" The change exceeds the check's threshold of {num(t['abs'])}{unit} ({t['basis']})."
+        yield dict(ns=ns, subject=f"{code}|{site or ''}", severity=sev, statement=st,
+                   inputs=[p["id"], last["id"]], variant="delta")
+
+
+def op_med_list_conflict(kb, chk, ctx):
+    cur = {(r["ns"], r["drug"]): r for r in kb.q("SELECT * FROM v_meds_current")}
+    stmts = {}
+    for r in kb.q("SELECT f.ns, f.id, f.at, f.source_id, json_extract(f.data, '$.status') AS st, "
+                  "coalesce(json_extract(f.data, '$.drug_id'), 'brand:' || lower(json_extract(f.data, '$.brand'))) AS drug "
+                  "FROM fact f WHERE f.kind = 'medication' AND f.status = 'active' ORDER BY f.ns, drug, f.at, f.id"):
+        if r["id"] not in kb.skip:
+            stmts.setdefault((r["ns"], r["drug"]), []).append(r)
+    # a) stopped, then taking/dispensed in a later source, with no prescription in between
+    for (ns, drug), rows in stmts.items():
+        c = cur.get((ns, drug))
+        if c is not None and c["display_status"] == "not-in-current-list":
+            continue
+        hit = None
+        for i, s in enumerate(rows):
+            if s["st"] != "stopped":
+                continue
+            for t in rows[i + 1:]:
+                if t["st"] == "prescribed":
+                    break
+                if t["st"] in ("taking", "dispensed") and t["at"][:10] > s["at"][:10] and t["source_id"] != s["source_id"]:
+                    hit = (s, t)
+        if hit:
+            s, t = hit
+            yield dict(ns=ns, subject=f"order|{drug}", severity=chk["severity"], variant="order", inputs=[s["id"], t["id"]],
+                       statement=f"{kb.name(drug)}: stopped ({s['source_id']}, {ddmon(s['at'])}) and {t['st']} "
+                                 f"({t['source_id']}, {ddmon(t['at'])}); no prescription is recorded between them.")
+    # b) two current lines with one generic
+    by_generic = {}
+    for (ns, drug), r in cur.items():
+        if r["generic"] and r["display_status"] in ("prescribed", "dispensed", "taking") and r["id"] not in kb.skip:
+            by_generic.setdefault((ns, r["generic"].strip().lower()), []).append(r)
+    for (ns, g), rows in sorted(by_generic.items()):
+        if len(rows) < 2:
+            continue
+        rows.sort(key=lambda r: r["drug"])
+        lines = "; ".join(f"{kb.name(r['drug'])} ({r['med_status']}, {ddmon(r['at'])})" for r in rows)
+        yield dict(ns=ns, subject=f"generic|{g}", severity=chk["severity"], variant="generic",
+                   inputs=[r["id"] for r in rows],
+                   statement=f"{len(rows)} current lines share the generic {rows[0]['generic']}: {lines}.")
+    # c) prescribed-only lines older than the review window (off while null)
+    days = chk["params"].get("prescribed_only_days")
+    if isinstance(days, int):
+        limit = (ctx["today"] - datetime.timedelta(days=days)).isoformat()
+        for (ns, drug), r in sorted(cur.items()):
+            if r["display_status"] == "prescribed" and r["at"][:10] < limit and r["id"] not in kb.skip:
+                yield dict(ns=ns, subject=f"prescribed-only|{drug}", severity="data-quality", variant="prescribed-only",
+                           inputs=[r["id"]], statement=f"{kb.name(drug)}: the latest statement is a prescription of "
+                           f"{ddmon(r['at'])}; no strip, dispensing or 'taking' is recorded since.")
+
+
+def op_passthrough(kb, chk, ctx):
+    view = chk["params"].get("view")
+    if view == "v_conflicts":
+        for r in kb.q("SELECT * FROM v_conflicts ORDER BY ns, day, id_a"):
+            yield dict(ns=r["ns"], subject=f"{r['id_a']}|{r['id_b']}", severity=chk["severity"], variant="conflict",
+                       inputs=[r["id_a"], r["id_b"]],
+                       statement=f"Two sources disagree on {kb.name(r['code'])} on {ddmon(r['day'])}: {r['value_a']} "
+                                 f"({r['source_a']}) vs {r['value_b']} ({r['source_b']}).")
+    elif view == "v_internal_contradictions":
+        for r in kb.q("SELECT * FROM v_internal_contradictions ORDER BY ns, day, id"):
+            what = kb.name(r["what"]) if str(r["what"]).startswith("ref:") else r["what"]
+            yield dict(ns=r["ns"], subject=r["id"], severity=chk["severity"], variant="internal", inputs=[r["id"]],
+                       statement=f"{r['source_id']} ({ddmon(r['day'])}) is tagged {r['tag']} on {what}.")
+    elif view == "v_needs_human":
+        groups = {}
+        for r in kb.q("SELECT ns, reason, id FROM v_needs_human ORDER BY ns, reason, id"):
+            groups.setdefault((r["ns"], r["reason"]), []).append(r["id"])
+        for (ns, reason), ids in groups.items():
+            yield dict(ns=ns, subject=f"needs-human|{reason}", severity=chk["severity"], variant="needs-human",
+                       inputs=ids, statement=f"{len(ids)} record(s) wait for a human check (reason: {reason}); see "
+                                             "data-quality.md.")
+    else:
+        raise CrossrefError(f"{chk['id']}: passthrough view must be v_conflicts, v_internal_contradictions or v_needs_human")
+
+
+def op_stale(kb, chk, ctx):
+    days = chk["params"]["max_days"]
+    limit = (ctx["today"] - datetime.timedelta(days=days)).isoformat()
+    codes = chk["params"].get("codes") or []
+    for ns in ctx["persons"]:
+        want = codes or ctx["key_series"].get(ns) or []
+        for c in want:
+            code = c if c.startswith("ref:code:") else f"ref:code:{c}"
+            r = kb.q("SELECT * FROM v_latest WHERE ns = ? AND code = ?", ns, code)
+            if r and r[0]["at"][:10] < limit:
+                r = r[0]
+                yield dict(ns=ns, subject=code, severity=chk["severity"], variant="stale", inputs=[r["id"]],
+                           statement=f"Latest {kb.name(code)} on file: {ddmon(r['at'])} (window {days} days).")
+
+
+def op_claim_differs(kb, chk, ctx):
+    for c in ctx["claims"]:
+        if c["state"] != "differs-in-later-source":
+            continue
+        later = [l for l in c["links"] if l["relation"] == "differs-in-later-source"]
+        if not later:
+            continue
+        l = later[-1]
+        who = c["author_name"] or "the author"
+        yield dict(ns=c["ns"], subject=c["id"], severity=chk["severity"], variant="claim", inputs=[c["fact"], l["target"]],
+                   statement=f"Question for {who}: the record has '{c['text_as_written']}' ({c['status_as_documented']}, "
+                             f"{ddmon(c['at'])}, {c['source']}); a later source records '{l['text']}' ({l['status']}, "
+                             f"{ddmon(l['at'])}, {l['source']}). Is this still current?")
+
+
+OPS = {"range_vs_printed": op_range_vs_printed, "delta_vs_prior": op_delta_vs_prior,
+       "med_list_conflict": op_med_list_conflict, "passthrough": op_passthrough, "stale": op_stale,
+       "claim_differs": op_claim_differs}
+
+
+# ----------------------------------------------------------------------------------------------------------- claims
+def claim_key(fid, data):
+    if data.get("icd10"):
+        return "icd10:" + data["icd10"].lower()
+    local = fid.split(":", 2)[2]
+    key = local.split(".", 1)[1] if "." in local else local
+    return re.sub(r"\.\d+$", "", key)
+
+
+def compatible(a, b):
+    """Not stated is compatible with anything; history restates confirmed."""
+    return a is None or b is None or a == b or {a, b} == {"confirmed", "history"}
+
+
+def build_claims(kb, feedback):
+    rows = kb.q(
+        "SELECT f.id, f.ns, f.kind, f.at, f.data, f.source_id, f.context_id, f.tags, f.quote, s.rank, s.kind AS skind, "
+        "coalesce(s.practitioner_id, s.org_id) AS author FROM fact f JOIN source s ON s.id = f.source_id "
+        "WHERE f.status = 'active' AND json_extract(f.data, '$.type') IS NOT 'context' AND (f.kind = 'condition' OR "
+        f"(f.kind = 'event' AND EXISTS (SELECT 1 FROM json_each(f.tags) WHERE value IN ({','.join('?' * len(FAMILY_TAGS))})))) "
+        "ORDER BY f.ns, f.at, f.id", *FAMILY_TAGS)
+    same = {}
+    for r in kb.q("SELECT id, source_id, context_id FROM fact WHERE status = 'active' AND "
+                  "json_extract(data, '$.type') IS NOT 'context'"):
+        same.setdefault(r["source_id"], []).append(r["id"])
+        if r["context_id"]:
+            same.setdefault(r["context_id"], []).append(r["id"])
+    claims = []
+    for r in rows:
+        d, tags = json.loads(r["data"]), json.loads(r["tags"])
+        fam = [t for t in FAMILY_TAGS if t in tags]
+        asserted = fam[0] if fam else ("recollection" if r["rank"] == "recollection" else
+                                      "doctor-written" if r["author"] and r["author"].startswith("ref:party:") and
+                                      r["skind"] in ("rx", "consult", "discharge") else "document")
+        text = d.get("text_as_written") or d.get("label") or d.get("detail") or r["quote"] or d.get("type") or ""
+        linked = sorted(set(same.get(r["source_id"], []) + same.get(r["context_id"] or "", [])) - {r["id"]})
+        claims.append(dict(
+            id=f"{r['ns']}:claim:{r['id'].split(':', 2)[2]}", ns=r["ns"], fact=r["id"], kind=r["kind"], at=r["at"],
+            source=r["source_id"], asserted_by=asserted, author=r["author"],
+            author_name=kb.name(r["author"]) if r["author"] else None, text_as_written=text[:200],
+            status_as_documented=d.get("status_as_documented"), key=claim_key(r["id"], d) if r["kind"] == "condition" else None,
+            links=[{"target": t, "relation": "same-source", "basis": "source_id/context_id", "by": "crossref"} for t in linked],
+            state="as-recorded"))
+    groups = {}
+    for c in claims:
+        if c["key"]:
+            groups.setdefault((c["ns"], c["key"]), []).append(c)
+    for members in groups.values():
+        for c in members:
+            later = [o for o in members if o["source"] != c["source"] and o["at"][:10] > c["at"][:10]]
+            if not later:
+                continue
+            differs = [o for o in later if not compatible(c["status_as_documented"], o["status_as_documented"])]
+            rel = "differs-in-later-source" if differs else "restated"
+            c["state"] = rel
+            for o in later:
+                c["links"].append({"target": o["fact"], "relation": "differs-in-later-source" if o in differs else "restated",
+                                   "basis": "same claim key in a later source", "by": "crossref", "text": o["text_as_written"],
+                                   "status": o["status_as_documented"], "at": o["at"], "source": o["source"]})
+    for c in claims:
+        c["state_recorded"] = c["state"]
+        fb = feedback.get(c["id"])
+        if fb:
+            c["state"] = {"question": "question-open", "answered": "clinician-answered", "retired": "retired"}[fb["action"]]
+            c["owner"] = {k: fb[k] for k in ("action", "question", "answer", "reason", "at", "by") if fb.get(k)}
+        del c["key"]
+    return claims
+
+
+# ------------------------------------------------------------------------------------------------------------ flags
+def flag_view(f, feedback, today):
+    """Effective state from the flag row + the latest owner feedback given since the flag last changed."""
+    fb = feedback.get(f["id"])
+    if f["state"] == "closed":
+        return "closed", fb
+    if not fb or fb["at"][:10] < f["changed_at"]:
+        return "open", None
+    a = fb["action"]
+    if a == "snooze":
+        until = (datetime.date.fromisoformat(fb["at"][:10]) + datetime.timedelta(days=fb["days"])).isoformat()
+        return ("snoozed" if today.isoformat() < until else "open"), fb
+    return {"useful": "open", "noise": "noise", "promote": "promoted", "resolved": "resolved"}[a], fb
+
+
+def update_flags(old, found, checks, today, baseline):
+    """old: {subject_key: row}; found: [(check, item)]. Returns new rows + counts. Dedup key = check + major version +
+    ns + subject + input fingerprint; a changed fingerprint updates the open flag (re-notified), never a second flag."""
+    t = today.isoformat()
+    out, seen, n = {}, set(), {"new": 0, "changed": 0, "closed": 0, "reopened": 0}
+    for chk, it in found:
+        major = str(chk["version"]).split(".")[0]
+        skey = f"{chk['id']}|{major}|{it['ns']}|{it.get('variant', '')}|{it['subject']}"
+        fp = h8("|".join(sorted(it["inputs"])))
+        seen.add(skey)
+        prev = old.get(skey)
+        row = dict(prev or {}, check=chk["id"], check_version=chk["version"], severity=it["severity"],
+                   statement=it["statement"], inputs=sorted(it["inputs"]), ns=it["ns"], subject_key=skey,
+                   dedup_key=f"{skey}|{fp}")
+        if prev is None:
+            slug = chk["id"].split(":")[-1]
+            row.update(id=f"{it['ns']}:flag:{t}-{slug}-{h8(skey)}", first_seen=t, changed_at=t, state="open",
+                       digest_day="baseline" if baseline else None, closed_at=None)
+            n["new"] += 1
+        elif prev["state"] == "closed":
+            row.update(state="open", changed_at=t, closed_at=None, digest_day=None)
+            n["reopened"] += 1
+        elif prev["dedup_key"] != row["dedup_key"] or prev["statement"] != row["statement"]:
+            row.update(changed_at=t, digest_day=None)
+            n["changed"] += 1
+        out[skey] = row
+    for skey, prev in old.items():
+        if skey in seen:
+            continue
+        if prev["state"] != "closed":
+            prev = dict(prev, state="closed", closed_at=t)
+            n["closed"] += 1
+        out[skey] = prev
+    return out, n
+
+
+SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
+
+
+def pick_digest(rows, feedback, today, cap):
+    """Today's next-visit flags for one person: those already picked today, then fill to the cap (oldest first)."""
+    t = today.isoformat()
+    shown = [r for r in rows if r.get("digest_day") == t]
+    cands = [r for r in rows if r["severity"] == "next-visit" and r.get("digest_day") is None
+             and flag_view(r, feedback, today)[0] == "open"]
+    cands.sort(key=lambda r: (r["first_seen"], r["id"]))
+    for r in cands[:max(0, cap - len(shown))]:
+        r["digest_day"] = t
+        shown.append(r)
+    return shown, sum(1 for c in cands if c.get("digest_day") is None)
+
+
+# ------------------------------------------------------------------------------------------------------------ pages
+def md_cell(v):
+    return str(v if v is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def table(head, rows):
+    return ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)] + [
+        "| " + " | ".join(md_cell(c) for c in r) + " |" for r in rows]
+
+
+def precision(flags_all, feedback):
+    stats = {}
+    for f in flags_all:
+        fb = feedback.get(f["id"])
+        s = stats.setdefault(f["check"], {"useful": 0, "noise": 0})
+        if fb and fb["action"] in ("useful", "noise"):
+            s[fb["action"]] += 1
+        elif fb and fb["action"] == "promote":
+            s["useful"] += 1
+    return stats
+
+
+def front(title, srcs, day):
+    return ["---", f'title: "{title}"', "audience: admin", "type: reference", "owner: admin", f"last_reviewed: {day}",
+            "review_every: 7d", "status: active", f"sources: [{', '.join(srcs)}]", "generated: true", "---", ""]
+
+
+def write_page(path, title, srcs, body, today, dry):
+    """Whole-file generated page; rewritten only when the body changes (no daily date-only diffs)."""
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    old_body = old.split("\n---\n", 1)[1].lstrip("\n") if old.startswith("---\n") and "\n---\n" in old else None
+    text_body = "\n".join(body).rstrip() + "\n"
+    if old_body == text_body:
+        return False
+    if not dry:
+        path.write_text("\n".join(front(title, srcs, today.isoformat())) + "\n" + text_body, encoding="utf-8")
+    return True
+
+
+def flags_page(ns, display, rows, feedback, checks, asof, today):
+    view = [(r, *flag_view(r, feedback, today)) for r in rows]
+    b = [f"# Cross-check flags: {display}", "", f"**{DISCLAIMER}**", "",
+         f"_Generated by `tools/crossref` from the KB (data as of {ddmon(asof)}). Don't edit this page; give feedback "
+         "as described at the end._", "",
+         "Each flag restates what the records say, with the fact ids it rests on. A flag is not a diagnosis and never a "
+         "medicine instruction. A concern reaches a doctor only when you promote it to a question in "
+         "[questions.md](questions.md). Severity: `next-visit` (daily digest, capped), `routine` (weekly roll-up), "
+         "`data-quality` (the records need a human; weekly roll-up).", ""]
+    states = ("open", "snoozed", "promoted", "noise", "resolved", "closed")
+    cnt = [[s] + [sum(1 for r, st, _ in view if r["severity"] == s and st == x) for x in states] for s in SEVERITIES]
+    b += ["## Summary", ""] + table(["severity", *states], cnt) + [""]
+    for sev in SEVERITIES:
+        live = [(r, st, fb) for r, st, fb in view if r["severity"] == sev and st in ("open", "snoozed", "promoted")]
+        b += [f"## {sev} ({len(live)})", ""]
+        if not live:
+            b += ["None.", ""]
+            continue
+        live.sort(key=lambda x: (x[0]["check"], x[0]["first_seen"], x[0]["id"]))
+        b += table(["flag", "check", "statement", "inputs", "first seen", "state"],
+                   [[f"`{r['id']}`", r["check"].split(":")[-1], r["statement"], "<br>".join(f"`{i}`" for i in r["inputs"][:6])
+                     + (f"<br>+{len(r['inputs']) - 6} more" if len(r["inputs"]) > 6 else ""), ddmon(r["first_seen"]),
+                     st + (f" ({fb.get('question')})" if fb and fb.get("question") else "")] for r, st, fb in live]) + [""]
+    done = [(r, st, fb) for r, st, fb in view if st in ("noise", "resolved", "closed")]
+    b += [f"## Not open ({len(done)})", "",
+          "Marked noise or resolved by you, or closed because the inputs no longer fire the check.", ""]
+    if done:
+        done.sort(key=lambda x: (x[1], x[0]["id"]))
+        b += table(["flag", "check", "state", "since", "reason"],
+                   [[f"`{r['id']}`", r["check"].split(":")[-1], st,
+                     ddmon(r.get("closed_at") or (fb or {}).get("at", "")), (fb or {}).get("reason", "")] for r, st, fb in done])
+        b += [""]
+    prec = precision(rows, feedback)
+    b += ["## Checks", ""] + table(
+        ["check", "version", "status", "operator", "severity", "basis", "useful / noise (this person)"],
+        [[c["id"], c["version"], c["status"], c["operator"], c["severity"],
+          "; ".join(s.get("basis", "") + (f" ({s['note']})" if s.get("note") else "") for s in c["sources"]),
+          f"{prec.get(c['id'], {}).get('useful', 0)} / {prec.get(c['id'], {}).get('noise', 0)}"]
+         for c in sorted(checks.values(), key=lambda c: c["id"])]) + [""]
+    b += FEEDBACK_HELP
+    return b
+
+
+FEEDBACK_HELP = [
+    "## Feedback", "",
+    "From a product checkout (appends one row to `crossref/feedback.ndjson`; the latest row per flag wins):", "",
+    "```sh",
+    "python3 -I tools/crossref/crossref --records <records-dir> feedback <flag-id> useful",
+    "python3 -I tools/crossref/crossref --records <records-dir> feedback <flag-id> noise --reason \"already known\"",
+    "python3 -I tools/crossref/crossref --records <records-dir> feedback <flag-id> snooze --days 30",
+    "python3 -I tools/crossref/crossref --records <records-dir> feedback <flag-id> promote --question <ns>:q:NNNN",
+    "python3 -I tools/crossref/crossref --records <records-dir> feedback <flag-id> resolved --reason \"answered\"",
+    "python3 -I tools/crossref/crossref --records <records-dir> feedback <claim-id> question --question <ns>:q:NNNN",
+    "```", "",
+    "Promote also needs the question itself in `questions.md` (next free id). Feedback given before a flag changes "
+    "does not hide the changed flag. Useful / noise marks feed each check's precision (target 0.7).", ""]
+
+
+def claims_page(ns, display, claims, asof):
+    b = [f"# Claims register: {display}", "", f"**{DISCLAIMER}**", "",
+         f"_Generated by `tools/crossref` from the KB (data as of {ddmon(asof)}). Don't edit this page._", "",
+         "Every condition recorded in a source and every family- or patient-reported statement, with who made it. The "
+         "state describes the **records** (whether a later source restates the claim or records it differently); it is "
+         "never a verdict on whether the claim is true.", ""]
+    states = {}
+    for c in claims:
+        states[c["state"]] = states.get(c["state"], 0) + 1
+    b += table(["state", "claims"], sorted(states.items())) + [""]
+    b += table(["claim", "as written", "status as documented", "date", "asserted by", "author", "state", "later sources",
+                "same-source facts"],
+               [[f"`{c['id']}`", c["text_as_written"], c["status_as_documented"] or "", ddmon(c["at"]), c["asserted_by"],
+                 c["author_name"] or "", c["state"] + (f" ({c['owner'].get('question') or c['owner'].get('answer')})"
+                                                        if c.get("owner") and (c["owner"].get("question") or c["owner"].get("answer")) else ""),
+                 "<br>".join(f"`{l['target']}` ({l['relation']})" for l in c["links"] if l["relation"] != "same-source"),
+                 sum(1 for l in c["links"] if l["relation"] == "same-source")]
+                for c in claims]) + [""]
+    return b
+
+
+# ----------------------------------------------------------------------------------------------------------- digest
+def digest_section(per_ns, display, feedback, today, cfg, first_run, claims_by_ns):
+    out = []
+    lines = []
+    for ns, (shown, waiting, _) in per_ns.items():
+        if shown or waiting:
+            lines.append(display.get(ns, ns))
+            lines += [f"• {r['statement']} [{r['id']}]" for r in shown]
+            if waiting:
+                lines.append(f"• {waiting} more waiting (cap {cfg['daily_cap']} a day); see docs/health/{ns}/flags.md")
+    if first_run:
+        n = sum(len(v[2]) for v in per_ns.values())
+        out += ["", f"Cross-check (records only; {DISCLAIMER}):",
+                f"First run: {n} flag(s) recorded as the baseline (not listed here). See docs/health/<member>/flags.md."]
+    elif lines:
+        out += ["", f"Cross-check flags, new (records only; questions for the doctor, not advice; {DISCLAIMER}). "
+                    "Reply useful / noise / snooze / promote via crossref feedback:"] + lines
+    if today.isoweekday() == cfg["rollup_weekday"]:
+        week = (today - datetime.timedelta(days=7)).isoformat()
+        roll = []
+        for ns, (_, _, rows) in per_ns.items():
+            live = [r for r in rows if flag_view(r, feedback, today)[0] in ("open", "snoozed", "promoted")]
+            if not live and not claims_by_ns.get(ns):
+                continue
+            by = {s: sum(1 for r in live if r["severity"] == s) for s in SEVERITIES}
+            new = sum(1 for r in rows if r["changed_at"] > week)
+            cl = claims_by_ns.get(ns, [])
+            moved = sum(1 for c in cl if c["state"] not in ("as-recorded",))
+            roll.append(f"• {display.get(ns, ns)}: open next-visit {by['next-visit']}, routine {by['routine']}, "
+                        f"data-quality {by['data-quality']}; new or changed this week {new}; claims {len(cl)} "
+                        f"({moved} not as-recorded)")
+        prec = precision([r for v in per_ns.values() for r in v[2]], feedback)
+        voted = [f"{k.split(':')[-1]} {v['useful']}/{v['useful'] + v['noise']}" for k, v in sorted(prec.items())
+                 if v["useful"] + v["noise"]]
+        if roll:
+            out += ["", "Cross-check weekly roll-up:"] + roll
+            out.append("• precision (useful/marked): " + (", ".join(voted) if voted else "no marks yet"))
+    return "\n".join(out)
+
+
+# -------------------------------------------------------------------------------------------------------------- run
+def run(a):
+    root = pathlib.Path(a.records).resolve()
+    rc = records_config.load(root)
+    db = pathlib.Path(a.db) if a.db else root / "data" / "kb.sqlite"
+    if not db.exists():
+        raise CrossrefError(f"{db} not found; run tools/kb/build --records {root} first")
+    today = datetime.date.fromisoformat(a.today)
+    checks = load_checks(root, seed=not a.dry_run)
+    cfg = load_config(root)
+    _, feedback = load_feedback(root)
+    kb = KB(sqlite3.connect(f"file:{db}?mode=ro", uri=True))
+    gv = root / "data" / "meta" / "gen-views.json"
+    key_series = json.loads(gv.read_text(encoding="utf-8")).get("key_series", {}) if gv.exists() else {}
+    claims = build_claims(kb, feedback)
+    ctx = {"today": today, "persons": rc["persons"], "key_series": key_series, "claims": claims}
+    found = []
+    for chk in sorted(checks.values(), key=lambda c: c["id"]):
+        if chk["status"] == "active":
+            found += [(chk, it) for it in OPS[chk["operator"]](kb, chk, ctx)]
+    fp, nfacts, asof = kb.fingerprint()
+    xdir = root / "crossref"
+    per_ns, totals, changed_files = {}, {"new": 0, "changed": 0, "closed": 0, "reopened": 0}, []
+    claims_by_ns = {}
+    for c in claims:
+        claims_by_ns.setdefault(c["ns"], []).append(c)
+    for ns in rc["namespaces"]:
+        fpath = xdir / ns / "flags.ndjson"
+        first = not fpath.exists()
+        old = {r["subject_key"]: r for r in read_ndjson(fpath)}
+        rows, n = update_flags(old, [(c, i) for c, i in found if i["ns"] == ns], checks, today, baseline=first)
+        for k in totals:
+            totals[k] += n[k]
+        rows = sorted(rows.values(), key=lambda r: r["id"])
+        shown, waiting = pick_digest(rows, feedback, today, cfg["daily_cap"])
+        per_ns[ns] = (shown, waiting, rows)
+        ns_claims = claims_by_ns.get(ns, [])
+        if not a.dry_run:
+            if rows or fpath.exists():
+                changed_files += [fpath] if write_ndjson(fpath, rows) else []
+            cpath = xdir / ns / "claims.ndjson"
+            if ns_claims or cpath.exists():
+                changed_files += [cpath] if write_ndjson(cpath, ns_claims) else []
+        hdir = root / "docs" / "health" / ns
+        if hdir.is_dir() and (rows or ns_claims):
+            disp = rc["display"].get(ns, ns)
+            if write_page(hdir / "flags.md", f"Cross-check flags ({ns})", [f"crossref/{ns}/flags.ndjson", "crossref/checks.ndjson"],
+                          flags_page(ns, disp, rows, feedback, checks, asof, today), today, a.dry_run):
+                changed_files.append(hdir / "flags.md")
+            if ns_claims and write_page(hdir / "claims.md", f"Claims register ({ns})", [f"crossref/{ns}/claims.ndjson"],
+                                        claims_page(ns, disp, ns_claims, asof), today, a.dry_run):
+                changed_files.append(hdir / "claims.md")
+    first_run = all(r.get("digest_day") == "baseline" for v in per_ns.values() for r in v[2]) and totals["new"] > 0 \
+        and totals["new"] == sum(len(v[2]) for v in per_ns.values())
+    digest = digest_section(per_ns, rc["display"], feedback, today, cfg, first_run, claims_by_ns)
+    counts = {
+        "run": f"run:{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%MZ')}-l1",
+        "day": today.isoformat(), "data_as_of": asof, "kb_fingerprint": fp[:16], "facts": nfacts, **totals,
+        "open": {s: sum(1 for v in per_ns.values() for r in v[2]
+                        if r["severity"] == s and flag_view(r, feedback, today)[0] == "open") for s in SEVERITIES},
+        "flags": sum(len(v[2]) for v in per_ns.values()), "claims": len(claims),
+        "digest_listed": sum(len(v[0]) for v in per_ns.values()),
+        "checks_active": sorted(c["id"].split(":")[-1] for c in checks.values() if c["status"] == "active")}
+    runs = xdir / "runs.ndjson"
+    prev = read_ndjson(runs)[-1:] if runs.exists() else []
+    if not a.dry_run and (changed_files or not prev or prev[0].get("kb_fingerprint") != counts["kb_fingerprint"]):
+        runs.parent.mkdir(parents=True, exist_ok=True)
+        with runs.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(counts, sort_keys=True) + "\n")
+    if a.digest and digest and not a.dry_run:
+        p = pathlib.Path(a.digest)
+        if p.exists():
+            with p.open("a", encoding="utf-8") as fh:
+                prev_text = p.read_text(encoding="utf-8")
+                fh.write(("\n" if prev_text and not prev_text.endswith("\n") else "") + digest.lstrip("\n") + "\n")
+    # counts only on stdout (the batch log must carry no PHI)
+    print("crossref: " + json.dumps({k: counts[k] for k in ("facts", "flags", "claims", "new", "changed", "closed",
+                                                             "reopened", "open", "digest_listed")}, sort_keys=True))
+    if a.dry_run and a.print_digest:
+        print(digest)
+    return 0
+
+
+def feedback_cmd(a):
+    root = pathlib.Path(a.records).resolve()
+    records_config.load(root)
+    t = a.target
+    known = set()
+    for f in (root / "crossref").glob("*/flags.ndjson"):
+        known |= {r["id"] for r in read_ndjson(f)}
+    for f in (root / "crossref").glob("*/claims.ndjson"):
+        known |= {r["id"] for r in read_ndjson(f)}
+    if t not in known:
+        raise CrossrefError(f"feedback: unknown flag or claim id {t}")
+    row = {"target": t, "action": a.action, "by": a.by,
+           "at": a.at or datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).isoformat(timespec="seconds")}
+    for k in ("days", "question", "answer", "reason"):
+        if getattr(a, k) is not None:
+            row[k] = getattr(a, k)
+    validate_feedback(row)
+    path = root / "crossref" / "feedback.ndjson"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    print(f"ok: {a.action} recorded for {t}; rerun crossref to refresh the pages")
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--records", required=True)
+    if "feedback" in argv:
+        i = argv.index("feedback")
+        argv = argv[:i] + argv[i + 1:]
+        ap.add_argument("target")
+        ap.add_argument("action", choices=FLAG_ACTIONS + CLAIM_ACTIONS)
+        ap.add_argument("--days", type=int)
+        ap.add_argument("--question")
+        ap.add_argument("--answer")
+        ap.add_argument("--reason")
+        ap.add_argument("--by", default="owner")
+        ap.add_argument("--at", help=argparse.SUPPRESS)
+        fn = feedback_cmd
+    else:
+        ap.add_argument("--db")
+        ap.add_argument("--today", default=datetime.date.today().isoformat())
+        ap.add_argument("--digest", help="append the digest section to this file when it exists")
+        ap.add_argument("--dry-run", action="store_true", help="write nothing")
+        ap.add_argument("--print-digest", action="store_true", help="with --dry-run: print the digest section")
+        fn = run
+    a = ap.parse_args(argv)
+    try:
+        return fn(a)
+    except (CrossrefError, records_config.RecordsError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

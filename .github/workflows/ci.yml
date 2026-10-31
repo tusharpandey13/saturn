@@ -35,6 +35,7 @@ jobs:
         run: |
           python3 -I tools/kb/test_build.py
           python3 -I tools/kb/test_gen.py
+          python3 -I tools/crossref/test_crossref.py
   doc-scan:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

@@ -43,6 +43,12 @@ repos:
         entry: sh -c 'python3 -I tools/kb/build --records fixtures/records-example --check && python3 -I tools/kb/test_gen.py'
         pass_filenames: false
         files: ^(tools/kb/|schema/|fixtures/records-example/)
+      - id: crossref
+        name: cross-referencing checks (synthetic fixtures)
+        language: system
+        entry: python3 -I tools/crossref/test_crossref.py
+        pass_filenames: false
+        files: ^(tools/crossref/|tools/kb/records_config.py|schema/schema.sql)
       - id: no-binaries-outside-fixtures
         name: binary files only under fixtures/
         language: fail

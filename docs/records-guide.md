@@ -52,6 +52,7 @@ Format: `<ns>:<class>:<local>`. `ns` is one of the `namespaces` in `records.yaml
 | Current health state (curated) | `docs/health/<ns>/` only: `summary`, `medications`, `problems`, `timeline`, `care-team`, `questions`, `briefs/`, `research/` (dated cross-references, [method](methods/research-crossref.md); `research/private/` for private-mode runs, with a gitignored `.cache/` for restricted PDFs) |
 | Household to-dos | `docs/health/family/actions.md` |
 | Extraction notes, hard-reads, chat triage, analyses | `docs/log/…` (dated, append-only) |
+| Cross-check flags and claims register (ADR 012) | `crossref/` (checks, owner feedback, derived flag and claim state, run log) and the generated `docs/health/<ns>/flags.md`, `claims.md`; written by `tools/crossref` ([README](../tools/crossref/README.md)); give feedback with its `feedback` command |
 | Records-local config | `records.yaml`, `config/thresholds.yaml` (optional red-flag thresholds, below), `meta/stt-vocab.txt` (optional STT vocabulary), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
 
 ### `config/thresholds.yaml` (red-flag thresholds)

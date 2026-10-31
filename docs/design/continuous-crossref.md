@@ -357,6 +357,14 @@ Estimates are agent working time, with the owner's review time on top. Claude co
 | **4. LLM-assisted claim links and re-evaluation** | Haiku/Sonnet proposes claim links and `differs-in-later-source` candidates from free text (tagged `agent-inferred`, inactive until accepted); question drafting for promoted flags, using method phrasing rules and the verifier word list | about 1 agent-week | small per batch (Haiku tier), capped | fewer missed links in free-text documents; less owner typing |
 | **5. Sharing and interoperability** | FHIR export of flags, claims and provenance (`DetectedIssue`, `Condition` as documented, `Provenance`) for a doctor brief annex; precision dashboard in the weekly roll-up; CQL mapping study (no adoption unless it removes code) | about 3 to 5 agent-days | none | a brief annex a doctor can scan; portability |
 
+**Iteration 1 as built (31-Oct-2026, [tools/crossref](../../tools/crossref/README.md)).** Cut to ship sooner:
+check definitions, flags and claims live in the records repo's `crossref/` directory (outside `data/`), so the KB build,
+its id regex and the views are unchanged (the `flag`/`claim` id classes and `v_flags_open`/`v_claims` views wait until
+they are needed); flag and claim state is rewritten each run with git as the history instead of superseding rows;
+pages are whole-file generated (`flags.md`, `claims.md`) rather than `gen:` blocks; feedback is a command that appends
+to `crossref/feedback.ndjson` (digest-reply parsing is next); no refractory period beyond dedup and snooze;
+`linked-data-changed` is not built.
+
 **Iteration 1 stop condition.** Run the checks on the records for 2 weeks. Keep iteration 2 only if the owner marks
 at least half of the `next-visit` flags `useful` and the daily load stays at or under the budget. Otherwise, retune
 or drop checks before adding more.
