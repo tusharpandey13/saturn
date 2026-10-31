@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ClaudeCliError, ClaudeCliExtractor, type ExtractInput, ExtractorStopError, MAX_PER_CALL, MODEL, parseResult, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
+import { ClaudeCliError, ClaudeCliExtractor, type ExtractInput, ExtractorStopError, MAX_PER_CALL, MEDIA_MODEL, MODEL, parseResult, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
 import { parseExtraction } from "../src/extract/schema.js";
 
 const FAKE = `#!/usr/bin/env node
@@ -31,7 +31,7 @@ const results = msgs.filter((m) => !(mode === "skip2" && m.n === 2)).map(({ n, t
   if (/Attachment/.test(text)) return { msg: n, ...none, media_kind: "device_reading", unreadable_reason: "blurred" };
   return { msg: n, ...none };
 });
-out({ is_error: false, result: JSON.stringify({ results }), structured_output: { results } });
+out({ is_error: false, result: JSON.stringify({ results }), structured_output: { results }, usage: { input_tokens: 100, output_tokens: 10 }, total_cost_usd: 0.01 });
 `;
 
 let dir: string;
@@ -84,21 +84,55 @@ describe("ClaudeCliExtractor (fake claude on PATH)", () => {
     expect(JSON.parse(calls()[0].args[calls()[0].args.indexOf("--json-schema") + 1]).properties.results.items.required).toContain("context");
   });
 
-  it("photos/PDFs go as content blocks over stream-json; chunks of at most MAX_PER_CALL", async () => {
+  it("text on Haiku in chunks of MAX_PER_CALL; photos on the media model (Sonnet); a PDF alone with a page hint", async () => {
     const photo: ExtractInput = { now: NOW, media: { data: new Uint8Array([0xff, 0xd8, 1]), mimeType: "image/jpeg" } };
-    const pdf: ExtractInput = { now: NOW, media: { data: new Uint8Array([0x25, 0x50]), mimeType: "application/pdf" } };
+    const pdfBytes = new TextEncoder().encode("%PDF-1.4 1 0 obj <</Type /Pages /Count 2>> 2 0 obj <</Type /Page>> 3 0 obj <</Type/Page>>");
+    const pdf: ExtractInput = { now: NOW, media: { data: pdfBytes, mimeType: "application/pdf" } };
     const many = Array.from({ length: MAX_PER_CALL + 1 }, (_, i) => text(`wajan ${60 + (i % 5)}`));
-    const out = await cli("ok").extract([photo, pdf, ...many]);
+    const x = cli("ok");
+    const out = await x.extract([photo, pdf, ...many, photo]);
     const c = calls();
-    expect(c).toHaveLength(2);
-    expect(c[0].args).toEqual(expect.arrayContaining(["--input-format", "stream-json", "--output-format", "stream-json"]));
-    const content = JSON.parse(c[0].stdin).message.content;
-    expect(content.map((b: any) => b.type).slice(0, 4)).toEqual(["text", "image", "text", "document"]);
-    expect(content[1].source).toEqual({ type: "base64", media_type: "image/jpeg", data: Buffer.from([0xff, 0xd8, 1]).toString("base64") });
-    expect(c[1].args[c[1].args.indexOf("--output-format") + 1]).toBe("json");
-    expect(out).toHaveLength(MAX_PER_CALL + 3);
+    const model = (k: number) => c[k].args[c[k].args.indexOf("--model") + 1];
+    // 2 text chunks (21 messages), then [photo], [pdf] alone, [photo]
+    expect(c).toHaveLength(5);
+    expect([model(0), model(1)]).toEqual([MODEL, MODEL]);
+    expect([model(2), model(3), model(4)]).toEqual([MEDIA_MODEL, MEDIA_MODEL, MEDIA_MODEL]);
+    expect(MEDIA_MODEL).toBe("claude-sonnet-5-5");
+    expect(c[0].args[c[0].args.indexOf("--output-format") + 1]).toBe("json");
+    expect(c[2].args).toEqual(expect.arrayContaining(["--input-format", "stream-json", "--output-format", "stream-json"]));
+    expect(JSON.parse(c[2].stdin).message.content.map((b: any) => b.type)).toEqual(["text", "image"]);
+    const pdfCall = JSON.parse(c[3].stdin).message.content;
+    expect(pdfCall.map((b: any) => b.type)).toEqual(["text", "document"]);
+    expect(pdfCall[0].text).toMatch(/a PDF of 2 pages; read every page/);
+    expect(JSON.parse(c[2].stdin).message.content[1].source).toEqual({ type: "base64", media_type: "image/jpeg", data: Buffer.from([0xff, 0xd8, 1]).toString("base64") });
+    expect(out).toHaveLength(MAX_PER_CALL + 4);
     expect((out[0] as any).unreadable_reason).toBe("blurred");
     expect(out.every((o) => !(o instanceof Error))).toBe(true);
+    expect(x.modelFor(photo)).toBe(MEDIA_MODEL);
+    expect(x.modelFor(text("a"))).toBe(MODEL);
+    expect(x.usage[MODEL].calls).toBe(2);
+    expect(x.usage[MEDIA_MODEL]).toMatchObject({ calls: 3, inputTokens: 300, outputTokens: 30 });
+    expect(x.usage[MEDIA_MODEL].costUsd).toBeCloseTo(0.03);
+  });
+
+  it("models are configurable (Opus for media); an invalid id falls back to the default", async () => {
+    const photo: ExtractInput = { now: NOW, media: { data: new Uint8Array([1]), mimeType: "image/png" } };
+    const env = { PATH: `${dir}:${process.env.PATH}`, FAKE_CLAUDE_LOG: log, FAKE_CLAUDE_MODE: "ok" };
+    const x = new ClaudeCliExtractor({ env, mediaModel: "claude-opus-5-5", textModel: "rm -rf" });
+    await x.extract([photo, text("a")]);
+    const c = calls();
+    expect(c.map((k) => k.args[k.args.indexOf("--model") + 1])).toEqual([MODEL, "claude-opus-5-5"]);
+  });
+
+  it("usage guard: photo/PDF calls over maxMediaCalls wait as delayed (transient), text still runs", async () => {
+    const photo: ExtractInput = { now: NOW, media: { data: new Uint8Array([1]), mimeType: "application/pdf" } };
+    const env = { PATH: `${dir}:${process.env.PATH}`, FAKE_CLAUDE_LOG: log, FAKE_CLAUDE_MODE: "ok" };
+    const out = await new ClaudeCliExtractor({ env, maxMediaCalls: 1 }).extract([photo, photo, text("a")]);
+    expect(calls()).toHaveLength(2);
+    expect(out[0]).not.toBeInstanceOf(Error);
+    expect(out[1]).toBeInstanceOf(ClaudeCliError);
+    expect((out[1] as ClaudeCliError).status).toBe(0); // transient: inbox row stays new, retried next run
+    expect(out[2]).not.toBeInstanceOf(Error);
   });
 
   it("auth failure: no retry, every message gets a transient 401, later chunks are not attempted", async () => {

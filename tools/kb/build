@@ -37,7 +37,7 @@ LINKS = {"source": {"duplicate_of": "source", "org_id": "ref:party", "practition
          "ref": {"supersedes": "ref"}}
 
 # ---- Telegram (D1 export) -> source + fact ---------------------------------------------------------------------
-D1_TABLES = {"persons", "chats", "messages", "readings", "symptoms", "alerts", "context"}  # context: ADR 010, batch-only
+D1_TABLES = {"persons", "chats", "messages", "readings", "report_items", "symptoms", "alerts", "context"}  # context (ADR 010), report_items: batch-only
 D1_PERSON = {}  # D1 person id -> KB ns (same id otherwise); records.yaml d1_person_map
 # reading type -> (code local, category, canonical unit)
 D1_READING = {
@@ -46,6 +46,14 @@ D1_READING = {
     "creatinine": ("creatinine", "lab", "mg/dL"), "glucose_fasting": ("glucose-fasting", "lab", "mg/dL"),
     "glucose_pp": ("glucose-pp", "lab", "mg/dL"), "glucose_random": ("glucose-random", "lab", "mg/dL"),
 }
+# Generic codes for report rows with no matching ref:code (product built-ins, added to the KB only when used; a records
+# ref with the same id wins). The printed name is kept in data.name_raw.
+GENERIC_CODES = {
+    "lab-unmapped": ("Lab result, name as printed (not yet mapped to a code)", "lab"),
+    "report-findings": ("Report findings, verbatim as printed", "imaging"),
+    "report-impression": ("Report impression / conclusion, verbatim as printed", "imaging"),
+}
+MONOVALENT = {"potassium", "sodium", "chloride", "bicarbonate"}  # mmol/L == mEq/L
 SYMPTOM_DETAIL = ["location", "side", "character", "severity", "duration_min", "at_rest", "associated", "triggers"]
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
@@ -69,14 +77,87 @@ def _jl(v):
         return v
 
 
+def _norm(s):
+    return re.sub(r"[^a-z0-9%]+", " ", str(s).lower().replace("µ", "u").replace("μ", "u")).strip()
+
+
+def _unit(u):
+    return re.sub(r"\s+", "", str(u or "").lower().replace("µ", "u").replace("μ", "u"))
+
+
+def code_index(refs):
+    """Active ref:code rows -> {normalised id/name/alias: (local, data)} for matching printed test names."""
+    idx = {}
+    for r in refs:
+        if r.get("kind") != "code" or r.get("status") != "active" or not str(r.get("id", "")).startswith("ref:code:"):
+            continue
+        local, name, data = r["id"][9:], r.get("name") or "", r.get("data") or {}
+        keys = {_norm(local), _norm(name)} | {_norm(p) for p in re.split(r"[(),/]", name) if len(_norm(p)) > 1}
+        for k in keys:
+            idx.setdefault(k, (local, data))
+    return idx
+
+
+def _match_code(name, unit, value, codes):
+    """(local, canonical unit) of the ref:code for a printed result, or None. Only when the printed unit is the code's
+    canonical unit and the value is inside its plausible range: anything else stays unmapped (never a wrong code)."""
+    n = _norm(name)
+    for k in (n, re.sub(r"^(serum|s|plasma|blood|whole blood) ", "", n)):
+        hit = codes.get(k)
+        if not hit:
+            continue
+        local, data = hit
+        cu = data.get("unit")
+        if value is not None:
+            if not cu or (_unit(unit) != _unit(cu) and not (local in MONOVALENT and {_unit(unit), _unit(cu)} <= {"mmol/l", "meq/l"})):
+                return None
+            lo, hi = data.get("plausible_min"), data.get("plausible_max")
+            if (lo is not None and value < lo) or (hi is not None and value > hi):
+                return None
+        return local, cu
+    return None
+
+
+def _ref_range(t):
+    """Printed range -> (low, high) for the simple forms "3.5 - 5.1", "< 200", "> 60"; else (None, None)."""
+    t = str(t or "").replace(",", "")
+    m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*(?:-|–|to)\s*(-?\d+(?:\.\d+)?)\s*[^\d]*", t)
+    if m:
+        return float(m[1]), float(m[2])
+    m = re.fullmatch(r"\s*(<|<=|≤|up to|upto)\s*(\d+(?:\.\d+)?)\s*[^\d]*", t, re.I)
+    if m:
+        return None, float(m[2])
+    m = re.fullmatch(r"\s*(>|>=|≥)\s*(\d+(?:\.\d+)?)\s*[^\d]*", t)
+    if m:
+        return float(m[2]), None
+    return None, None
+
+
+def _report_at(r, msg):
+    """Fact time for a report row: sample time, else report time, else the message time (tagged)."""
+    for k in ("sample_at", "reported_at"):
+        v = r.get(k)
+        if isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            return v, "day", v + "T12:00:00+05:30", k
+        if isinstance(v, str) and v:
+            try:
+                return ist(v)[:16] + "+05:30", "minute", v, k
+            except ValueError:
+                pass
+    t = (msg or {}).get("received_at") or r.get("extracted_at")
+    return ist(t)[:16] + "+05:30", "minute", t, "received"
+
+
 def _envelope(row, msg, quote, ns, src_id):
     # confirmed: 1 = patient confirmed, -1 = rejected, 0 = not confirmed (ADR 005 has no confirm step: always 0 now).
     confirmed = row.get("confirmed", 0)
     conf = row.get("confidence")
     # subject-hint: the message seems to be about another member; the fact stays with the sender until a human decides.
     tags = (["low-confidence"] if conf is not None and conf < 0.8 else []) + (["subject-hint"] if (msg or {}).get("subject_hint") else [])
-    if _reporter(msg):
-        tags.append("family-reported")  # sent by another member for this subject
+    if (msg or {}).get("kind") in ("image", "document") and row.get("type") is not None:
+        tags.append("document")  # read from a photo/PDF (device screen, report): not a typed or spoken claim
+    elif _reporter(msg):
+        tags.append("family-reported")  # typed/spoken by another member for this subject
     return {
         "ns": ns, "source_id": src_id, "quote": quote[:200] if quote else None,
         "recorded_by": row.get("extracted_by") or (msg or {}).get("extracted_by") or "telegram-bot",
@@ -95,9 +176,10 @@ def _reporter(msg):
     return D1_PERSON.get(sender, sender)
 
 
-def telegram_records(rows, root):
-    """rows: [(where, d1_table, d1_row)] -> ([(where, rt, kb_row)], errors)."""
-    out, errors = [], []
+def telegram_records(rows, root, codes=None):
+    """rows: [(where, d1_table, d1_row)] -> ([(where, rt, kb_row)], errors). codes: code_index() of the records refs."""
+    codes = codes or {}
+    out, errors, dups, generic = [], [], [], set()
     msgs = {r["id"]: r for _, t, r in rows if t == "messages" and "id" in r}
     media = {f"telegram/{f.stem}": str(f.relative_to(root)) for f in root.glob("sources/*/media/telegram/*")}
     src_ids = {}
@@ -115,6 +197,14 @@ def telegram_records(rows, root):
                          r.get("subject_hint") and f"subject_hint: {r['subject_hint'][:80]} (attributed to the sender; human review)",
                          _reporter(r) and f"reported by {_reporter(r)} for {ns}"
                          + (f" (subject set by {r['subject_set_by']})" if r.get("subject_set_by") else "")]
+                rep = ex.get("report") if isinstance(ex, dict) and isinstance(ex.get("report"), dict) else None
+                if rep:
+                    parts.append("; ".join(f"{k}: {v}" for k, v in (
+                        ("report", rep.get("report_type")), ("facility", rep.get("facility")),
+                        ("doctors", ", ".join(d for d in rep.get("doctors") or [] if isinstance(d, str)) or None),
+                        ("sample_at", rep.get("sample_at")), ("reported_at", rep.get("reported_at"))) if v))
+                if r.get("extraction_status") == "duplicate" and r.get("duplicate_of"):
+                    parts.append(f"same file as message {r['duplicate_of']}; recorded once")
                 sid = src_ids[r["id"]] = f"{ns}:src:{tg_local(r['received_at'], r['id'])}"
                 out.append((where, "source", {
                     "id": sid, "ns": ns, "kind": "telegram_msg", "path": media.get(r.get("media_ref") or ""),
@@ -124,9 +214,12 @@ def telegram_records(rows, root):
                     "recorded_by": r.get("extracted_by") or "telegram-bot",
                     "created_at": r.get("extracted_at") or r["received_at"], "status": "active",
                     "tags": (["subject-hint"] if r.get("subject_hint") else [])
-                            + (["non-health"] if r.get("image_class") == "non-health" else []),
+                            + (["non-health"] if r.get("image_class") == "non-health" else [])
+                            + (["duplicate"] if r.get("extraction_status") == "duplicate" else []),
                     "note": "; ".join(x for x in parts if x),
                 }))
+                if r.get("extraction_status") == "duplicate" and r.get("duplicate_of"):
+                    dups.append((out[-1][2], r["duplicate_of"]))
         except KeyError as e:
             errors.append(f"{where}: d1.{t} row missing {e}")
     for where, t, r in rows:
@@ -148,6 +241,56 @@ def telegram_records(rows, root):
                     "created_at": r.get("extracted_at") or (msg or {}).get("received_at") or r["start"]}))
             except KeyError as e:
                 errors.append(f"{where}: d1.context row missing {e}")
+            continue
+        if t == "report_items":  # a report's printed values / findings / impression -> observation facts (document)
+            try:
+                ns = D1_PERSON.get(r["person_id"], r["person_id"])
+                msg = msgs.get(r["source_message_id"])
+                sid = src_ids.get(r["source_message_id"], f"{ns}:src:missing-tg.{r['source_message_id']}")
+                at, prec, id_ts, basis = _report_at(r, msg)
+                sec, name = r.get("section") or "result", r["name"]
+                vnum, vtext = r.get("value_num"), r.get("value_text")
+                if vnum is None and not vtext:
+                    continue
+                imaging = r.get("report_type") == "imaging"
+                if sec == "result":
+                    hit = _match_code(name, r.get("unit"), vnum, codes)
+                    local, unit = hit if hit else ("lab-unmapped", None)
+                    cat = (codes.get(_norm(local)) or (None, {}))[1].get("category") or "lab"
+                else:
+                    local, unit, cat = f"report-{sec}", None, "imaging" if imaging else "exam"
+                if local in GENERIC_CODES and _norm(local) not in codes:
+                    generic.add(local)
+                data = {"code": f"ref:code:{local}", "category": cat, "name_raw": name[:200], "panel": r.get("panel")}
+                if vnum is not None:
+                    data["value_num"] = vnum
+                    if vtext:
+                        data["value_raw"] = str(vtext)[:200]
+                else:
+                    data["value_text"] = vtext
+                if r.get("unit"):
+                    data["unit"] = unit or r["unit"]
+                    data["unit_raw"] = r["unit"]
+                if r.get("ref_range"):
+                    data["ref_text"] = r["ref_range"]
+                    lo, hi = _ref_range(r["ref_range"])
+                    data["ref_low"], data["ref_high"] = lo, hi
+                if r.get("flag") in ("H", "L", "N"):
+                    data["flag"], data["flag_basis"] = r["flag"], "printed"
+                if sec == "result":
+                    v = vtext if vnum is None else (f"{vnum:g}" if isinstance(vnum, (int, float)) else str(vnum))
+                    quote = f"{name}: {v} {r.get('unit') or ''}".strip() + (f" (ref {r['ref_range']})" if r.get("ref_range") else "")
+                else:
+                    quote = vtext
+                env = _envelope(r, msg, quote, ns, sid)
+                doctors = _jl(r.get("doctors")) or []
+                env["tags"] = [x for x in env["tags"] if x != "family-reported"] + ["document"] \
+                    + (["doctor-written"] if sec != "result" and doctors else []) \
+                    + ([] if basis == "sample_at" else [f"at-{basis.replace('_at', '')}-time"])
+                out.append((where, "fact", {"id": f"{ns}:fact:{tg_local(id_ts, r['id'])}", "kind": "observation", "at": at,
+                                            "at_precision": prec, "data": data, **env}))
+            except (KeyError, ValueError) as e:
+                errors.append(f"{where}: d1.report_items row: {e}")
             continue
         if t not in ("readings", "symptoms"):
             continue
@@ -189,6 +332,14 @@ def telegram_records(rows, root):
                                                          "components": detail}, **env}))
         except KeyError as e:
             errors.append(f"{where}: d1.{t} row missing {e} (or unknown reading type)")
+    for src, first in dups:  # one source per file: the duplicate points at the first message's source
+        if first in src_ids:
+            src["duplicate_of"], src["rank"] = src_ids[first], "copy"
+    for local in sorted(generic):
+        name, cat = GENERIC_CODES[local]
+        out.append(("product built-in", "ref", {"id": f"ref:code:{local}", "ns": "ref", "kind": "code", "name": name,
+                                                "data": {"category": cat}, "recorded_by": "product", "created_at": "2026-10-31",
+                                                "status": "active", "tags": ["built-in"]}))
     clean = lambda d: {k: (clean(v) if k == "data" else v) for k, v in d.items() if v is not None}
     return [(w, t, clean(r)) for w, t, r in out], errors
 
@@ -351,7 +502,7 @@ def main(argv):
                 errors.append(f"{where}: {t} has unknown keys {sorted(extra)}"); continue
             records[t].append((where, f, r))
 
-    mapped, tg_errors = telegram_records(tg_rows, root)
+    mapped, tg_errors = telegram_records(tg_rows, root, code_index(r for _, _, r in records["ref"]))
     errors += tg_errors
     for where, t, r in mapped:
         records[t].append((where, tg_dir, r))

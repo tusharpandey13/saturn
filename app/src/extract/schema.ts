@@ -7,6 +7,7 @@ import { MEDIA_KINDS, SIDES, SYMPTOM_TYPES } from "../types.js";
 import type { MediaKind, Reading, ReadingType, Side, Symptom, SymptomType } from "../types.js";
 import { ContextItem } from "./context.js";
 
+export const REPORT_TYPES = ["lab", "imaging", "discharge", "other"] as const;
 const READING_TYPES = [
   "weight", "bp", "pulse", "spo2", "potassium", "sodium", "creatinine", "glucose_fasting", "glucose_pp", "glucose_random",
 ] as const satisfies readonly ReadingType[];
@@ -45,6 +46,24 @@ export const ExtractionOutput = z.strictObject({
     "only when the message is clearly about someone other than the sender (e.g. \"Maa's BP 120/80\" sent by her son): who, as written; else null",
   ),
   context: z.array(ContextItem).describe("life-context signals (ADR 010); [] unless the message header says context: yes"),
+  report: z.strictObject({
+    report_type: z.enum(REPORT_TYPES).describe("lab = lab/pathology values; imaging = MRI/CT/X-ray/USG/echo/ECG report; discharge; other"),
+    sample_at: z.string().nullable().describe("sample COLLECTION / registration date-time as printed (ISO-8601 local, date only if no time printed); never the report/print time. null if not printed"),
+    reported_at: z.string().nullable().describe("report / authorised date-time as printed (ISO-8601 local), else null"),
+    facility: z.string().nullable().describe("lab, hospital or centre name as printed"),
+    doctors: strs("doctor names as printed, with role if printed (e.g. \"Dr A B, MD Pathology (signed)\", \"Ref: Dr C D\")"),
+    items: z.array(z.strictObject({
+      name: str("test/parameter name exactly as printed"),
+      value_num: z.number().nullable().describe("numeric result as printed; null for a text result"),
+      value_text: z.string().nullable().describe("text result as printed (e.g. Negative, Reactive, '<0.5'), else null"),
+      unit: z.string().nullable().describe("unit as printed"),
+      ref_range: z.string().nullable().describe("reference / biological interval exactly as printed, else null"),
+      flag: z.string().nullable().describe("H, L or N only if printed (or the value is printed in bold/marked high/low), else null"),
+      panel: z.string().nullable().describe("panel / section heading as printed (e.g. Lipid profile), else null"),
+    })).describe("EVERY result on EVERY page, in page order; nothing skipped"),
+    findings: z.string().nullable().describe("imaging/narrative report: the findings text verbatim; else null"),
+    impression: z.string().nullable().describe("imaging/narrative report: the impression / conclusion / opinion verbatim; else null"),
+  }).nullable().describe("for a report document/photo (media_kind report): everything printed; null otherwise"),
 });
 
 /** JSON Schema for structured output (`claude --json-schema`), generated from the Zod contract. */
@@ -84,6 +103,31 @@ export interface Extraction {
   rejected: string[];
   /** Well-formed readings outside the plausible range (misread, or a real extreme). */
   outOfRange: { type: ReadingType; value: number }[];
+  /** A report document/photo: every printed value, ranges, flags, sample time, facility, doctors, findings, impression.
+   *  Stored as d1.report_items (the facts); its K/Na/creatinine/glucose also feed the rules as `reportReadings`. */
+  report?: Report | null;
+  /** Rule-engine/digest view of report values with a reading type (not stored as d1.readings: the items are the facts). */
+  reportReadings?: Reading[];
+}
+
+export interface ReportItem {
+  name: string;
+  valueNum: number | null;
+  valueText: string | null;
+  unit: string | null;
+  refRange: string | null;
+  flag: "H" | "L" | "N" | null;
+  panel: string | null;
+  section: "result" | "findings" | "impression";
+}
+export interface Report {
+  type: (typeof REPORT_TYPES)[number];
+  /** Sample collection time (ISO, +05:30 when naive) or date (YYYY-MM-DD); null when not printed. */
+  sampleAt: string | null;
+  reportedAt: string | null;
+  facility: string | null;
+  doctors: string[];
+  items: ReportItem[];
 }
 
 const HAS_OFFSET = /([zZ]|[+-]\d{2}:?\d{2})$/;
@@ -178,6 +222,64 @@ function parseSymptom(s: any, now: string, rejected: string[]): Symptom | null {
   };
 }
 
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_REPORT_PAST_MS = 60 * 365 * 86_400_000;
+/** A printed report date/time: ISO date-time (naive = IST) or a date; not in the future (1 day grace); else null. */
+export function normaliseReportAt(v: unknown, now: string): string | null {
+  if (typeof v !== "string" || !v.trim()) return null;
+  const s = v.trim();
+  const n = Date.parse(now);
+  if (DATE_ONLY.test(s)) {
+    const t = Date.parse(`${s}T00:00:00+05:30`);
+    return Number.isNaN(t) || t > n + 86_400_000 || t < n - MAX_REPORT_PAST_MS ? null : s;
+  }
+  const iso = HAS_OFFSET.test(s) ? s : `${s}+05:30`;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) || t > n + 86_400_000 || t < n - MAX_REPORT_PAST_MS ? null : iso;
+}
+
+const nstr = (v: unknown, max = 4000) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+const FLAG: Record<string, "H" | "L" | "N"> = { h: "H", high: "H", l: "L", low: "L", n: "N", normal: "N" };
+/** Report values that are also reading types (rules + digest). Name as printed -> type; units must be canonical. */
+const REPORT_READING: [RegExp, ReadingType, RegExp][] = [
+  [/^(serum |s\.? ?)?potassium( \(k\+?\))?$|^k\+?$/i, "potassium", /^mmol\/l$|^meq\/l$/i],
+  [/^(serum |s\.? ?)?sodium( \(na\+?\))?$|^na\+?$/i, "sodium", /^mmol\/l$|^meq\/l$/i],
+  [/^(serum |s\.? ?)?creatinine$/i, "creatinine", /^mg\/dl$/i],
+  [/^(plasma |blood )?glucose,? ?(\(?fasting\)?|f)$|^fasting (plasma |blood )?(glucose|sugar)$|^fbs$/i, "glucose_fasting", /^mg\/dl$/i],
+];
+
+function parseReport(r: any, now: string): { report: Report | null; readings: Reading[] } {
+  if (!r || typeof r !== "object") return { report: null, readings: [] };
+  const item = (x: any, section: ReportItem["section"]): ReportItem | null => {
+    const name = nstr(x?.name, 200);
+    const valueNum = isNum(x?.value_num) ? x.value_num : null;
+    const valueText = nstr(x?.value_text, 500);
+    if (!name || (valueNum === null && valueText === null)) return null;
+    return { name, valueNum, valueText, unit: nstr(x?.unit, 40), refRange: nstr(x?.ref_range, 200), flag: FLAG[String(x?.flag ?? "").trim().toLowerCase()] ?? null, panel: nstr(x?.panel, 120), section };
+  };
+  const items = (Array.isArray(r.items) ? r.items : []).map((x: any) => item(x, "result")).filter(Boolean) as ReportItem[];
+  for (const k of ["findings", "impression"] as const) {
+    const t = nstr(r[k], 8000);
+    if (t) items.push({ name: k, valueNum: null, valueText: t, unit: null, refRange: null, flag: null, panel: null, section: k });
+  }
+  const sampleAt = normaliseReportAt(r.sample_at, now);
+  const report: Report = {
+    type: (REPORT_TYPES as readonly string[]).includes(r.report_type) ? r.report_type : "other",
+    sampleAt, reportedAt: normaliseReportAt(r.reported_at, now), facility: nstr(r.facility, 200), doctors: strArr(r.doctors).map((d) => d.trim().slice(0, 200)).filter(Boolean).slice(0, 10), items,
+  };
+  if (!items.length && !report.facility && !report.sampleAt) return { report: null, readings: [] };
+  const at = report.sampleAt ?? report.reportedAt;
+  const measuredAt = at && !DATE_ONLY.test(at) ? normaliseMeasuredAt(at, now) : now;
+  const readings: Reading[] = [];
+  for (const it of items) {
+    if (it.valueNum === null) continue;
+    const hit = REPORT_READING.find(([re, , unit]) => re.test(it.name.trim()) && unit.test((it.unit ?? "").replace(/\s/g, "")));
+    if (hit && inRange(it.valueNum, PLAUSIBLE[hit[1]]) && !readings.some((x) => x.type === hit[1]))
+      readings.push({ type: hit[1], value: it.valueNum, value2: null, value3: null, unit: it.unit!, measuredAt });
+  }
+  return { report, readings };
+}
+
 /** Validate untrusted LLM output. Accepts an object or a JSON string. Never throws. */
 export function parseExtraction(raw: unknown, now: string): Extraction {
   const rejected: string[] = [];
@@ -202,5 +304,6 @@ export function parseExtraction(raw: unknown, now: string): Extraction {
   }
   const hint = typeof obj.subject_hint === "string" ? obj.subject_hint.trim().slice(0, 80) : "";
   const subjectHint = hint && !/^(null|none|self|sender)$/i.test(hint) ? hint : null;
-  return { readings, symptoms, confidence, mediaKind, unreadableReason, subjectHint, rejected, outOfRange };
+  const { report, readings: reportReadings } = parseReport(obj.report, now);
+  return { readings, symptoms, confidence, mediaKind, unreadableReason, subjectHint, rejected, outOfRange, report, reportReadings };
 }

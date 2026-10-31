@@ -7,6 +7,10 @@
    "type": "string",
    "x-ref": "code"
   },
+  "name_raw": {
+   "type": "string",
+   "description": "test/parameter name as printed (report rows); the code may be generic"
+  },
   "category": {
    "enum": [
     "lab",

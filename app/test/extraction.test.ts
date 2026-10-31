@@ -76,3 +76,20 @@ describe("parseExtraction", () => {
     walk(EXTRACTION_SCHEMA);
   });
 });
+
+describe("report dates", () => {
+  it("keeps an old printed sample date (no 30-day clamp), rejects future and garbage", async () => {
+    const { normaliseReportAt } = await import("../src/extract/schema.js");
+    expect(normaliseReportAt("2025-01-05T08:15:00", NOW)).toBe("2025-01-05T08:15:00+05:30");
+    expect(normaliseReportAt("2025-01-05", NOW)).toBe("2025-01-05");
+    expect(normaliseReportAt("2027-01-05", NOW)).toBeNull();
+    expect(normaliseReportAt("05/01/2025", NOW)).toBeNull();
+    expect(normaliseReportAt(null, NOW)).toBeNull();
+  });
+
+  it("schema asks for the full report: items with ranges and flags, sample time, facility, doctors, findings, impression", () => {
+    const r = (EXTRACTION_SCHEMA.properties.report as any).anyOf.find((x: any) => x.type === "object");
+    expect(Object.keys(r.properties)).toEqual(["report_type", "sample_at", "reported_at", "facility", "doctors", "items", "findings", "impression"]);
+    expect(Object.keys(r.properties.items.items.properties)).toEqual(["name", "value_num", "value_text", "unit", "ref_range", "flag", "panel"]);
+  });
+});

@@ -1,12 +1,13 @@
 // Daily batch (ADR 005), three idempotent steps. The workflow commits between them:
 //   pull     D1 inbox (status new) + media (R2, or Telegram by file_id) -> data/telegram/raw/ + sources/   [commit]
-//   extract  raw rows not yet extracted -> STT (optional) / vitals parser / Haiku via claude -p -> data/telegram/*.ndjson,
+//   extract  raw rows not yet extracted -> STT (optional) / vitals parser / claude -p (Haiku text, Sonnet photo/PDF) -> data/telegram/*.ndjson,
 //            needs_deep queue, digest text + ops lines                                                   [build, commit]
 //   finish   mark the committed and processed inbox rows done, DM the digest and ops lines to the admins, prune
 // The bot never posts to a group chat (ADR 011): groups are input-only; the admins are the only output channel.
 // Re-running any step on the same input is safe: raw rows are keyed by update_id, extracted rows by message id
 // (chat:message), the queue by message id, and inbox updates only touch rows still 'new'.
 
+import { createHash } from "node:crypto";
 import { PRODUCT_NAME } from "../product.js";
 import { parseUpdate, type ParsedMessage, type TelegramAdapter } from "../channel/telegram.js";
 import type { ThresholdsConfig } from "../config/thresholds.js";
@@ -212,6 +213,8 @@ type Base = {
   subject_hint: string | null;
   /** Life context (ADR 010): extracted (read with context: yes) | skipped_cap | private; absent = not read. */
   context_status?: string;
+  /** extraction_status duplicate: the message key whose identical file (same bytes, same subject) was recorded. */
+  duplicate_of?: string;
 };
 interface Item {
   raw: RawRow;
@@ -247,6 +250,23 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   let contextLeft = Math.max(0, (d.contextDailyCap ?? CONTEXT_DAILY_CAP) - history.filter((r) => r.rt === "d1.messages" && r.context_status === "extracted"
     && !todoKeys.has(r.id as string) && dayOf(String(r.extracted_at)) === today).length);
   const ctx = { read: 0, signals: 0, dropped: 0, skippedCap: 0 };
+  // Identical media (same bytes, e.g. the same photo sent twice or forwarded) is recorded once per subject:
+  // index the files of messages already recorded, then each new file in update order.
+  const sha = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
+  const seenMedia = new Map<string, string>(); // `${subject}|${sha256}` -> message key
+  const recorded = new Map(history.filter((r) => r.rt === "d1.messages").map((r) => [r.id as string, r]));
+  for (const raw of d.repo.rawRows()) {
+    if (!raw.media_path) continue;
+    const ev = parseUpdate(raw.update);
+    const prev = ev?.type === "message" ? recorded.get(ev.msg.key) : undefined;
+    if (!prev || todoKeys.has(prev.id as string) || ["duplicate", "failed", "skipped", "private"].includes(String(prev.extraction_status))) continue;
+    try {
+      const k = `${prev.person_id}|${sha(d.repo.readMedia(raw.media_path))}`;
+      if (!seenMedia.has(k)) seenMedia.set(k, prev.id as string);
+    } catch {
+      /* file gone: nothing to match */
+    }
+  }
 
   // 1. Per message: skip/park what cannot be read, transcribe voice, take vitals-only texts from the deterministic parser.
   const nameOf = (id: string) => d.persons.get(id)?.name ?? displayOf(id, aliases) ?? id;
@@ -287,6 +307,20 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     try {
       let transcript: Transcript | null = null;
       const media = raw.media_path ? { data: d.repo.readMedia(raw.media_path), mimeType: raw.media_mime ?? MIME_OF_EXT[raw.media_path.split(".").pop()!] ?? "application/octet-stream" } : undefined;
+      if (media && (msg.kind === "image" || msg.kind === "document")) {
+        const k = `${subject.id}|${sha(media.data)}`;
+        const first = seenMedia.get(k);
+        if (first && first !== msg.key) {
+          // Same file already recorded for this subject: one source, no second set of facts, no second deep read.
+          out.push({ ...base, extraction_status: "duplicate", duplicate_of: first, note: `same file as message ${first}; recorded once` });
+          replaced.add(msg.key);
+          entry.pending!.push("same file as an earlier message; recorded once");
+          entries.push(entry);
+          items.pop();
+          continue;
+        }
+        seenMedia.set(k, msg.key);
+      }
       if (msg.kind === "audio" && media) {
         if (!d.stt) {
           // Stored (raw + media are in git); transcribed by the first run that has an STT key.
@@ -339,7 +373,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     }
     it.base.extraction_json = typeof r === "string" ? r : JSON.stringify(r);
     it.ex = parseExtraction(r, it.msg.ts);
-    it.extractedBy = d.extractor.model ?? "llm";
+    it.extractedBy = d.extractor.modelFor?.(it.input!) ?? d.extractor.model ?? "llm";
     if (it.input!.context) {
       // Context never touches the health result above; anything the minimisation checks reject is dropped, not trimmed.
       const c = parseContext(r, { text: it.input!.text ?? "", ts: it.msg.ts, sender: it.raw.person_id, aliases, personIds: [...d.persons.keys()], consented: (p) => consented.has(p) });
@@ -378,8 +412,13 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     ctx.signals += context?.length ?? 0;
     if (mode === "shadow" && context?.length)
       entry.context = context.map((c) => `${nameOf(c.subject)}: ${c.category.replace(/_/g, " ")}${c.intensity ? `, ${c.intensity}` : ""}: ${c.summary}${c.confidence === "low" ? " (low confidence)" : ""}`);
-    entry.readings = ex.readings;
+    entry.readings = [...ex.readings, ...(ex.reportReadings ?? [])];
     entry.symptoms = ex.symptoms;
+    if (ex.report) {
+      const n = ex.report.items.filter((i) => i.section === "result").length;
+      const text = ex.report.items.filter((i) => i.section !== "result").map((i) => i.section);
+      entry.notes = [`${ex.report.type} report: ${n} value(s)${text.length ? ` + ${text.join(" and ")}` : ""} recorded${ex.report.sampleAt ? ` (sample ${ex.report.sampleAt.slice(0, 10)})` : " (no sample date printed)"}`];
+    }
 
     // Questions for the admin and work for the offline Opus agent (needs_deep). Never ask anyone to retype values.
     const reasons: string[] = [];
@@ -422,8 +461,8 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       .filter((r) => r.rt === "d1.readings" && r.type === "weight" && r.person_id === subject.id && r.source_message_id !== msg.key && r.confirmed !== -1)
       .map((r) => ({ type: "weight", value: r.value, value2: null, value3: null, unit: "kg", measuredAt: r.measured_at }) as Reading)
       .filter((r) => Date.parse(r.measuredAt) >= Date.parse(msg.ts) - 8 * DAY);
-    entry.annotations = evaluate({ readings: ex.readings, symptoms: ex.symptoms, weightHistory: weights, thresholds: d.thresholds, timeZone: tz });
-    if (ex.readings.length || ex.symptoms.length || entry.questions.length || entry.deep || entry.context?.length) entries.push(entry);
+    entry.annotations = evaluate({ readings: [...ex.readings, ...(ex.reportReadings ?? [])], symptoms: ex.symptoms, weightHistory: weights, thresholds: d.thresholds, timeZone: tz });
+    if (entry.readings.length || ex.symptoms.length || entry.questions.length || entry.deep || entry.context?.length || entry.notes?.length) entries.push(entry);
   }
 
   const changed = out.length ? d.repo.writeKb(out, replaced) : [];
@@ -472,6 +511,13 @@ function recordRows(messageId: string, personId: string, ex: Extraction, by: str
     ...ex.readings.map((r, i) => ({
       rt: "d1.readings", id: `${messageId}:r${i}`, type: r.type, value: r.value, value2: r.value2, value3: r.value3, unit: r.unit,
       measured_at: r.measuredAt, source_value: r.sourceValue ?? null, source_unit: r.sourceUnit ?? null, ...common,
+    })),
+    // A report's printed values, ranges, flags, findings and impression (tools/kb/build -> observation facts at the
+    // sample time, tagged document). Report meta (facility, doctors, dates) also stays in the message's extraction_json.
+    ...(ex.report?.items ?? []).map((it, i) => ({
+      rt: "d1.report_items", id: `${messageId}:i${i}`, section: it.section, name: it.name, value_num: it.valueNum, value_text: it.valueText,
+      unit: it.unit, ref_range: it.refRange, flag: it.flag, panel: it.panel, report_type: ex.report!.type, sample_at: ex.report!.sampleAt,
+      reported_at: ex.report!.reportedAt, facility: ex.report!.facility, doctors: json(ex.report!.doctors), ...common,
     })),
     ...ex.symptoms.map((s: Symptom, i) => ({
       rt: "d1.symptoms", id: `${messageId}:s${i}`, symptom_type: s.symptomType, location: s.location, side: s.side,

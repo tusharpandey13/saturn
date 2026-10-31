@@ -257,6 +257,74 @@ class ContextTest(unittest.TestCase):
         ])
 
 
+class ReportTest(unittest.TestCase):
+    """d1.report_items -> observation facts at the sample time; photo/PDF provenance = document; duplicate files."""
+
+    def test_report_items_provenance_and_duplicates(self):
+        T = "2026-10-30T15:30:00.000Z"
+        base = {"rt": "d1.messages", "person_id": "alice", "sender_person_id": "carol-tg", "chat_id": "-100",
+                "received_at": "2026-10-30T05:00:00.000Z", "raw_text": None, "extraction_status": "ok",
+                "extracted_by": "claude-sonnet-5-5", "extracted_at": T}
+        rep = {"report_type": "lab", "facility": "Example Lab", "doctors": ["Dr Example, MD Pathology"],
+               "sample_at": "2026-09-01T08:15:00+05:30", "reported_at": "2026-09-02T18:00:00+05:30", "items": []}
+        common = {"source_message_id": "-100:7", "person_id": "alice", "report_type": "lab", "sample_at": "2026-09-01T08:15:00+05:30",
+                  "reported_at": "2026-09-02T18:00:00+05:30", "facility": "Example Lab", "doctors": "[\"Dr Example\"]",
+                  "confidence": 0.95, "confirmed": 0, "extracted_by": "claude-sonnet-5-5", "extracted_at": T}
+        item = lambda i, **kw: {"rt": "d1.report_items", "id": f"-100:7:i{i}", "unit": None, "ref_range": None, "flag": None,
+                                "panel": None, "value_num": None, "value_text": None, "section": "result", **common, **kw}
+        rows = [
+            {**base, "id": "-100:7", "kind": "document", "media_ref": None, "extraction_json": json.dumps({"media_kind": "report", "report": rep})},
+            item(0, name="Serum Potassium", value_num=5.6, unit="mEq/L", ref_range="3.5 - 5.1", flag="H", panel="Electrolytes"),
+            item(1, name="Synthetic Marker X", value_num=12.5, unit="U/L", ref_range="< 40"),
+            item(2, name="Creatinine", value_num=88, unit="umol/L"),  # not the canonical unit: stays unmapped
+            item(3, name="impression", section="impression", value_text="Synthetic impression text."),
+            {**base, "id": "-100:8", "kind": "image", "media_ref": None, "extraction_json": None},
+            {"rt": "d1.readings", "id": "-100:8:r0", "source_message_id": "-100:8", "person_id": "alice", "type": "bp", "value": 128,
+             "value2": 82, "value3": None, "unit": "mmHg", "measured_at": "2026-10-30T10:00:00+05:30", "confidence": 0.95,
+             "confirmed": 0, "extracted_by": "claude-sonnet-5-5", "extracted_at": T},
+            {**base, "id": "-100:9", "kind": "image", "media_ref": None, "extraction_status": "duplicate", "duplicate_of": "-100:8",
+             "received_at": "2026-10-30T05:05:00.000Z"},
+            {**base, "id": "-100:10", "kind": "text", "raw_text": "synthetic 61 kg", "media_ref": None},
+            {"rt": "d1.readings", "id": "-100:10:r0", "source_message_id": "-100:10", "person_id": "alice", "type": "weight",
+             "value": 61, "value2": None, "value3": None, "unit": "kg", "measured_at": "2026-10-30T10:00:00+05:30",
+             "confidence": 0.95, "confirmed": 0, "extracted_by": "claude-haiku-5-5", "extracted_at": T},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tg = pathlib.Path(tmp) / "telegram"
+            tg.mkdir()
+            (tg / "2026-10.ndjson").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            db = pathlib.Path(tmp) / "kb.sqlite"
+            out = build("--records", str(RECORDS), "--telegram", str(tg), "--db", str(db))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            con = sqlite3.connect(db)
+            q = lambda sql: con.execute(sql).fetchall()
+            facts = {r[0]: (r[1], r[2], json.loads(r[3]), json.loads(r[4]), r[5]) for r in q(
+                "SELECT id, at, at_precision, data, tags, quote FROM fact WHERE id LIKE 'alice:fact:%-tg.-100.%'")}
+            src = dict((r[0], r[1:]) for r in q("SELECT id, rank, duplicate_of, tags, note FROM source WHERE id LIKE 'alice:src:%-tg.-100.%'"))
+            refs = q("SELECT id FROM ref WHERE id IN ('ref:code:lab-unmapped', 'ref:code:report-impression', 'ref:code:report-findings') ORDER BY id")
+            con.close()
+        k = facts["alice:fact:2026-09-01-tg.-100.7.i0"]
+        self.assertEqual(k[:2], ("2026-09-01T08:15+05:30", "minute"))  # the sample time, not the report or message time
+        self.assertEqual(k[2], {"code": "ref:code:potassium", "category": "lab", "name_raw": "Serum Potassium", "panel": "Electrolytes",
+                                "value_num": 5.6, "unit": "mmol/L", "unit_raw": "mEq/L", "ref_text": "3.5 - 5.1", "ref_low": 3.5,
+                                "ref_high": 5.1, "flag": "H", "flag_basis": "printed"})
+        self.assertEqual(k[3], ["document"])  # sent by another member, but read from a document: not family-reported
+        self.assertEqual(k[4], "Serum Potassium: 5.6 mEq/L (ref 3.5 - 5.1)")
+        x = facts["alice:fact:2026-09-01-tg.-100.7.i1"][2]
+        self.assertEqual((x["code"], x["name_raw"], x.get("ref_high"), x.get("ref_low")), ("ref:code:lab-unmapped", "Synthetic Marker X", 40, None))
+        self.assertEqual(facts["alice:fact:2026-09-01-tg.-100.7.i2"][2]["code"], "ref:code:lab-unmapped")
+        imp = facts["alice:fact:2026-09-01-tg.-100.7.i3"]
+        self.assertEqual((imp[2]["code"], imp[2]["value_text"], imp[3]), ("ref:code:report-impression", "Synthetic impression text.", ["document", "doctor-written"]))
+        self.assertEqual(refs, [("ref:code:lab-unmapped",), ("ref:code:report-impression",)])  # built-ins only when used
+        self.assertEqual(facts["alice:fact:2026-10-30-tg.-100.8.r0"][3], ["document"])  # BP monitor photo
+        self.assertEqual(facts["alice:fact:2026-10-30-tg.-100.10.r0"][3], ["family-reported"])  # typed by another member
+        self.assertIn("facility: Example Lab", src["alice:src:2026-10-30-tg.-100.7"][3])
+        self.assertIn("sample_at: 2026-09-01T08:15:00+05:30", src["alice:src:2026-10-30-tg.-100.7"][3])
+        dup = src["alice:src:2026-10-30-tg.-100.9"]
+        self.assertEqual(dup[:3], ("copy", "alice:src:2026-10-30-tg.-100.8", '["duplicate"]'))
+        self.assertFalse(any(".-100.9." in f for f in facts))
+
+
 class ContextValidationTest(unittest.TestCase):
     run_case, append, expect_fail = ValidationTest.run_case, ValidationTest.append, ValidationTest.expect_fail
 

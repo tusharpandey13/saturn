@@ -17,6 +17,8 @@ export interface ExtractInput {
 export interface Extractor {
   /** Recorded as extracted_by on every row this adapter produced. */
   readonly model?: string;
+  /** The model that reads this input, when it depends on the input (text vs photo/PDF); else `model`. */
+  modelFor?(input: ExtractInput): string;
   extract(inputs: ExtractInput[]): Promise<(unknown | Error)[]>;
 }
 
@@ -49,7 +51,14 @@ Rules:
 - Never invent values. If a number is not clearly visible or said, omit the reading. Unknown fields are null.
 - BP monitor photos: value = SYS, value2 = DIA, value3 = PUL. Read labels; do not swap SYS and DIA.
 - Oximeter: SpO2 -> type spo2, PR/pulse -> separate type pulse reading.
-- Lab reports: only potassium (mmol/L), sodium (mmol/L), creatinine (mg/dL; convert from umol/L by dividing by 88.4).
+- Reports (lab report, imaging/scan report such as MRI/CT/X-ray/USG/echo, discharge summary), as PDF or photo: fill \`report\`, readings stays [].
+  Read EVERY page to the end. report.items: EVERY printed result, none skipped, in page order: name exactly as printed,
+  value as printed (value_num for a number, value_text for text such as Negative or "<0.5"), unit as printed, the printed
+  reference range verbatim (ref_range), flag only if printed or the value is marked high/low/bold (H, L, N), panel heading.
+  Do not convert units. Do not compute flags. sample_at = sample COLLECTION / registration date-time as printed (not the
+  report, print or authorisation time; those go in reported_at). facility and doctors (referring, reporting, signing;
+  with role/degree as printed). Imaging and narrative reports: findings and impression copied verbatim, complete.
+  A report with no printed values still gets report_type, dates, facility, doctors, findings and impression.
 - Blood sugar / glucometer (sugar, shugar, khoon mein cheeni), mg/dL: khali pet / fasting -> glucose_fasting; khane ke baad / PP -> glucose_pp; otherwise glucose_random.
 - Classify every photo/PDF FIRST (media_kind), then extract:
   device_reading (BP monitor, oximeter, scale, glucometer), prescription, medicine (strip, box, bottle),
@@ -67,6 +76,7 @@ Rules:
 - subject_hint: only when the message is clearly about someone other than the sender ("Maa ka BP 120/80", "Papa ko chakkar aaya"):
   who it is about, as written ("Maa"). Else null. Still extract the values; a human decides whose they are.
 ${CONTEXT_RULES}
+- report is null unless media_kind is report.
 - Never diagnose, never advise. If a health image is unreadable, set unreadable_reason.`;
 }
 

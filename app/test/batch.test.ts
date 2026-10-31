@@ -545,3 +545,69 @@ describe("life-context signals (ADR 010)", () => {
     kb.close();
   });
 });
+
+describe("photos and PDFs: model per kind, full reports, duplicate files (synthetic)", () => {
+  /** Haiku for text, Sonnet for media (like ClaudeCliExtractor); a PDF answers as a lab report. */
+  class MediaAwareExtractor extends MockExtractor {
+    modelFor(i: ExtractInput) {
+      return i.media ? "claude-sonnet-5-5" : this.model;
+    }
+    override async one(input: ExtractInput): Promise<unknown> {
+      if (input.media?.mimeType !== "application/pdf") return super.one(input);
+      this.calls.push(input);
+      const item = (name: string, value_num: number | null, unit: string | null, ref_range: string | null, flag: string | null = null, value_text: string | null = null) =>
+        ({ name, value_num, value_text, unit, ref_range, flag, panel: null });
+      return {
+        readings: [], symptoms: [], media_kind: "report", confidence: 0.95, unreadable_reason: null, subject_hint: null, context: [],
+        report: {
+          report_type: "lab", sample_at: "2026-09-01T08:15:00", reported_at: "2026-09-02T18:00:00", facility: "Example Lab", doctors: ["Dr Example (signed)"],
+          items: [item("Serum Potassium", 5.6, "mmol/L", "3.5 - 5.1", "H"), item("Sodium", 139, "mmol/L", "135 - 145"), item("Synthetic Marker X", 12.5, "U/L", "< 40"),
+            item("Urine Synthetic", null, null, null, null, "Negative"), item("Bad row", null, null, null)],
+          findings: null, impression: null,
+        },
+      };
+    }
+  }
+
+  it("records every report value at the sample time, tags document, records a duplicate photo once", async () => {
+    const photo = (update_id: number, message_id: number, fid: string) =>
+      ({ update_id, message: { message_id, date: 1792814460 + message_id, chat: { id: Number(GROUP) }, from: { id: 111 }, photo: [{ file_id: fid, file_unique_id: `u-${fid}`, width: 900, height: 1200, file_size: 50000 }] } });
+    const doc = { update_id: 3003, message: { message_id: 43, date: 1792814500, chat: { id: Number(GROUP) }, from: { id: 111 }, document: { file_id: "rep1", file_unique_id: "u-rep1", mime_type: "application/pdf", file_size: 9000, file_name: "report.pdf" } } };
+    // The same BP photo bytes sent twice (re-uploaded: different file ids) -> one set of readings.
+    const { store, r2, t, repo } = await ingestAll([photo(3001, 41, "bp1"), photo(3002, 42, "bp2"), doc], { bp1: JPEG_BP, bp2: JPEG_BP, rep1: new TextEncoder().encode("%PDF-1.4 synthetic") });
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new MediaAwareExtractor();
+    const r = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r.extracted).toBe(3);
+    expect(llm.calls).toHaveLength(2); // the duplicate never reaches the model
+    const rows = ndjson(repo);
+    const msgs = rows.filter((x) => x.rt === "d1.messages");
+    expect(msgs.map((m) => [m.extraction_status, m.extracted_by, m.duplicate_of ?? null])).toEqual([
+      ["ok", "claude-sonnet-5-5", null], ["duplicate", null, `${GROUP}:41`], ["ok", "claude-sonnet-5-5", null],
+    ]);
+    expect(rows.filter((x) => x.rt === "d1.readings")).toHaveLength(1);
+    const items = rows.filter((x) => x.rt === "d1.report_items");
+    expect(items.map((i) => i.name)).toEqual(["Serum Potassium", "Sodium", "Synthetic Marker X", "Urine Synthetic"]); // the empty row is dropped
+    expect(items[0]).toMatchObject({ value_num: 5.6, unit: "mmol/L", ref_range: "3.5 - 5.1", flag: "H", sample_at: "2026-09-01T08:15:00+05:30", facility: "Example Lab", extracted_by: "claude-sonnet-5-5" });
+    expect(r.digest).toMatch(/lab report: 4 value\(s\) recorded \(sample 2026-09-01\)/);
+    expect(r.digest).toMatch(/same file as an earlier message; recorded once/);
+    expect(r.digest).toMatch(/POTASSIUM_RAISED: Potassium 5\.6/); // report K/Na feed the digest and the rules (not stored twice)
+    kbBuild();
+    const db = new DatabaseSync(join(root, "kb.sqlite"));
+    const facts = db.prepare("SELECT id, at, tags, json_extract(data, '$.code') AS code FROM fact ORDER BY id").all() as { id: string; at: string; tags: string; code: string }[];
+    db.close();
+    const rep = facts.filter((f) => f.id.includes(".43.i"));
+    expect(rep.map((f) => [f.code, f.at, JSON.parse(f.tags)])).toEqual([
+      ["ref:code:potassium", "2026-09-01T08:15+05:30", ["document"]], ["ref:code:sodium", "2026-09-01T08:15+05:30", ["document"]],
+      ["ref:code:lab-unmapped", "2026-09-01T08:15+05:30", ["document"]], ["ref:code:lab-unmapped", "2026-09-01T08:15+05:30", ["document"]],
+    ]);
+    expect(facts.filter((f) => f.code === "ref:code:bp")).toHaveLength(1);
+
+    // A later run: the same photo bytes again -> duplicate of the first message (index from git, not memory).
+    const again = await ingestAll([photo(3004, 44, "bp3")], { bp3: JPEG_BP });
+    await pull({ store: again.store, r2: again.r2, tg: again.t.tg, repo });
+    const r2nd = await extract({ repo, extractor: new MediaAwareExtractor(), stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r2nd.extracted).toBe(1);
+    expect(ndjson(repo).find((x) => x.id === `${GROUP}:44`)).toMatchObject({ extraction_status: "duplicate", duplicate_of: `${GROUP}:41` });
+  });
+});

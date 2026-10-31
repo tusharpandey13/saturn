@@ -30,6 +30,8 @@ export interface DigestEntry {
   /** Life-context signals in shadow mode (ADR 010), fixed template "<who>: <category>[, <intensity>]: <summary>".
    *  Admin digest only; never in a view while context_mode is shadow. */
   context?: string[];
+  /** Fixed "what was recorded" lines that are not readings (e.g. "lab report: 24 value(s) recorded (sample ...)"). */
+  notes?: string[];
 }
 
 /** Attribution suffix: who sent it and who it was logged for. */
@@ -68,7 +70,7 @@ export function buildDigest(o: {
   const multi = days.length > 1;
   const time = (iso: string) => (multi ? `${dayFmt(iso)} ${hm(iso)}` : hm(iso));
 
-  const recorded = entries.filter((e) => e.readings.length || e.symptoms.length);
+  const recorded = entries.filter((e) => e.readings.length || e.symptoms.length || e.notes?.length);
   if (!entries.length && !o.pending) out.push("", EMPTY_LINE);
   for (const dy of multi ? days : [null]) {
     const inDay = recorded.filter((e) => dy === null || dayFmt(e.ts) === dy);
@@ -76,7 +78,7 @@ export function buildDigest(o: {
     for (const p of [...new Set(inDay.map((e) => e.person))]) {
       out.push("", p);
       for (const e of inDay.filter((x) => x.person === p))
-        for (const l of [...e.readings.map(readingEn), ...e.symptoms.map(symptomEn)]) out.push(`• ${time(e.ts)} ${l}${e.via ? VIA(e.via, e.person) : ""}`);
+        for (const l of [...(e.notes ?? []), ...e.readings.map(readingEn), ...e.symptoms.map(symptomEn)]) out.push(`• ${time(e.ts)} ${l}${e.via ? VIA(e.via, e.person) : ""}`);
     }
   }
 

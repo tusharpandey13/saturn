@@ -1,6 +1,6 @@
 // Git working-tree layout written by the daily batch (ADR 005). Git is the source of truth.
 //   data/telegram/raw/YYYY-MM.jsonl   raw inbox rows (verbatim Telegram update), one per update_id. Written FIRST.
-//   data/telegram/YYYY-MM.ndjson      extracted rows ("rt": "d1.messages|d1.readings|d1.symptoms|d1.context"), read by
+//   data/telegram/YYYY-MM.ndjson      extracted rows ("rt": "d1.messages|d1.readings|d1.report_items|d1.symptoms|d1.context"), read by
 //                                     tools/kb/build (d1.context: life-context signals, ADR 010; not a D1 table)
 //   data/telegram/directory.ndjson    persons and chats ("rt": "d1.persons|d1.chats")
 //   data/queue/needs_deep.jsonl       work for the offline Opus agent (append-only)
@@ -62,7 +62,7 @@ export interface SubjectOverride {
 
 export type Row = Record<string, unknown> & { rt: string };
 
-const TABLE_ORDER = ["d1.persons", "d1.chats", "d1.messages", "d1.readings", "d1.symptoms", "d1.context"];
+const TABLE_ORDER = ["d1.persons", "d1.chats", "d1.messages", "d1.readings", "d1.report_items", "d1.symptoms", "d1.context"];
 
 /** Asia/Kolkata calendar day (YYYY-MM-DD) of an instant: the digest's "today". */
 export function dayOf(iso: string): string {

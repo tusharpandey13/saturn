@@ -1,9 +1,13 @@
 // LlmAdapter `claude-cli`: the daily-batch extractor (ADR 005) via the Claude Code CLI (auth is an env choice):
-//   claude -p --model claude-haiku-5-5 --tools "" --max-turns 1 --json-schema <BATCH_SCHEMA> --output-format json
+//   claude -p --model <text: claude-haiku-5-5 | photo/PDF: claude-sonnet-5-5> --tools "" --max-turns 1 --json-schema <BATCH_SCHEMA> --output-format json
 // Auth: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`, valid 1 year). Never --bare: bare mode ignores that token.
 // Optional fallback: if ANTHROPIC_API_KEY is set, the CLI itself prefers it over the OAuth token (CLI auth
 // precedence), so the API-key path needs no SDK and no second code path. Off by default.
-// The day's messages go in as few calls as practical (chunks of <= 20 messages, <= 6 MB of base64 media).
+// Model per input kind (env EXTRACT_MODEL_TEXT / EXTRACT_MODEL_MEDIA): text stays on Haiku; photos and PDFs go to a
+// stronger model (Sonnet by default; Opus configurable). Text messages go in chunks of <= 20; a PDF goes alone (every
+// page reaches the model as one document block); photos in chunks of <= 4 (<= 6 MB of base64 per call).
+// Usage guard: at most maxMediaCalls (EXTRACT_MAX_MEDIA_CALLS, default 30) photo/PDF calls per run; the rest wait as
+// delayed (retried next run). Per-model calls, tokens and cost are counted in `usage` (logged as counts only).
 // Photos and PDFs need content blocks, which only `--input-format stream-json` accepts, and the CLI requires
 // `--output-format stream-json` with it; the final `result` event has the same fields as `--output-format json`.
 // The CLI's structured_output is schema-constrained; parseExtraction() still validates and normalises it in code.
@@ -20,6 +24,11 @@ export { type ExtractInput, type Extractor, ExtractorStopError, oneByOne } from 
 /** Full model ID, not the alias, so a new Haiku does not change extraction silently. The CLI version is pinned in
  *  the daily-batch workflow (CLAUDE_CODE_VERSION; Haiku 5.5 needs >= 2.1.293). */
 export const MODEL = "claude-haiku-5-5";
+/** Default for photos and PDFs (reports, prescriptions, device photos): reads every page and value. */
+export const MEDIA_MODEL = "claude-sonnet-5-5";
+export const MAX_MEDIA_CALLS = 30;
+export const MAX_IMAGES_PER_CALL = 4;
+const MODEL_RE = /^claude-[a-z0-9][a-z0-9.-]*$/;
 
 /** Auth (401), rate/usage limit (429), overload/5xx, or the CLI died: retried next run, inbox rows stay new. */
 export class ClaudeCliError extends Error {
@@ -55,14 +64,22 @@ type Block =
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
   | { type: "document"; source: { type: "base64"; media_type: "application/pdf"; data: string } };
 
+/** Page count of a PDF from its page objects (0 when they are compressed away). A hint for the model only. */
+export function pdfPages(data: Uint8Array): number {
+  return (Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("latin1").match(/\/Type\s*\/Page(?![a-zA-Z])/g) ?? []).length;
+}
+
 const b64 = (data: Uint8Array) => Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("base64");
 
 function blocksFor(n: number, { text, media, now, replyTo, context }: ExtractInput): Block[] {
   const ctx = replyTo ? ` It replies to: """${replyTo.slice(0, 500)}""" (context only; extract from the reply itself).` : "";
-  const head: Block = { type: "text", text: `Message ${n}: received at ${now} (Asia/Kolkata context). context: ${context ? "yes" : "no"}.${ctx} ${text ? `Text: """${text}"""` : "No text."}${media ? " Attachment follows." : ""}` };
+  const pdf = media?.mimeType === "application/pdf";
+  const pages = pdf ? pdfPages(media.data) : 0;
+  const att = !media ? "" : pdf ? ` Attachment follows: a PDF${pages ? ` of ${pages} pages` : ""}; read every page.` : " Attachment follows.";
+  const head: Block = { type: "text", text: `Message ${n}: received at ${now} (Asia/Kolkata context). context: ${context ? "yes" : "no"}.${ctx} ${text ? `Text: """${text}"""` : "No text."}${att}` };
   if (!media) return [head];
   const data = b64(media.data);
-  return [head, media.mimeType === "application/pdf" ? { type: "document", source: { type: "base64", media_type: "application/pdf", data } } : { type: "image", source: { type: "base64", media_type: media.mimeType, data } }];
+  return [head, pdf ? { type: "document", source: { type: "base64", media_type: "application/pdf", data } } : { type: "image", source: { type: "base64", media_type: media.mimeType, data } }];
 }
 
 const mediaSize = (i: ExtractInput) => (i.media ? Math.ceil(i.media.data.byteLength / 3) * 4 : 0);
@@ -76,44 +93,87 @@ export interface ClaudeCliOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Who the senders are (records meta/extraction-context.md); see systemPrompt(). */
   context?: string | null;
+  /** Model for text-only messages (default MODEL, Haiku) and for photos/PDFs (default MEDIA_MODEL, Sonnet). */
+  textModel?: string;
+  mediaModel?: string;
+  /** Usage guard: photo/PDF calls per run (default MAX_MEDIA_CALLS); over it, inputs wait as delayed. */
+  maxMediaCalls?: number;
 }
 
+export interface ModelUsage { calls: number; inputTokens: number; outputTokens: number; costUsd: number }
+
+const pickModel = (v: string | undefined, dflt: string) => {
+  const m = v?.trim();
+  if (m && !MODEL_RE.test(m)) console.error(`claude cli: ignoring invalid model id; using ${dflt}`);
+  return m && MODEL_RE.test(m) ? m : dflt;
+};
+
 export class ClaudeCliExtractor implements Extractor {
-  readonly model = MODEL;
+  /** The text model (Haiku by default); photos and PDFs use `mediaModel` (see modelFor). */
+  readonly model: string;
+  readonly mediaModel: string;
+  private readonly maxMediaCalls: number;
   private blocked: ClaudeCliError | null = null;
   private readonly backoffMs: number[];
   calls = 0;
+  mediaCalls = 0;
+  /** Per model: CLI calls, tokens and cost as reported by the CLI (counts only; no content). */
+  readonly usage: Record<string, ModelUsage> = {};
 
   constructor(private o: ClaudeCliOptions = {}) {
     this.backoffMs = o.backoffMs ?? [5_000, 20_000, 60_000];
+    this.model = pickModel(o.textModel, MODEL);
+    this.mediaModel = pickModel(o.mediaModel, MEDIA_MODEL);
+    this.maxMediaCalls = o.maxMediaCalls ?? MAX_MEDIA_CALLS;
+  }
+
+  modelFor(input: ExtractInput): string {
+    return input.media ? this.mediaModel : this.model;
   }
 
   async extract(inputs: ExtractInput[]): Promise<(unknown | Error)[]> {
     const out: (unknown | Error)[] = new Array(inputs.length);
+    // Text first (one cheap chunked pass), then photos/PDFs on the media model.
     let chunk: number[] = [];
     let size = 0;
-    const flush = async () => {
-      if (chunk.length) await this.runChunk(inputs, chunk, out);
+    const flush = async (media: boolean) => {
+      if (chunk.length) await this.runChunk(inputs, chunk, out, media);
       chunk = [];
       size = 0;
     };
     for (let i = 0; i < inputs.length; i++) {
+      if (inputs[i].media) continue;
+      if (chunk.length >= MAX_PER_CALL) await flush(false);
+      chunk.push(i);
+    }
+    await flush(false);
+    for (let i = 0; i < inputs.length; i++) {
+      const m = inputs[i].media;
+      if (!m) continue;
       const s = mediaSize(inputs[i]);
       if (s > MAX_MEDIA_B64_PER_CALL) {
         out[i] = new ExtractorStopError("attachment_too_large");
         continue;
       }
-      if (chunk.length >= MAX_PER_CALL || size + s > MAX_MEDIA_B64_PER_CALL) await flush();
+      const pdf = m.mimeType === "application/pdf";
+      if (pdf || chunk.length >= MAX_IMAGES_PER_CALL || size + s > MAX_MEDIA_B64_PER_CALL) await flush(true);
       chunk.push(i);
       size += s;
+      if (pdf) await flush(true); // a PDF always goes alone: the model's whole attention on its pages
     }
-    await flush();
+    await flush(true);
     return out;
   }
 
-  private async runChunk(inputs: ExtractInput[], idx: number[], out: (unknown | Error)[]): Promise<void> {
+  private async runChunk(inputs: ExtractInput[], idx: number[], out: (unknown | Error)[], media: boolean): Promise<void> {
+    if (media && this.mediaCalls >= this.maxMediaCalls) {
+      // Usage guard: kept as delayed (transient), so the inbox rows stay new and the next run reads them.
+      for (const i of idx) out[i] = new ClaudeCliError(0, "media_call_cap");
+      return;
+    }
     try {
-      const so = (await this.call(idx.flatMap((i, k) => blocksFor(k + 1, inputs[i])))) as { results?: { msg?: unknown }[] };
+      if (media) this.mediaCalls++;
+      const so = (await this.call(idx.flatMap((i, k) => blocksFor(k + 1, inputs[i])), media ? this.mediaModel : this.model)) as { results?: { msg?: unknown }[] };
       const byMsg = new Map<number, Record<string, unknown>>();
       for (const r of Array.isArray(so?.results) ? so.results : []) if (typeof r?.msg === "number" && !byMsg.has(r.msg)) byMsg.set(r.msg, r);
       idx.forEach((i, k) => {
@@ -126,17 +186,17 @@ export class ClaudeCliExtractor implements Extractor {
       });
     } catch (err) {
       // One refused or unusable message must not fail the whole chunk: retry those one by one.
-      if (err instanceof ExtractorStopError && idx.length > 1) for (const i of idx) await this.runChunk(inputs, [i], out);
+      if (err instanceof ExtractorStopError && idx.length > 1) for (const i of idx) await this.runChunk(inputs, [i], out, media);
       else for (const i of idx) out[i] = err as Error;
     }
   }
 
   /** One CLI call with retries; returns structured_output. */
-  private async call(blocks: Block[]): Promise<unknown> {
+  private async call(blocks: Block[], model: string): Promise<unknown> {
     for (let attempt = 0; ; attempt++) {
       if (this.blocked) throw this.blocked; // auth or usage limit hit earlier in this run: do not hammer
       try {
-        return await this.once(blocks);
+        return await this.once(blocks, model);
       } catch (err) {
         if (!(err instanceof ClaudeCliError)) throw err;
         if (err.status === 401 || attempt >= this.backoffMs.length) {
@@ -149,12 +209,12 @@ export class ClaudeCliExtractor implements Extractor {
     }
   }
 
-  private async once(blocks: Block[]): Promise<unknown> {
+  private async once(blocks: Block[], model: string): Promise<unknown> {
     this.calls++;
     const stream = blocks.some((b) => b.type !== "text");
     const effort = stream ? "medium" : "low";
     const args = [
-      "-p", "--model", MODEL, "--effort", effort, "--tools", "", "--max-turns", "1",
+      "-p", "--model", model, "--effort", effort, "--tools", "", "--max-turns", "1",
       "--system-prompt", systemPrompt(this.o.context), "--json-schema", JSON.stringify(BATCH_SCHEMA),
       "--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands",
       ...(stream ? ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] : ["--output-format", "json"]),
@@ -168,11 +228,23 @@ export class ClaudeCliExtractor implements Extractor {
     const cwd = mkdtempSync(join(tmpdir(), "hl-claude-"));
     try {
       const { code, stdout } = await run(this.o.bin ?? "claude", args, input, { cwd, env, timeoutMs: this.o.timeoutMs ?? 10 * 60_000 });
+      countUsage(this.usage, model, stdout);
       return parseResult(stdout, code);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
   }
+}
+
+/** Adds the CLI's reported usage (result event: usage, total_cost_usd) to `usage`. Never throws. */
+function countUsage(usage: Record<string, ModelUsage>, model: string, stdout: string): void {
+  const u = (usage[model] ??= { calls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 });
+  u.calls++;
+  const res = lastResult(stdout);
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  u.inputTokens += n(res?.usage?.input_tokens) + n(res?.usage?.cache_read_input_tokens) + n(res?.usage?.cache_creation_input_tokens);
+  u.outputTokens += n(res?.usage?.output_tokens);
+  u.costUsd += n(res?.total_cost_usd);
 }
 
 function run(bin: string, args: string[], input: string, o: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }): Promise<{ code: number | null; stdout: string }> {
@@ -196,7 +268,7 @@ function run(bin: string, args: string[], input: string, o: { cwd: string; env: 
 }
 
 /** Last `result` event of json / stream-json output -> structured_output, or a classified error. */
-export function parseResult(stdout: string, code: number | null): unknown {
+function lastResult(stdout: string): any {
   let res: any = null;
   for (const line of stdout.split("\n")) {
     try {
@@ -206,6 +278,11 @@ export function parseResult(stdout: string, code: number | null): unknown {
       /* not a JSON line */
     }
   }
+  return res;
+}
+
+export function parseResult(stdout: string, code: number | null): unknown {
+  const res = lastResult(stdout);
   if (!res) throw new ClaudeCliError(0, code === null ? "killed" : `no_result_exit_${code}`);
   if (res.is_error) {
     const text = String(res.result ?? "");

@@ -51,6 +51,9 @@ case "$cmd" in
       echo "CLAUDE_CODE_VERSION=$(y .batch.claude_code_version "$ENV_FILE")"
       echo "CLAUDE_TOKEN_CREATED=$(y .batch.claude_token_created "$ENV_FILE")"
       echo "CONTEXT_MODE=$(y .context_mode "$ENV_FILE")"
+      echo "EXTRACT_MODEL_TEXT=$(y .batch.extract_model_text "$ENV_FILE")"
+      echo "EXTRACT_MODEL_MEDIA=$(y .batch.extract_model_media "$ENV_FILE")"
+      echo "EXTRACT_MAX_MEDIA_CALLS=$(y .batch.extract_max_media_calls "$ENV_FILE")"
     } >> "${GITHUB_ENV:-/dev/stdout}" ;;
   verify-lock)
     want=$(y .commit "$LOCK_FILE"); got=$(git -C "${1:?dir}" rev-parse HEAD)
