@@ -1,0 +1,366 @@
+#!/usr/bin/env -S python3 -I
+"""Answer proposals from recordings, and the listener's confirm/reject step.
+
+Usage:
+  tools/answers/answers propose --records DIR --audio REL [--force]
+  tools/answers/answers list    --records DIR [--ns NS] [--status proposed|confirmed|rejected]
+  tools/answers/answers confirm <proposal-id> --records DIR [--edit "answer text"] [--by WHO] [--keep-open]
+  tools/answers/answers reject  <proposal-id> --records DIR [--reason TEXT] [--by WHO]
+
+propose: for audio under sources/<ns>/ that has a `.mac.transcript.md` (tools/stt), reads the open questions of
+  docs/health/<ns>/questions.md (`### <ns>:q:NNNN: ...` blocks under "## Open..." headings) and asks Opus
+  (`claude -p --tools ""`) which questions the recording ADDRESSES. Each proposal carries the verbatim quote from the
+  suggested reading AND from raw whisper, the speaker, the time range and a confidence, and is "needs listener
+  confirmation". Quotes are checked deterministically against the transcript lines in the cited range; a proposal
+  whose quotes are not verbatim is dropped. Also a short list of new information not tied to a question.
+  Output: docs/health/<ns>/answer-proposals.md (generated; one block per audio id, replaced on re-propose; decided
+  proposals are kept). Never edits questions.md.
+confirm: moves the answer into questions.md "## Answered" (next free <ns>:ans:NNNN; source = audio path + time
+  range) and removes the open question block (with --keep-open: keeps it, adds a dated update line and names the
+  question as the open remainder). Records the decision (who, when, edit) in answer-proposals.md.
+reject: records the rejection. Neither command touches any other file.
+Exit codes: 0 ok, 1 error, 3 usage.
+"""
+import argparse, datetime, json, pathlib, re, sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "stt"))
+import sttlib as L  # noqa: E402
+
+PAGE = "answer-proposals.md"
+SCHEMA = {"type": "object", "required": ["proposals", "new_information"], "additionalProperties": False, "properties": {
+    "proposals": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+        "required": ["question_id", "answer", "quote_suggested", "quote_whisper", "speaker", "start", "end", "confidence"],
+        "properties": {"question_id": {"type": "string"}, "answer": {"type": "string"},
+                       "quote_suggested": {"type": "string"}, "quote_whisper": {"type": "string"},
+                       "speaker": {"type": "string"}, "start": {"type": "string"}, "end": {"type": "string"},
+                       "confidence": {"type": "string", "enum": ["low", "medium", "high"]}}}},
+    "new_information": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+        "required": ["summary", "quote_whisper", "start", "end"],
+        "properties": {"summary": {"type": "string"}, "quote_whisper": {"type": "string"},
+                       "start": {"type": "string"}, "end": {"type": "string"}}}}}}
+
+RULES = """You read a machine transcript of a Hindi/Hinglish health recording (a voice note or a phone call) and a list of open questions the family keeps for the doctors. Propose an answer ONLY where the recording actually addresses a question. Most recordings address none; an empty list is the normal answer.
+
+Rules:
+- Evidence over recollection: use only what is said in this recording. Do not use general knowledge to fill gaps.
+- Record what was said, by whom. Never diagnose, never infer a cause, never suggest starting, stopping or changing a medicine or dose.
+- The answer is one or two plain English sentences of what the speaker said, no more specific than the words (if she says "बीमार नहीं", do not write "no fever").
+- quote_suggested: copy a contiguous run of words EXACTLY from the "suggested" lines (including any "(?)"). quote_whisper: copy a contiguous run of words EXACTLY from the "whisper" lines covering the same speech. Never edit, join across non-adjacent lines, or translate quotes.
+- start/end: the mm:ss.s times of the first and last line the quotes come from. speaker: the speaker label on those lines, or "unknown" when there are no labels (never guess a person).
+- confidence: high only when the speech is clear in both engines and directly answers the question; low when the transcript is uncertain ("(?)") or the link to the question is indirect.
+- new_information: at most 5 health-relevant statements (symptoms, medicines taken, readings, events, plans) that answer no listed question; summary in plain English, with a verbatim whisper quote and times. Nothing else."""
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def die(msg, code=1):
+    print(f"answers: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- questions.md
+Q_HEAD = re.compile(r"^### ([a-z]+:q:\d{4}): (.*)$")
+
+
+def open_questions(md):
+    """[{id, title, text, start, end}] for ### blocks under '## Open' headings (line indexes, end exclusive)."""
+    lines = md.split("\n")
+    out, in_open, cur = [], False, None
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            if cur:
+                cur["end"] = i
+                out.append(cur)
+                cur = None
+            in_open = line.startswith("## Open")
+            continue
+        m = Q_HEAD.match(line)
+        if m or (line.startswith("### ") and cur):
+            if cur:
+                cur["end"] = i
+                out.append(cur)
+                cur = None
+            if m and in_open:
+                cur = {"id": m.group(1), "title": m.group(2).strip(), "start": i}
+    if cur:
+        cur["end"] = len(lines)
+        out.append(cur)
+    for q in out:
+        while q["end"] > q["start"] and not lines[q["end"] - 1].strip():
+            q["end"] -= 1
+        q["text"] = "\n".join(lines[q["start"]:q["end"]])
+    return out
+
+
+def next_ans(md, ns):
+    nums = [int(n) for n in re.findall(rf"\b{re.escape(ns)}:ans:(\d{{4}})\b", md)]
+    return f"{ns}:ans:{(max(nums) + 1) if nums else 1:04d}"
+
+
+def cell(s):
+    return str(s).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def move_to_answered(md, ns, qid, row, keep_open, update_line):
+    lines = md.split("\n")
+    qs = {q["id"]: q for q in open_questions(md)}
+    if qid not in qs:
+        die(f"{qid} is not an open question in docs/health/{ns}/questions.md")
+    try:
+        h = next(i for i, l in enumerate(lines) if l.strip() == "## Answered")
+    except StopIteration:
+        die("questions.md has no '## Answered' section")
+    t = next((i for i in range(h, len(lines)) if lines[i].startswith("| Id")), None)
+    if t is None:
+        die("the Answered section has no table")
+    last = t + 1
+    while last + 1 < len(lines) and lines[last + 1].startswith("|"):
+        last += 1
+    lines.insert(last + 1, row)
+    q = qs[qid]
+    if keep_open:
+        lines.insert(q["end"], update_line)
+    else:
+        end = q["end"]
+        while end < len(lines) and not lines[end].strip():
+            end += 1
+        del lines[q["start"]:end]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- answer-proposals.md (state in JSON comments)
+def load_page(path):
+    st = {"audios": {}}
+    if not path.exists():
+        return st
+    for m in re.finditer(r"^<!-- (audio|prop|newinfo) (\{.*\}) -->$", path.read_text(encoding="utf-8"), re.M):
+        kind, j = m.group(1), json.loads(m.group(2))
+        a = st["audios"].setdefault(j["audio_id"], {"meta": None, "props": [], "newinfo": []})
+        if kind == "audio":
+            a["meta"] = j
+        elif kind == "prop":
+            a["props"].append(j)
+        else:
+            a["newinfo"].append(j)
+    return st
+
+
+def render_page(ns, st):
+    out = ["---", f"title: \"{ns}: answer proposals from recordings (generated)\"", "audience: family", "type: reference",
+           "owner: tools/answers", f"last_reviewed: {today()}", "review_every: 7d", "status: current",
+           "sources: [" + ", ".join(sorted(a["meta"]["audio"] for a in st["audios"].values() if a["meta"])) + "]",
+           "generated: true", "---", "",
+           f"# {ns}: answer proposals from recordings", "",
+           f"**{L.FACTS_LINE}** Generated by `tools/answers` from machine transcripts (`*.mac.transcript.md`); do not",
+           "hand-edit. Every proposal is a machine reading of a recording and **needs listener confirmation**: listen to the",
+           "cited range, then `tools/answers/answers confirm <id> --records . [--edit \"...\"]` (moves it into",
+           "`questions.md` → Answered) or `... reject <id> --records .`.", ""]
+    for aid in sorted(st["audios"], key=lambda k: (st["audios"][k]["meta"] or {}).get("proposed_at", ""), reverse=True):
+        a = st["audios"][aid]
+        mt = a["meta"] or {"audio_id": aid, "audio": "?", "proposed_at": "?", "model": "?"}
+        out += [f"## Audio `{mt['audio']}`", "",
+                f"Proposed {mt['proposed_at']} by {mt['model']} from `{mt.get('transcript', '?')}`; "
+                f"{len(a['props'])} proposal(s), {mt.get('open_questions', '?')} open question(s) checked.", "",
+                "<!-- audio " + json.dumps(mt, ensure_ascii=False, sort_keys=True) + " -->", ""]
+        if not a["props"]:
+            out += ["No open question is addressed by this recording.", ""]
+        for p in a["props"]:
+            status = p["status"] + (f" by {p['decided_by']} on {p['decided_at']}" if p.get("decided_at") else "")
+            if p.get("ans_id"):
+                status += f" → `{p['ans_id']}`"
+            out += [f"### `{p['id']}` → `{p['question_id']}` ({status})", "",
+                    f"- **Question:** {p['question_title']}",
+                    f"- **Proposed answer (agent-inferred):** {p['answer']}"]
+            if p.get("edit"):
+                out.append(f"- **Answer as confirmed (edited):** {p['edit']}")
+            if p.get("reason"):
+                out.append(f"- **Rejected because:** {p['reason']}")
+            out += [f"- **Quote (suggested reading):** \"{p['quote_suggested']}\"",
+                    f"- **Quote (raw whisper):** \"{p['quote_whisper']}\"",
+                    f"- **Speaker / time:** {p['speaker']}, {p['start']}–{p['end']}",
+                    f"- **Confidence:** {p['confidence']}. **Needs listener confirmation.**", "",
+                    "<!-- prop " + json.dumps(p, ensure_ascii=False, sort_keys=True) + " -->", ""]
+        if a["newinfo"]:
+            out += ["### New information not tied to a question (agent-inferred; needs a listener)", ""]
+            for n in a["newinfo"]:
+                out += [f"- [{n['start']}–{n['end']}] {n['summary']} — whisper: \"{n['quote_whisper']}\"",
+                        "<!-- newinfo " + json.dumps(n, ensure_ascii=False, sort_keys=True) + " -->"]
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------- propose
+def squash(s):
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def quote_ok(quote, lines, start, end):
+    """Verbatim (whitespace-normalised) substring of the lines that overlap [start-1, end+1] seconds, joined."""
+    if not quote.strip():
+        return False
+    try:
+        a, b = L.parse_ts(start), L.parse_ts(end)
+    except (ValueError, AttributeError):
+        return False
+    sel = [l["text"] for l in lines if l["end"] >= a - 1 and l["start"] <= b + 1]
+    return squash(quote) in squash(" ".join(sel))
+
+
+def ns_of(rel, records):
+    parts = pathlib.PurePosixPath(rel).parts
+    if len(parts) < 3 or parts[0] != "sources":
+        die(f"{rel}: not under sources/<ns>/")
+    return parts[1]
+
+
+def cmd_propose(a):
+    records = pathlib.Path(a.records).resolve()
+    rel = a.audio
+    audio = records / rel
+    ns = ns_of(rel, records)
+    tr = audio.with_name(audio.name[: -len(audio.suffix)] + ".mac.transcript.md")
+    if not tr.exists():
+        die(f"{audio.stem}: no .mac.transcript.md")
+    qpath = records / "docs/health" / ns / "questions.md"
+    if not qpath.exists():
+        return 0  # no question register for this namespace: nothing to propose
+    qs = open_questions(qpath.read_text(encoding="utf-8"))
+    if not qs:
+        return 0
+    page = records / "docs/health" / ns / PAGE
+    st = load_page(page)
+    aid = audio.stem
+    if aid in st["audios"] and not a.force:
+        return 0
+    md = tr.read_text(encoding="utf-8")
+    sugg, raw = L.section(md, "Suggested reading"), L.section(md, "Raw whisper")
+    if not raw:
+        return 0
+
+    def fmt(ls):
+        return "\n".join(f"[{L.ts(l['start'])} → {L.ts(l['end'])}]" + (f" [{l['speaker']}]" if l["speaker"] else "") + f" {l['text']}" for l in ls)
+    prompt = ("Open questions:\n\n" + "\n\n".join(q["text"] for q in qs) + "\n\nTranscript, suggested reading (agent-reconciled):\n"
+              + (fmt(sugg) or "(none)") + "\n\nTranscript, raw whisper:\n" + fmt(raw))
+    try:
+        out, _ = L.call_claude(RULES, prompt, SCHEMA, effort="medium")
+    except L.LlmError as e:
+        die(f"{aid}: proposal call failed ({e})")
+    titles = {q["id"]: q["title"] for q in qs}
+    old = st["audios"].get(aid, {"props": []})
+    kept = [p for p in old["props"] if p["status"] != "proposed"]
+    props, n, dropped = list(kept), len(kept), 0
+    for p in out.get("proposals") or []:
+        if p["question_id"] not in titles or not quote_ok(p["quote_whisper"], raw, p["start"], p["end"]) or \
+                (sugg and not quote_ok(p["quote_suggested"], sugg, p["start"], p["end"])):
+            dropped += 1
+            continue
+        n += 1
+        props.append({**p, "id": f"{ns}:prop:{aid}.{n:02d}", "audio_id": aid, "audio": rel, "status": "proposed",
+                      "question_title": titles[p["question_id"]]})
+    newinfo = [{**x, "audio_id": aid} for x in (out.get("new_information") or [])[:5] if quote_ok(x["quote_whisper"], raw, x["start"], x["end"])]
+    st["audios"][aid] = {"meta": {"audio_id": aid, "audio": rel, "transcript": str(tr.relative_to(records)), "proposed_at": today(),
+                                  "model": L.OPUS, "open_questions": len(qs), "dropped_unverified_quotes": dropped},
+                         "props": props, "newinfo": newinfo}
+    page.write_text(render_page(ns, st), encoding="utf-8")
+    print(f"answers: {aid}: {len(props) - len(kept)} proposal(s), {len(newinfo)} new item(s), {dropped} dropped (quote not verbatim)", file=sys.stderr)
+    print(page.relative_to(records))
+    return 0
+
+
+# ---------------------------------------------------------------- list / confirm / reject
+def find_prop(records, pid):
+    ns = pid.split(":")[0]
+    page = records / "docs/health" / ns / PAGE
+    st = load_page(page)
+    for a in st["audios"].values():
+        for p in a["props"]:
+            if p["id"] == pid:
+                return ns, page, st, p
+    die(f"no proposal {pid} in docs/health/{ns}/{PAGE}")
+
+
+def cmd_list(a):
+    records = pathlib.Path(a.records).resolve()
+    for page in sorted((records / "docs/health").glob(f"{a.ns or '*'}/{PAGE}")):
+        for au in load_page(page)["audios"].values():
+            for p in au["props"]:
+                if not a.status or p["status"] == a.status:
+                    print(f"{p['id']}\t{p['question_id']}\t{p['status']}\t{p['confidence']}\t{p['start']}-{p['end']}")
+    return 0
+
+
+def fmt_date(iso):
+    d = datetime.date.fromisoformat(iso)
+    return d.strftime("%d-%b-%Y")
+
+
+def cmd_confirm(a):
+    records = pathlib.Path(a.records).resolve()
+    ns, page, st, p = find_prop(records, a.id)
+    if p["status"] != "proposed":
+        die(f"{a.id} is already {p['status']}")
+    qpath = records / "docs/health" / ns / "questions.md"
+    md = qpath.read_text(encoding="utf-8")
+    ans = next_ans(md, ns)
+    answer = a.edit or p["answer"]
+    src = (f"`{p['audio']}` {p['start']}–{p['end']} (recording, speaker {p['speaker']}; machine transcript, listener-confirmed "
+           f"by {a.by} {fmt_date(today())}; proposal `{p['id']}`)")
+    remainder = f"`{p['question_id']}`" if a.keep_open else "—"
+    row = f"| `{ans}` | {cell(p['question_title'])} | {cell(answer)} | {cell(src)} | {today()} | {remainder} | — |"
+    upd = f"- **Update {fmt_date(today())}:** answered in part from a recording (`{ans}` in Answered; `{p['audio']}` {p['start']}–{p['end']})."
+    qpath.write_text(move_to_answered(md, ns, p["question_id"], row, a.keep_open, upd), encoding="utf-8")
+    p.update(status="confirmed", decided_by=a.by, decided_at=today(), ans_id=ans, keep_open=bool(a.keep_open))
+    if a.edit:
+        p["edit"] = a.edit
+    page.write_text(render_page(ns, st), encoding="utf-8")
+    print(f"{a.id}: confirmed as {ans}")
+    return 0
+
+
+def cmd_reject(a):
+    records = pathlib.Path(a.records).resolve()
+    ns, page, st, p = find_prop(records, a.id)
+    if p["status"] != "proposed":
+        die(f"{a.id} is already {p['status']}")
+    p.update(status="rejected", decided_by=a.by, decided_at=today())
+    if a.reason:
+        p["reason"] = a.reason
+    page.write_text(render_page(ns, st), encoding="utf-8")
+    print(f"{a.id}: rejected")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="answers", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("propose")
+    p.add_argument("--records", required=True)
+    p.add_argument("--audio", required=True)
+    p.add_argument("--force", action="store_true", help="re-propose (keeps confirmed/rejected proposals)")
+    li = sub.add_parser("list")
+    li.add_argument("--records", required=True)
+    li.add_argument("--ns")
+    li.add_argument("--status", choices=["proposed", "confirmed", "rejected"])
+    c = sub.add_parser("confirm")
+    c.add_argument("id")
+    c.add_argument("--records", required=True)
+    c.add_argument("--edit")
+    c.add_argument("--by", default="owner")
+    c.add_argument("--keep-open", action="store_true", help="partial answer: keep the question open")
+    r = sub.add_parser("reject")
+    r.add_argument("id")
+    r.add_argument("--records", required=True)
+    r.add_argument("--reason")
+    r.add_argument("--by", default="owner")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit as e:
+        return 3 if e.code else 0
+    return {"propose": cmd_propose, "list": cmd_list, "confirm": cmd_confirm, "reject": cmd_reject}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,267 @@
+#!/usr/bin/env -S python3 -I
+"""Score every available speech-to-text output for audio that has a human ground truth (`<audio-stem>.groundtruth.md`).
+
+Usage:
+  tools/stt-eval/stt-eval --records DIR [--audio REL] [--force] [--no-judge] [--terms FILE]
+  tools/stt-eval/stt-eval --records DIR --summary            only rewrite eval/stt-results.md from the ndjson
+
+Systems scored (when the file exists next to the audio):
+  mac:suggested  mac:whisper  mac:mms   sections of `<stem>.mac.transcript.md` (tools/stt)
+  batch:whisper                          `<stem>.batch.transcript.md`, or `<stem>.transcript.md` written by the batch
+Metrics (README "Normalisation" for the text normalisation, shared with tools/stt):
+  cer, wer          edit distance over normalised characters / words, divided by the reference length
+  terms             key-term recall: ground-truth `terms:` + the records term list (eval/stt-terms.txt, one per line,
+                    `#` comments), counted only when the term occurs in the ground truth; a term is found when a window
+                    of the same number of words reaches similarity >= 0.75 (normalised edit distance)
+  meaning           Opus judge, fixed rubric (RUBRIC_VERSION): each ground-truth line same / minor / changed / missing,
+                    plus hypothesis statements not in the ground truth (added)
+  clinical          Opus judge: each clinical item of the ground truth (symptom, medicine, dose/number, negation, time
+                    reference, speaker attribution) exact / more_specific / less_specific / wrong / missing, plus added
+Output (records repo): eval/stt-results.ndjson (append-only; numbers and labels only, no quotes or text) and the
+summary eval/stt-results.md (latest row per audio and system). A row is skipped when the same ground truth,
+hypothesis and rubric were already scored (--force re-scores). Prints the changed paths.
+The judge runs with `claude -p --tools ""`, a fixed system prompt and a JSON schema; the CLI has no temperature
+setting, so repeated runs can differ slightly: compare rows with the same rubric version, and treat 1-label moves as noise.
+"""
+import argparse, datetime, hashlib, json, pathlib, re, sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "stt"))
+import sttlib as L  # noqa: E402
+
+RUBRIC_VERSION = "stt-judge-v1"
+MEANING = ["same", "minor", "changed", "missing"]
+CLIN_KINDS = ["symptom", "medicine", "dose_number", "negation", "time", "speaker"]
+CLIN = ["exact", "more_specific", "less_specific", "wrong", "missing"]
+TERM_SIM = 0.75
+
+JUDGE_RULES = f"""You evaluate a speech-to-text output (HYPOTHESIS) against a human ground truth (REFERENCE) of the same Hindi/Hinglish health recording. Rubric {RUBRIC_VERSION}; apply it literally and the same way every time.
+The reference is in Latin transliteration with [speaker] tags; the hypothesis may be in Devanagari, Latin or mixed, with or without speaker tags. Script and spelling differences are NOT errors; judge meaning only.
+
+(a) Meaning fidelity, one label per reference line (index = 1-based line number):
+- same: the hypothesis conveys the same meaning (wording may differ).
+- minor: small loss or distortion that does not change what the line tells a doctor.
+- changed: the meaning is different (wrong word that changes sense, flipped negation, different person or time).
+- missing: the line's content is absent or unintelligible in the hypothesis.
+added_statements: the number of statements in the hypothesis whose meaning is not in the reference (invented content). Noise words alone do not count.
+
+(b) Clinical fidelity. List every clinically relevant item of the reference, one entry each:
+- kinds: symptom (any feeling or complaint, e.g. weakness, dizziness, "not ill"), medicine (any medicine or "dawai" mention), dose_number (doses, counts, readings, numbers), negation (a negated clinical statement), time (time references: today, morning, after bathing, now), speaker (who said a clinically relevant line; only when the reference has more than one speaker).
+- labels: exact (same meaning), more_specific (the hypothesis claims something more specific than was said, e.g. "fever" for "ill", a named disease for a feeling), less_specific (vaguer than said), wrong (different content), missing (absent). For speaker items: a hypothesis without speaker labels is "missing".
+added_clinical: the number of clinical claims in the hypothesis that the reference does not contain.
+Return labels and counts only; never quote text."""
+
+JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["sentences", "added_statements", "clinical", "added_clinical"],
+                "properties": {
+                    "sentences": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["index", "label"],
+                                  "properties": {"index": {"type": "integer"}, "label": {"type": "string", "enum": MEANING}}}},
+                    "added_statements": {"type": "integer"},
+                    "clinical": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["kind", "label"],
+                                 "properties": {"kind": {"type": "string", "enum": CLIN_KINDS}, "label": {"type": "string", "enum": CLIN}}}},
+                    "added_clinical": {"type": "integer"}}}
+
+
+def sha(s):
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def parse_groundtruth(md):
+    """-> (lines [{speaker, text}], terms [str]). Body lines after the front matter: `[speaker] text`; stops at notes."""
+    body = md.split("\n---", 1)[1] if md.startswith("---\n") else md
+    lines, terms = [], []
+    for raw in body.splitlines()[1:]:
+        s = raw.strip()
+        if s.startswith("terms:"):
+            terms = [re.sub(r"\(.*?\)", "", t).strip() for t in s[6:].split(",") if t.strip()]
+            continue
+        if s.startswith("notes:"):
+            break
+        m = re.match(r"^\[([^\]:]+)\]\s+(.*)$", s)
+        if m:
+            lines.append({"speaker": m.group(1), "text": m.group(2)})
+    return lines, [t for t in terms if t]
+
+
+def systems_for(audio):
+    stem = audio.name[: -len(audio.suffix)]
+    out = []
+    mac = audio.with_name(stem + ".mac.transcript.md")
+    if mac.exists():
+        md = mac.read_text(encoding="utf-8")
+        fm = L.front_matter(md)
+        for sysname, sec, eng in (("mac:suggested", "Suggested reading", f"{fm.get('reconcile_model', '?')} over whisper+mms"),
+                                  ("mac:whisper", "Raw whisper", fm.get("whisper_model", "?")),
+                                  ("mac:mms", "Raw MMS", fm.get("mms_engine", "?"))):
+            ls = [l for l in L.section(md, sec) if l["text"] and not l["text"].startswith("(no ")]
+            if ls:
+                out.append((sysname, eng, ls, str(mac.name)))
+    for name in (stem + ".batch.transcript.md", stem + ".transcript.md"):
+        p = audio.with_name(name)
+        if p.exists():
+            md = p.read_text(encoding="utf-8")
+            fm = L.front_matter(md)
+            if fm.get("generator") == "saturn-batch":
+                ls = L.section(md, "Transcript")
+                if ls:
+                    out.append(("batch:whisper", fm.get("model", "?"), ls, name))
+                    break
+    return out
+
+
+def find_term(term_words, hyp_words):
+    k = len(term_words)
+    if not k:
+        return False
+    t = " ".join(term_words)
+    for i in range(max(1, len(hyp_words) - k + 1)):
+        if L.similar(t, " ".join(hyp_words[i:i + k])) >= TERM_SIM:
+            return True
+    return False
+
+
+def load_terms(records, extra):
+    out = list(extra)
+    p = pathlib.Path(records) / "eval/stt-terms.txt"
+    if p.exists():
+        out += [l.split("#")[0].strip() for l in p.read_text(encoding="utf-8").splitlines() if l.split("#")[0].strip()]
+    seen, res = set(), []
+    for t in out:
+        n = " ".join(L.norm_words(t))
+        if n and n not in seen:
+            seen.add(n)
+            res.append(t)
+    return res
+
+
+def score(ref_lines, hyp_lines, terms):
+    ref_w = L.norm_words(" ".join(l["text"] for l in ref_lines))
+    hyp_w = L.norm_words(" ".join(l["text"] for l in hyp_lines))
+    ref_c, hyp_c = " ".join(ref_w), " ".join(hyp_w)
+    present = [t for t in terms if find_term(L.norm_words(t), ref_w)]
+    hits = [t for t in present if find_term(L.norm_words(t), hyp_w)]
+    return {"cer": round(L.edit_distance(ref_c, hyp_c) / max(1, len(ref_c)), 3),
+            "wer": round(L.edit_distance(ref_w, hyp_w) / max(1, len(ref_w)), 3),
+            "ref_chars": len(ref_c), "ref_words": len(ref_w), "terms_hit": len(hits), "terms_total": len(present)}
+
+
+def judge(ref_lines, hyp_lines):
+    ref = "\n".join(f"{i}. [{l['speaker']}] {l['text']}" for i, l in enumerate(ref_lines, 1))
+    hyp = "\n".join((f"[{l['speaker']}] " if l.get("speaker") else "") + l["text"] for l in hyp_lines)
+    out, _ = L.call_claude(JUDGE_RULES, f"REFERENCE:\n{ref}\n\nHYPOTHESIS:\n{hyp}", JUDGE_SCHEMA, effort="medium")
+    meaning = {k: 0 for k in MEANING}
+    seen = set()
+    for s in out.get("sentences") or []:
+        if 1 <= s["index"] <= len(ref_lines) and s["index"] not in seen:
+            seen.add(s["index"])
+            meaning[s["label"]] += 1
+    meaning["missing"] += len(ref_lines) - len(seen)  # an unlabeled line counts as missing
+    meaning["added"] = max(0, int(out.get("added_statements") or 0))
+    clinical = {k: 0 for k in CLIN}
+    by_kind = {}
+    for c in out.get("clinical") or []:
+        clinical[c["label"]] += 1
+        by_kind.setdefault(c["kind"], {}).setdefault(c["label"], 0)
+        by_kind[c["kind"]][c["label"]] += 1
+    clinical["added"] = max(0, int(out.get("added_clinical") or 0))
+    return meaning, clinical, by_kind
+
+
+def read_rows(path):
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def fmt_counts(d, keys):
+    return " / ".join(str(d.get(k, 0)) for k in keys)
+
+
+def write_summary(records, rows):
+    latest = {}
+    for r in rows:
+        latest[(r["audio"], r["system"])] = r
+    out = ["---", "title: STT evaluation results (generated)", "audience: maintainer", "type: reference", "owner: tools/stt-eval",
+           f"last_reviewed: {datetime.date.today().isoformat()}", "review_every: 90d", "status: current",
+           "sources: [eval/stt-results.ndjson]", "generated: true", "---", "",
+           "# Speech-to-text evaluation (generated by `tools/stt-eval`)", "",
+           "Latest row per audio and system from `eval/stt-results.ndjson` (numbers and labels only). Ground truths are",
+           "the `*.groundtruth.md` files next to the audio. Normalisation and rubric: product `tools/stt/README.md`.",
+           "Lower CER/WER is better. Meaning: same / minor / changed / missing / added. Clinical: exact / more-specific /",
+           "less-specific / wrong / missing / added. **more-specific** is the dangerous one (a claim stronger than what was said).", ""]
+    for audio in sorted({k[0] for k in latest}):
+        out += [f"## `{audio}`", "", "| System | Engine | CER | WER | Key terms | Meaning: same / minor / changed / missing / added | Clinical: exact / more specific / less specific / wrong / missing / added | Scored |",
+                "|---|---|---|---|---|---|---|---|"]
+        for (a, s), r in sorted(latest.items()):
+            if a != audio:
+                continue
+            m = fmt_counts(r["meaning"], MEANING + ["added"]) if r.get("meaning") else "n/a"
+            c = fmt_counts(r["clinical"], CLIN + ["added"]) if r.get("clinical") else "n/a"
+            out.append(f"| {s} | {r['engine']} | {r['cer']:.3f} | {r['wer']:.3f} | {r['terms_hit']}/{r['terms_total']} | {m} | {c} | {r['at'][:10]} |")
+        out.append("")
+    p = records / "eval/stt-results.md"
+    p.write_text("\n".join(out), encoding="utf-8")
+    return p
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="stt-eval", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--records", required=True)
+    ap.add_argument("--audio")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--no-judge", action="store_true")
+    ap.add_argument("--summary", action="store_true")
+    a = ap.parse_args(argv)
+    records = pathlib.Path(a.records).resolve()
+    res_path = records / "eval/stt-results.ndjson"
+    rows = read_rows(res_path)
+    if a.summary:
+        print(write_summary(records, rows).relative_to(records))
+        return 0
+    gts = sorted((records / "sources").glob("**/*.groundtruth.md"))
+    if a.audio:
+        stem = (records / a.audio).name.rsplit(".", 1)[0]
+        gts = [g for g in gts if g.name == stem + ".groundtruth.md"]
+    done = {(r["audio"], r["system"], r["gt_sha256"], r["hyp_sha256"], r.get("rubric")) for r in rows}
+    new = []
+    for g in gts:
+        stem = g.name[: -len(".groundtruth.md")]
+        audios = [p for p in g.parent.glob(stem + ".*") if p.suffix.lower() in L.AUDIO_EXT]
+        if not audios:
+            continue
+        audio = audios[0]
+        gmd = g.read_text(encoding="utf-8")
+        ref, gt_terms = parse_groundtruth(gmd)
+        if not ref:
+            continue
+        terms = load_terms(records, gt_terms)
+        gsha = sha(gmd)
+        for sysname, engine, hyp, fname in systems_for(audio):
+            hsha = sha(json.dumps(hyp, ensure_ascii=False))
+            rubric = None if a.no_judge else RUBRIC_VERSION
+            if not a.force and (str(audio.relative_to(records)), sysname, gsha, hsha, rubric) in done:
+                continue
+            row = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "audio": str(audio.relative_to(records)),
+                   "system": sysname, "engine": engine, "hypothesis_file": fname, "gt_sha256": gsha, "hyp_sha256": hsha,
+                   "normalisation": "sttlib.norm_words v1", **score(ref, hyp, terms), "rubric": rubric}
+            if rubric:
+                try:
+                    row["meaning"], row["clinical"], row["clinical_by_kind"] = judge(ref, hyp)
+                    row["judge_model"] = L.OPUS
+                except L.LlmError as e:
+                    print(f"stt-eval: {audio.stem} {sysname}: judge failed ({e}); scored without rubric", file=sys.stderr)
+                    row["rubric"] = None
+            new.append(row)
+            print(f"stt-eval: {audio.stem} {sysname}: cer {row['cer']} wer {row['wer']} terms {row['terms_hit']}/{row['terms_total']}", file=sys.stderr)
+    if not new:
+        return 0
+    res_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(res_path, "a", encoding="utf-8") as f:
+        for r in new:
+            f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+    print(res_path.relative_to(records))
+    print(write_summary(records, rows + new).relative_to(records))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

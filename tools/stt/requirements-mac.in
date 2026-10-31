@@ -1,0 +1,7 @@
+# Mac STT engines (tools/stt/workers.py). Compile: uv pip compile --python-version 3.12 --python-platform aarch64-apple-darwin --generate-hashes requirements-mac.in -o requirements-mac.txt
+torch==2.11.0
+torchaudio==2.11.0
+transformers==5.22.1
+numpy==2.5.4
+safetensors==0.8.0
+pyannote.audio==4.0.7

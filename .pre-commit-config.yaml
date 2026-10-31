@@ -73,6 +73,12 @@ repos:
         entry: python3 -I tools/search/test_search.py
         pass_filenames: false
         files: ^(tools/search/|tools/kb/records_config.py|fixtures/records-example/)
+      - id: stt
+        name: Mac audio pipeline, answer proposals, STT eval (fake engines, synthetic audio)
+        language: system
+        entry: python3 -I tools/stt/test_stt.py
+        pass_filenames: false
+        files: ^(tools/stt/|tools/answers/|tools/stt-eval/|adapters/stt/whisper-cpp\.ts)
       - id: no-binaries-outside-fixtures
         name: binary files only under fixtures/
         language: fail

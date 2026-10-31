@@ -119,6 +119,13 @@ The admin digest lists every voice note, with its length, until someone has list
 
 `tools/kb/build` fails on a row without `update_id` (int), `by` and `at` (YYYY-MM-DD), with other keys, or for an update that is not a recorded voice note. To correct a fact from a voice note, supersede it (section 7) citing the audio.
 
+### Mac transcripts, answer proposals and the STT eval set
+
+Where the household runs the Mac runner ([tools/stt](../tools/stt/README.md)), each audio file under `sources/<ns>/media/` also gets `<audio-stem>.mac.transcript.md`: raw whisper and raw MMS output (the machine record), optional speaker labels, and an agent-reconciled **suggested reading** (agent-inferred; `(?)` marks uncertain words, and words no engine supports are flagged for the listener). It never replaces `.transcript.md`, `.batch.transcript.md` or `.groundtruth.md`, and the batch never writes it.
+
+- **Answer proposals:** `docs/health/<ns>/answer-proposals.md` is generated: proposed answers to open questions, each with verbatim quotes, speaker, time range and "needs listener confirmation". Listen to the range, then `tools/answers/answers confirm <ns>:prop:<audio-id>.NN --records .` (moves the answer into `questions.md` → Answered, citing the audio and time range) or `... reject`. Never copy a proposal into `questions.md` by hand.
+- **Eval set:** a person who listens and writes `<audio-stem>.groundtruth.md` (`[speaker] text` lines in Latin transliteration, verbatim; optional `terms:` line) adds the clip to the eval set; the next run scores every engine output into `eval/stt-results.ndjson` (numbers and labels only) and `eval/stt-results.md`. Keep a records term list (medicines, symptoms) in `eval/stt-terms.txt`.
+
 ### Telegram messages handled manually
 
 Facts the KB build derives from Telegram (`data/telegram/YYYY-MM.ndjson`) cannot be superseded by hand. When the owner ingests a Telegram document properly as a manual source, or the same photo was sent twice before the batch's media dedup (v0.8.0; it checks new messages only, not pairs already extracted), append one line to **`data/telegram/handled-manually.ndjson`**:

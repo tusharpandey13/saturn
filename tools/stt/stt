@@ -1,0 +1,681 @@
+#!/usr/bin/env -S python3 -I
+"""Mac speech-to-text pipeline for long, multi-speaker Hindi recordings (calls, voice notes) in a records repo.
+
+Usage:
+  tools/stt/stt pending --records DIR                       audio without a .mac.transcript.md (one path per line)
+  tools/stt/stt transcribe AUDIO --records DIR [--force] [--no-reconcile]
+  tools/stt/stt run --records DIR [--limit N] [--written FILE] [--no-answers] [--no-eval]
+  tools/stt/stt doctor                                      engines, cache, token: what is ready (no content)
+
+Per audio file (sources/<ns>/media/**.{ogg,oga,m4a,mp3,wav,opus}) it writes `<audio-stem>.mac.transcript.md`:
+  1. whisper.cpp large-v3-turbo q5_0 on Metal, the production settings of adapters/stt/whisper-cpp.ts (Hindi first,
+     auto fallback, loop protection, repetition post-check; never a translation pass); word times from token offsets;
+  2. Meta MMS-1b-all + Hindi adapter (CTC, MPS/CPU) in 20 s chunks, words aligned to the whisper segments by time;
+  3. speaker diarization (pyannote/speaker-diarization-3.1) only when the owner's token file exists
+     (~/.config/saturn/hf.token, 0600); otherwise no speaker labels, and the file says so;
+  4. a reconciled "suggested reading" per segment (Opus via `claude -p --tools ""`, strict rules: README), checked
+     deterministically: any word no engine supports is marked "(?)" and listed for the listener.
+Raw engine outputs stay in the file and are the record; the suggestion is labelled agent-inferred.
+Never overwrites a file it did not write (.transcript.md, .batch.transcript.md, .groundtruth.md are never touched).
+Logs (stderr) carry file ids, counts and timings only, never transcript text.
+Cache: $SATURN_STT_CACHE, else ~/Library/Caches/saturn-stt (tools/stt/setup-mac.sh fills it).
+"""
+import argparse, datetime, hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import sttlib as L  # noqa: E402
+
+# Mirrors adapters/stt/whisper-cpp.ts (test_stt.py fails if they drift).
+WHISPER_VERSION = "v1.9.5"
+WHISPER_COMMIT = "d1be6fde11ac6e0407606b4e42fe72d34add8037"
+WHISPER_MODEL_NAME = "ggml-large-v3-turbo-q5_0"
+WHISPER_MODEL_SHA256 = "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+DECODE = {"maxContext": 0, "entropyThold": 2.4, "logprobThold": -1.0, "noSpeechThold": 0.6, "temperatureInc": 0.2, "beamSize": 5, "bestOf": 5}
+TEMPERATURES = [0.0, 0.4]
+DETECT_CONFIDENT = 0.8
+MARK = "---\ngenerator: saturn-mac-stt"
+SUB_MAX_SEC, SUB_SPLIT_SEC = 12.0, 4.0  # sub-segment long whisper segments at pauses/punctuation (display + quotes)
+BATCH_ROWS, BATCH_CHARS = 30, 6000
+
+
+def log(msg):
+    print(f"{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')} stt: {msg}", file=sys.stderr, flush=True)
+
+
+def cache_dir():
+    return pathlib.Path(os.environ.get("SATURN_STT_CACHE") or pathlib.Path.home() / "Library/Caches/saturn-stt")
+
+
+def token_file():
+    return pathlib.Path(os.environ.get("SATURN_HF_TOKEN_FILE") or pathlib.Path.home() / ".config/saturn/hf.token")
+
+
+def minimal_env(extra=None):
+    e = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL") if os.environ.get(k)}
+    e.update(extra or {})
+    return e
+
+
+def run(cmd, timeout, env=None):
+    """Run a child; stdout discarded (it can carry transcript text), stderr tail kept for parsing only."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout, env=env or minimal_env())
+        return p.returncode, p.stderr.decode("utf-8", "replace")[-20000:]
+    except subprocess.TimeoutExpired:
+        return None, ""
+    except OSError:
+        return -1, "spawn_failed"
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- whisper.cpp
+def whisper_args(model, wav, out, language, temperature, threads):
+    args = ["-m", model, "-f", wav, "-l", language, "-t", str(threads),
+            "--max-context", str(DECODE["maxContext"]), "--entropy-thold", str(DECODE["entropyThold"]),
+            "--logprob-thold", str(DECODE["logprobThold"]), "--no-speech-thold", str(DECODE["noSpeechThold"]),
+            "--temperature", str(temperature), "--temperature-inc", str(DECODE["temperatureInc"]),
+            "--beam-size", str(DECODE["beamSize"]), "--best-of", str(DECODE["bestOf"]),
+            "--suppress-nst", "--output-json-full", "--output-file", out, "--no-prints"]
+    if any(a in ("-tr", "--translate") for a in args):
+        raise RuntimeError("translate_forbidden")
+    return args
+
+
+def settings_line(language="hi"):
+    d = DECODE
+    return (f"-l {language} (auto-detect fallback) --max-context {d['maxContext']} --entropy-thold {d['entropyThold']} "
+            f"--logprob-thold {d['logprobThold']} --no-speech-thold {d['noSpeechThold']} --temperature "
+            f"{'|'.join(str(t) for t in TEMPERATURES)} --temperature-inc {d['temperatureInc']} --beam-size {d['beamSize']} "
+            f"--best-of {d['bestOf']} --suppress-nst; no translation; post-check: repetition; Metal")
+
+
+def _w(text):
+    return [x for x in re.sub(r"[।॥,.?!;:\"'()\[\]-]", " ", text.lower()).split() if x]
+
+
+def repetition_verdict(segments):
+    """Same checks as repetitionVerdict in adapters/stt/whisper-cpp.ts."""
+    w = _w(" ".join(s["text"] for s in segments))
+    if not w:
+        return "empty"
+    segs = [" ".join(_w(s["text"])) for s in segments]
+    segs = [s for s in segs if s]
+    for i in range(2, len(segs)):
+        if segs[i] == segs[i - 1] == segs[i - 2] and len(segs[i].split()) >= 2:
+            return "repetition:segments"
+    for n in (1, 2, 3):
+        run_ = 1
+        i = n
+        while i + n <= len(w):
+            run_ = run_ + 1 if w[i:i + n] == w[i - n:i] else 1
+            if run_ >= (8 if n == 1 else 5):
+                return "repetition:run"
+            i += n
+
+    def dup(xs):
+        grams = [" ".join(xs[i:i + 4]) for i in range(max(0, len(xs) - 3))]
+        return 1 - len(set(grams)) / len(grams) if len(grams) >= 20 else 0
+    if dup(w) > 0.5 or dup(w[len(w) // 2:]) > 0.6:
+        return "repetition:ngrams"
+    return "ok"
+
+
+def devanagari_share(text):
+    letters = [c for c in text if c.isalpha()]
+    return sum(1 for c in letters if "ऀ" <= c <= "ॿ") / len(letters) if letters else 0
+
+
+def parse_whisper_full(raw):
+    """whisper.cpp --output-json-full -> (language, segments with word timings). Word times come from token offsets;
+    when the token text does not rebuild the segment text, words are spread over the segment by length."""
+    j = json.loads(raw)
+    segs = []
+    for s in j.get("transcription") or []:
+        text = str(s.get("text") or "").strip()
+        if not text:
+            continue
+        start, end = (s.get("offsets") or {}).get("from", 0) / 1000, (s.get("offsets") or {}).get("to", 0) / 1000
+        toks = [t for t in s.get("tokens") or [] if not str(t.get("text", "")).startswith("[_")]
+        chars, times = [], []
+        for t in toks:
+            o = t.get("offsets") or {}
+            for ch in str(t.get("text", "")):
+                chars.append(ch)
+                times.append((o.get("from", 0) / 1000, o.get("to", 0) / 1000))
+        words = []
+        if "".join(chars).strip() == text and "�" not in text:
+            cur, cs, ce = "", None, None
+            for ch, (a, b) in zip(chars, times):
+                if ch.isspace():
+                    if cur:
+                        words.append({"w": cur, "start": cs, "end": ce})
+                    cur, cs = "", None
+                    continue
+                cur += ch
+                cs = a if cs is None else cs
+                ce = b
+            if cur:
+                words.append({"w": cur, "start": cs, "end": ce})
+        else:
+            parts = text.split()
+            total = sum(len(p) for p in parts) or 1
+            t = start
+            for p in parts:
+                d = (end - start) * len(p) / total
+                words.append({"w": p, "start": round(t, 2), "end": round(t + d, 2)})
+                t += d
+        segs.append({"start": start, "end": end, "text": text, "words": words})
+    return (j.get("result") or {}).get("language"), segs
+
+
+def run_whisper(wav, audio_sec, cache):
+    t0 = time.time()
+    bin_, model = str(cache / "bin/whisper-cli"), str(cache / f"models/{WHISPER_MODEL_NAME}.bin")
+    if not os.access(bin_, os.X_OK) or not os.path.isfile(model):
+        raise RuntimeError("whisper_missing")
+    threads = max(1, min(8, os.cpu_count() or 4))
+    timeout = max(300, int(audio_sec * 2))
+    detected = None
+    code, err = run([bin_, "-m", model, "-f", wav, "-l", "auto", "-t", str(threads), "--detect-language"], timeout)
+    m = re.search(r"auto-detected language:\s*([a-z]{2,3})\s*\(p\s*=\s*([\d.]+)\)", err)
+    if m:
+        detected = (m.group(1), float(m.group(2)))
+    other = detected and detected[0] not in ("hi", "ur") and detected[1] >= DETECT_CONFIDENT
+    langs = ["auto", "hi"] if other else ["hi", "auto"]
+    attempts, best = [], None
+    with tempfile.TemporaryDirectory(prefix="saturn-stt-w-") as d:
+        for lang in langs:
+            for temp in TEMPERATURES:
+                a0 = time.time()
+                out = os.path.join(d, f"out{len(attempts)}")
+                code, _ = run([bin_] + whisper_args(model, wav, out, lang, temp, threads), timeout)
+                verdict, lang_out, segs = "ok", None, []
+                if code != 0:
+                    verdict = "timeout" if code is None else f"exit_{code}"
+                else:
+                    try:
+                        with open(out + ".json", encoding="utf-8", errors="replace") as f:
+                            lang_out, segs = parse_whisper_full(f.read())
+                        verdict = repetition_verdict(segs)
+                        if verdict == "ok" and (lang == "hi" or lang_out == "hi") and devanagari_share(" ".join(s["text"] for s in segs)) < 0.5:
+                            verdict = "script"
+                    except (ValueError, OSError):
+                        verdict = "bad_json"
+                attempts.append({"language": lang, "temperature": temp, "detected": lang_out, "verdict": verdict, "elapsed_sec": round(time.time() - a0, 1)})
+                if verdict == "ok":
+                    best = {"language": lang_out, "segments": segs, "accepted": True}
+                    break
+                if segs and not best:
+                    best = {"language": lang_out, "segments": segs, "accepted": False}
+            if best and best["accepted"]:
+                break
+    if not best:
+        if all(a["verdict"].startswith("exit_") or a["verdict"] in ("timeout", "bad_json") for a in attempts):
+            raise RuntimeError(f"whisper_{attempts[0]['verdict'] if attempts else 'no_attempt'}")
+        best = {"language": None, "segments": [], "accepted": False}
+    best.update(attempts=attempts, detected=detected, elapsed_sec=round(time.time() - t0, 1),
+                engine=f"whisper.cpp {WHISPER_VERSION} ({WHISPER_COMMIT[:12]}), Metal",
+                model=f"{WHISPER_MODEL_NAME} (sha256 {WHISPER_MODEL_SHA256[:12]})")
+    return best
+
+
+# ---------------------------------------------------------------- MMS and diarization (venv workers)
+def venv_python(cache):
+    return str(cache / "venv/bin/python")
+
+
+def run_worker(cache, args, timeout, extra_env=None):
+    env = minimal_env({"HF_HOME": str(cache / "hf"), "HF_HUB_DISABLE_TELEMETRY": "1", "TOKENIZERS_PARALLELISM": "false",
+                       "PYTORCH_ENABLE_MPS_FALLBACK": "1", **(extra_env or {})})
+    if not os.access(venv_python(cache), os.X_OK):
+        return 2, "venv_missing"
+    return run([venv_python(cache), "-I", str(HERE / "workers.py")] + args, timeout, env)
+
+
+def run_mms(wav, audio_sec, cache):
+    with tempfile.TemporaryDirectory(prefix="saturn-stt-m-") as d:
+        out = os.path.join(d, "mms.json")
+        code, _ = run_worker(cache, ["mms", wav, "--model", str(cache / "models/mms-1b-all"), "--out", out],
+                             max(600, int(audio_sec * 3)), {"HF_HUB_OFFLINE": "1"})
+        if code != 0 or not os.path.isfile(out):
+            return {"status": "unavailable" if code == 2 else f"failed_{'timeout' if code is None else code}", "words": []}
+        with open(out, encoding="utf-8") as f:
+            r = json.load(f)
+    r["status"] = "ok"
+    return r
+
+
+def run_diarize(wav, audio_sec, cache):
+    tf = token_file()
+    if not tf.is_file():
+        return {"status": "off", "note": f"no Hugging Face token file (~/{tf.relative_to(pathlib.Path.home()) if str(tf).startswith(str(pathlib.Path.home())) else tf.name}); no speaker labels"}
+    if tf.stat().st_mode & 0o077:
+        return {"status": "off", "note": "token file is readable by others (chmod 600 it); diarization skipped"}
+    with tempfile.TemporaryDirectory(prefix="saturn-stt-d-") as d:
+        out = os.path.join(d, "diar.json")
+        code, _ = run_worker(cache, ["diarize", wav, "--token-file", str(tf), "--out", out], max(900, int(audio_sec * 3)))
+        if code != 0 or not os.path.isfile(out):
+            return {"status": "off", "note": "diarization model unavailable (token valid? pyannote terms accepted?); no speaker labels"
+                    if code == 2 else f"diarization failed ({'timeout' if code is None else code}); no speaker labels"}
+        with open(out, encoding="utf-8") as f:
+            r = json.load(f)
+    r["status"] = "on"
+    return r
+
+
+# ---------------------------------------------------------------- alignment
+def split_segment(s):
+    """Long whisper segments -> sub-segments at pauses or punctuation (word times), at most SUB_MAX_SEC each."""
+    words = s["words"]
+    if not words or s["end"] - s["start"] <= SUB_MAX_SEC:
+        return [{"start": s["start"], "end": s["end"], "text": s["text"]}]
+    out, cur = [], []
+    for i, w in enumerate(words):
+        cur.append(w)
+        dur = cur[-1]["end"] - cur[0]["start"]
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        pause = nxt is not None and nxt["start"] - w["end"] > 0.6
+        punct = bool(re.search(r"[,.?!।]$", w["w"]))
+        if nxt is None or dur >= SUB_MAX_SEC or (dur >= SUB_SPLIT_SEC and (pause or punct)):
+            out.append(cur)
+            cur = []
+    rows = []
+    for i, ws in enumerate(out):
+        st = s["start"] if i == 0 else ws[0]["start"]
+        en = s["end"] if i == len(out) - 1 else ws[-1]["end"]
+        rows.append({"start": st, "end": max(en, st), "text": " ".join(w["w"] for w in ws)})
+    return rows
+
+
+def build_rows(whisper, mms, diar):
+    rows = []
+    for s in whisper.get("segments") or []:
+        rows.extend(split_segment(s))
+    for r in rows:
+        r["mms"] = []
+    gap = []
+    for w in mms.get("words") or []:
+        mid = (w["start"] + w["end"]) / 2
+        best, dist = None, 1e9
+        for r in rows:
+            d = 0 if r["start"] <= mid < r["end"] else min(abs(mid - r["start"]), abs(mid - r["end"]))
+            if d < dist:
+                best, dist = r, d
+        if best is not None and dist <= 1.0:
+            best["mms"].append(w["w"])
+        else:
+            gap.append(w)
+    # MMS words far from any whisper segment: their own rows (speech whisper skipped)
+    groups = []
+    for w in gap:
+        if groups and w["start"] - groups[-1][-1]["end"] <= 1.5:
+            groups[-1].append(w)
+        else:
+            groups.append([w])
+    for g in groups:
+        rows.append({"start": g[0]["start"], "end": g[-1]["end"], "text": "", "mms": [w["w"] for w in g]})
+    rows.sort(key=lambda r: r["start"])
+    turns = diar.get("turns") or []
+    for i, r in enumerate(rows):
+        r["id"] = i + 1
+        r["mms"] = " ".join(r["mms"])
+        r["speaker"] = None
+        if turns:
+            ov = {}
+            for t in turns:
+                o = min(r["end"], t["end"]) - max(r["start"], t["start"])
+                if o > 0:
+                    ov[t["speaker"]] = ov.get(t["speaker"], 0) + o
+            if ov:
+                top = sorted(ov.items(), key=lambda kv: -kv[1])
+                span = max(r["end"] - r["start"], 0.01)
+                r["speaker"] = "+".join(k for k, v in top if v >= 0.3 * span) or top[0][0]
+    return rows
+
+
+# ---------------------------------------------------------------- reconciliation (Opus)
+RECONCILE_RULES = """You reconcile two machine transcripts of the same Hindi or Hinglish recording (phone calls with doctors and family, voice notes about health). For each segment you write a "suggested reading" in Devanagari for a human listener, who will check it against the audio.
+
+Engines:
+- whisper: whisper large-v3-turbo. Fluent, punctuated; sometimes invents plausible words, mishears nouns, or writes noise as words.
+- mms: Meta MMS-1b-all (CTC). Phonetic, no punctuation, misspells, splits or joins words; but it often catches nouns whisper missed.
+
+Strict rules:
+1. Use only words that at least one engine supports for this segment or a neighbouring segment (a sound-alike spelling counts as support). Never add words, never complete a sentence from context, never summarise or tidy.
+2. Never make a statement more specific than what was said. Keep vague words vague: बीमार stays बीमार (never "fever"/बुखार), दर्द stays दर्द, "ठीक नहीं" stays "ठीक नहीं". Never turn a feeling into a symptom or a diagnosis.
+3. Keep negations exactly as spoken (नहीं, ना, मत, न). If the engines disagree about a negation, keep it and mark it "(?)".
+4. Keep English loanwords as spoken (energy loss, weakness, ok, BP, sugar, tablet, report), written as the engines wrote them; never translate them or anything else.
+5. Mark every word you are not confident of with "(?)" right after it. Write [अस्पष्ट] where neither engine gives intelligible speech.
+6. Numbers, doses, units, times, dates, medicine names and body parts: copy them as heard and list each one in "check".
+7. No translation, no gloss, no explanation, no medical interpretation, no advice.
+8. A segment that is only noise, or empty in both engines: reading "".
+Return every segment id you were given, once."""
+
+RECONCILE_SCHEMA = {"type": "object", "required": ["segments"], "additionalProperties": False, "properties": {
+    "segments": {"type": "array", "items": {"type": "object", "required": ["id", "reading", "check"], "additionalProperties": False,
+                 "properties": {"id": {"type": "integer"}, "reading": {"type": "string"},
+                                "check": {"type": "array", "items": {"type": "string"}}}}}}}
+
+
+def batches(rows):
+    out, cur, size = [], [], 0
+    for r in rows:
+        n = len(r["text"]) + len(r["mms"]) + 40
+        if cur and (len(cur) >= BATCH_ROWS or size + n > BATCH_CHARS):
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(r)
+        size += n
+    if cur:
+        out.append(cur)
+    return out
+
+
+UNCERTAIN = "(?)"
+SUPPORT_SIM = 0.65  # a reading word needs an engine word at least this similar (normalised edit distance)
+
+
+def support_check(reading, rows, idx):
+    """Mark words of `reading` that no engine supports (segment idx and its neighbours) with "(?)". Returns
+    (reading, unsupported raw tokens). Similarity on normalised Latin forms (sttlib.norm_words)."""
+    cands = set()
+    for r in rows[max(0, idx - 1):idx + 2]:
+        cands.update(L.norm_words(r["text"]))
+        cands.update(L.norm_words(r["mms"]))
+    out, bad = [], []
+    toks = reading.split()
+    for i, tok in enumerate(toks):
+        if tok == UNCERTAIN or "अस्पष्ट" in tok:
+            out.append(tok)
+            continue
+        ws = L.norm_words(tok)
+        ok = all(any(w == c or (len(w) > 2 and L.similar(w, c) >= SUPPORT_SIM) or (len(w) <= 2 and L.similar(w, c) >= 0.5) for c in cands) for w in ws)
+        if not ok:
+            bad.append(tok.replace(UNCERTAIN, ""))
+            nxt_marked = i + 1 < len(toks) and toks[i + 1] == UNCERTAIN
+            if UNCERTAIN not in tok and not nxt_marked:
+                tok = tok + UNCERTAIN
+        out.append(tok)
+    return " ".join(out), bad
+
+
+NUMBERISH = re.compile(r"[0-9०-९]|\b(mg|ml|mcg|एमजी|एमएल|मिलीग्राम|गोली|टैबलेट|tablet)\b", re.I)
+
+
+def reconcile(rows, enabled=True):
+    meta = {"model": L.OPUS, "status": "off" if not enabled else "ok", "batches": 0, "failed_batches": 0, "elapsed_sec": 0,
+            "flagged_words": 0, "cost_usd": 0.0}
+    sugg = {}
+    if not enabled or not rows:
+        if enabled and not rows:
+            meta["status"] = "no_speech"
+        return sugg, meta
+    t0 = time.time()
+    for b in batches(rows):
+        meta["batches"] += 1
+        payload = {"segments": [{"id": r["id"], "time": f"{L.ts(r['start'])}-{L.ts(r['end'])}", "speaker": r["speaker"],
+                                 "whisper": r["text"], "mms": r["mms"]} for r in b]}
+        prompt = "Segments (JSON). Return the suggested reading for each id.\n\n" + json.dumps(payload, ensure_ascii=False)
+        out = None
+        for _ in range(2):
+            try:
+                out, usage = L.call_claude(RECONCILE_RULES, prompt, RECONCILE_SCHEMA, effort="medium")
+                meta["cost_usd"] += usage.get("cost_usd") or 0
+                break
+            except L.LlmError as e:
+                meta["last_error"] = str(e)
+                if str(e) == "auth_failed":
+                    break
+        if out is None:
+            meta["failed_batches"] += 1
+            continue
+        ids = {r["id"] for r in b}
+        for s in out.get("segments") or []:
+            if s.get("id") in ids and s["id"] not in sugg:
+                sugg[s["id"]] = {"reading": str(s.get("reading") or "").strip(), "check": [str(c) for c in s.get("check") or []][:20]}
+    index = {r["id"]: i for i, r in enumerate(rows)}
+    for sid, s in sugg.items():
+        s["reading"], s["unsupported"] = support_check(s["reading"], rows, index[sid])
+        meta["flagged_words"] += len(s["unsupported"])
+        s["check"] += [t for t in s["reading"].split() if NUMBERISH.search(t) and t not in s["check"]]
+    meta["elapsed_sec"] = round(time.time() - t0, 1)
+    meta["cost_usd"] = round(meta["cost_usd"], 4)
+    if meta["failed_batches"]:
+        meta["status"] = "failed" if meta["failed_batches"] == meta["batches"] else "partial"
+    return sugg, meta
+
+
+# ---------------------------------------------------------------- output file
+def q(v):
+    return json.dumps(v, ensure_ascii=False)
+
+
+def product_version():
+    try:
+        return subprocess.run(["git", "-C", str(HERE), "describe", "--tags", "--always", "--dirty"], capture_output=True,
+                              text=True, timeout=10).stdout.strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def render(o):
+    w, m, d, rc, rows, sugg = o["whisper"], o["mms"], o["diar"], o["rmeta"], o["rows"], o["sugg"]
+    spk = d["status"] == "on"
+    att = "; ".join(f"{a['language']}/t{a['temperature']}:{a['verdict']}" for a in w["attempts"])
+    det = f"{w['detected'][0]} p={w['detected'][1]}" if w.get("detected") else "none"
+    dnote = d.get("note") or f"{d.get('engine', '')} rev {str(d.get('revision', ''))[:12]}, {d.get('speakers')} speakers"
+    fm = [
+        "---", "generator: saturn-mac-stt", f"status: {'machine-transcript' if w['accepted'] else 'rejected'}", "listened: false",
+        f"audio: {q(o['rel'])}", f"audio_sha256: {o['sha']}", f"duration_sec: {round(o['audio_sec'], 1)}",
+        f"language: {w.get('language') or 'unknown'}", f"transcribed_at: {o['now']}", f"tool_version: {q(o['version'])}",
+        f"elapsed_sec: {o['elapsed']}",
+        f"whisper_engine: {q(w['engine'])}", f"whisper_model: {q(w['model'])}", f"whisper_settings: {q(settings_line())}",
+        f"whisper_detection: {q(det)}", f"whisper_attempts: {q(att)}", f"whisper_elapsed_sec: {w['elapsed_sec']}",
+        f"whisper_rtf: {round(w['elapsed_sec'] / o['audio_sec'], 3) if o['audio_sec'] else 'n/a'}",
+        f"mms_engine: {q(m.get('engine', 'facebook/mms-1b-all (adapter hin)') + ' rev ' + str(m.get('revision', '?'))[:12])}",
+        f"mms_status: {m['status']}", f"mms_device: {m.get('device', 'n/a')}", f"mms_elapsed_sec: {m.get('elapsed_sec', 0)}",
+        f"diarization: {d['status']}",
+        f"diarization_note: {q(dnote)}",
+        f"diarization_elapsed_sec: {d.get('elapsed_sec', 0)}",
+        f"reconcile_model: {rc['model']}", f"reconcile_status: {rc['status']}", f"reconcile_elapsed_sec: {rc['elapsed_sec']}",
+        f"reconcile_flagged_words: {rc['flagged_words']}", f"segments: {len(rows)}", "---", "",
+    ]
+    body = [
+        f"# Machine transcript (Mac): `{pathlib.Path(o['rel']).name}`", "",
+        "> **Machine transcript — needs a listener.** Made by speech-recognition models, not checked by a person; the",
+        "> audio is the record. The **raw engine outputs** (whisper, MMS) are verbatim machine output. The **suggested",
+        f"> reading** is an agent reconciliation of them ({rc['model']}; agent-inferred, not verified): uncertain words carry",
+        "> \"(?)\", and words no engine supports are marked automatically. No translation. " + L.FACTS_LINE,
+    ]
+    if not w["accepted"]:
+        body += [">", "> **REJECTED:** every whisper attempt failed the loop/repetition post-check."]
+    if not spk:
+        body += [">", f"> **No speaker labels:** {d.get('note', 'diarization off')}."]
+    body += [
+        ">", "> After listening, record it as the records guide says (Telegram voice notes: one line in",
+        "> `data/telegram/listened.ndjson`). A corrected transcript goes in `<audio-stem>.groundtruth.md` (it feeds the",
+        "> STT evaluation).", "",
+        f"- Audio: `{o['rel']}` ({round(o['audio_sec'])} s)", "",
+        "## Suggested reading (agent-reconciled; not verified)", "",
+    ]
+    tag = (lambda r: f"[{r['speaker'] or '?'}] ") if spk else (lambda r: "")
+    if rc["status"] in ("off", "failed", "no_speech"):
+        body.append(f"(not available: reconcile {rc['status']}{(' — ' + rc['last_error']) if rc.get('last_error') else ''})")
+    for r in rows:
+        s = sugg.get(r["id"])
+        if rc["status"] in ("off", "failed", "no_speech"):
+            break
+        text = s["reading"] if s else "(no suggestion for this segment)"
+        if s and not text:
+            text = "(no speech)"
+        body.append(f"[{L.ts(r['start'])} → {L.ts(r['end'])}] {tag(r)}{text}")
+    checks = []
+    for r in rows:
+        s = sugg.get(r["id"])
+        if not s:
+            continue
+        for c in s["check"]:
+            checks.append(f"- [{L.ts(r['start'])}] {c} — number, dose, medicine name or body part: check against the audio")
+        for c in s["unsupported"]:
+            checks.append(f"- [{L.ts(r['start'])}] {c} — no engine supports this word (marked (?))")
+    body += ["", "## Listener checks", ""] + (checks or ["(none)"])
+    body += ["", "## Raw whisper (verbatim, timed)", ""]
+    body += [f"[{L.ts(r['start'])} → {L.ts(r['end'])}] {tag(r)}{r['text']}" for r in rows if r["text"]] or ["(no speech recognised)"]
+    body += ["", f"## Raw MMS (verbatim, timed; words aligned to the whisper segments){'' if m['status'] == 'ok' else ' — ' + m['status']}", ""]
+    body += [f"[{L.ts(r['start'])} → {L.ts(r['end'])}] {r['mms']}" for r in rows if r["mms"]] or ["(no output)"]
+    return "\n".join(fm + body) + "\n"
+
+
+# ---------------------------------------------------------------- commands
+def mac_path(audio):
+    return audio.with_name(audio.name[: -len(audio.suffix)] + ".mac.transcript.md")
+
+
+def pending(records):
+    out = []
+    for p in sorted((records / "sources").glob("*/media/**/*")):
+        if p.is_file() and p.suffix.lower() in L.AUDIO_EXT and not mac_path(p).exists():
+            out.append(p)
+    return out
+
+
+def audio_seconds(wav):
+    return max(0.0, (os.path.getsize(wav) - 44) / 32000)
+
+
+def transcribe(audio, records, force=False, do_reconcile=True):
+    audio = audio.resolve()
+    rel = str(audio.relative_to(records.resolve()))
+    out = mac_path(audio)
+    if out.exists() and (not force or not out.read_text(encoding="utf-8").startswith(MARK)):
+        log(f"{audio.stem}: skipped (a .mac.transcript.md exists{'' if force else '; --force to redo our own'})")
+        return None
+    cache = cache_dir()
+    t0 = time.time()
+    with tempfile.TemporaryDirectory(prefix="saturn-stt-") as d:
+        wav = os.path.join(d, "audio.wav")
+        code, _ = run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(audio), "-ar", "16000",
+                       "-ac", "1", "-c:a", "pcm_s16le", wav], 600)
+        if code != 0:
+            raise RuntimeError("ffmpeg_failed")
+        sec = audio_seconds(wav)
+        w = run_whisper(wav, sec, cache)
+        m = run_mms(wav, sec, cache)
+        dz = run_diarize(wav, sec, cache)
+    rows = build_rows(w, m, dz)
+    sugg, rmeta = reconcile(rows, do_reconcile)
+    if rmeta["status"] == "failed":  # auth, rate limit, outage: write nothing, so the next run retries
+        raise RuntimeError(f"reconcile_failed ({rmeta.get('last_error', '?')})")
+    o = {"rel": rel, "sha": sha256(audio), "audio_sec": sec, "now": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+         "version": product_version(), "elapsed": round(time.time() - t0, 1), "whisper": w, "mms": m, "diar": dz,
+         "rmeta": rmeta, "rows": rows, "sugg": sugg}
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(render(o), encoding="utf-8")
+    tmp.replace(out)
+    log(f"{audio.stem}: {round(sec)} s audio; whisper {w['elapsed_sec']} s ({'accepted' if w['accepted'] else 'rejected'}, "
+        f"{len(w['attempts'])} attempt(s)); mms {m['status']} {m.get('elapsed_sec', 0)} s; diarization {dz['status']}; "
+        f"reconcile {rmeta['status']} {rmeta['elapsed_sec']} s, {rmeta['flagged_words']} flagged; {len(rows)} segments; "
+        f"total {o['elapsed']} s")
+    return out
+
+
+def cmd_pending(a):
+    records = pathlib.Path(a.records).resolve()
+    for p in pending(records):
+        print(p.relative_to(records))
+    return 0
+
+
+def cmd_transcribe(a):
+    records = pathlib.Path(a.records).resolve()
+    out = transcribe(pathlib.Path(a.audio), records, a.force, not a.no_reconcile)
+    if out:
+        print(out.relative_to(records))
+    return 0
+
+
+def sibling_tool(name):
+    return str(HERE.parent / name / name)
+
+
+def cmd_run(a):
+    records = pathlib.Path(a.records).resolve()
+    written = []
+    todo = pending(records)[: a.limit] if a.limit else pending(records)
+    log(f"run: {len(todo)} pending audio file(s)")
+    for p in todo:
+        try:
+            out = transcribe(p, records)
+        except RuntimeError as e:
+            log(f"{p.stem}: failed ({e})")
+            if any(k in str(e) for k in ("missing", "auth_failed", "rate_limited")):
+                break  # the next run retries; no point trying the other files now
+            continue
+        if not out:
+            continue
+        written.append(str(out.relative_to(records)))
+        if not a.no_answers:
+            r = subprocess.run([sys.executable, "-I", sibling_tool("answers"), "propose", "--records", str(records),
+                                "--audio", str(p.relative_to(records))], capture_output=True, text=True)
+            written += [x for x in r.stdout.splitlines() if x.strip()]
+            if r.returncode:
+                log(f"{p.stem}: answer proposals failed (exit {r.returncode})")
+    if not a.no_eval:
+        r = subprocess.run([sys.executable, "-I", sibling_tool("stt-eval"), "--records", str(records)], capture_output=True, text=True)
+        written += [x for x in r.stdout.splitlines() if x.strip() and not x.startswith("|")]
+        if r.returncode:
+            log(f"eval failed (exit {r.returncode})")
+    written = sorted(set(written))
+    if a.written:
+        pathlib.Path(a.written).write_text("".join(x + "\n" for x in written), encoding="utf-8")
+    for x in written:
+        print(x)
+    return 0
+
+
+def cmd_doctor(a):
+    cache = cache_dir()
+    ok = lambda b: "ok" if b else "MISSING"  # noqa: E731
+    w = cache / f"models/{WHISPER_MODEL_NAME}.bin"
+    print(f"cache: {cache}")
+    print(f"whisper-cli: {ok(os.access(cache / 'bin/whisper-cli', os.X_OK))}")
+    print(f"whisper model: {ok(w.is_file() and sha256(w) == WHISPER_MODEL_SHA256)}")
+    print(f"mms model: {ok((cache / 'models/mms-1b-all/adapter.hin.safetensors').is_file())}")
+    print(f"venv: {ok(os.access(venv_python(cache), os.X_OK))}")
+    tf = token_file()
+    print(f"hf token: {'present (diarization on)' if tf.is_file() else 'absent (diarization off)'}")
+    print(f"claude: {ok(shutil.which('claude'))}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="stt", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("pending")
+    p.add_argument("--records", required=True)
+    t = sub.add_parser("transcribe")
+    t.add_argument("audio")
+    t.add_argument("--records", required=True)
+    t.add_argument("--force", action="store_true", help="redo a .mac.transcript.md this tool wrote")
+    t.add_argument("--no-reconcile", action="store_true")
+    r = sub.add_parser("run")
+    r.add_argument("--records", required=True)
+    r.add_argument("--limit", type=int, default=0)
+    r.add_argument("--written", help="write the changed paths (relative to the records root) to this file")
+    r.add_argument("--no-answers", action="store_true")
+    r.add_argument("--no-eval", action="store_true")
+    sub.add_parser("doctor")
+    a = ap.parse_args(argv)
+    return {"pending": cmd_pending, "transcribe": cmd_transcribe, "run": cmd_run, "doctor": cmd_doctor}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

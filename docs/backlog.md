@@ -17,10 +17,10 @@ Work the owner has parked. Not scheduled. Pick up only when the owner un-parks a
 ## Transcription follow-ups (parked 31-Oct-2026)
 
 - Retire Sarvam fully (adapter, token inventory, secret name) now that STT is local whisper.cpp.
-- Faster STT if notes get long or frequent: run whisper on the home server as a turbo task (or the Mac when awake)
-  instead of the GitHub runner (currently ~5–6x slower than real time, job timeout 75 min).
-- After the ground-truth clip: evaluate whisper large-v3 (non-turbo), turbo, and Indic models (e.g. AI4Bharat
-  IndicConformer, Meta MMS) on WER/CER and medicine-name accuracy; pick by measured quality.
+- Done in v0.13.0: the Mac runner (`tools/stt`: whisper on Metal + MMS + optional diarization + Opus suggested
+  reading), answer proposals (`tools/answers`) and the growing eval set (`tools/stt-eval`). Still open: home-server
+  STT when the Mac is asleep for long; IndicConformer as an optional engine (needs the owner's HF token); whisper
+  large-v3 (non-turbo) in the eval; more ground-truth clips before choosing engines by measured quality.
 
 ## Dependency, package and model upgrades (parked 31-Oct-2026)
 

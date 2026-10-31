@@ -697,13 +697,15 @@ describe("voice notes: local transcript, verbatim statements, needs a listener",
     expect(repo.queue()[0]).toMatchObject({ reasons: ["transcript_rejected"] });
   });
 
-  it("a person's transcript is never overwritten; the per-run audio cap defers the rest", async () => {
+  it("a person's (or the Mac runner's) transcript is never overwritten; the per-run audio cap defers the rest", async () => {
     const { repo, key } = await setup();
     mkdirSync(join(root, "sources/alice/media/telegram"), { recursive: true });
     writeFileSync(join(root, "sources/alice/media/telegram/u-voice1.transcript.md"), "# hand-made transcript\n");
+    writeFileSync(join(root, "sources/alice/media/telegram/u-voice1.mac.transcript.md"), "# Mac runner transcript\n");
     await extract({ repo, extractor: new VoiceExtractor(), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
     expect(readFileSync(join(root, "sources/alice/media/telegram/u-voice1.transcript.md"), "utf8")).toBe("# hand-made transcript\n");
     expect(existsSync(join(root, "sources/alice/media/telegram/u-voice1.batch.transcript.md"))).toBe(true);
+    expect(readFileSync(join(root, "sources/alice/media/telegram/u-voice1.mac.transcript.md"), "utf8")).toBe("# Mac runner transcript\n"); // tools/stt output
     expect(ndjson(repo).find((x) => x.id === key)).toMatchObject({ transcript_path: "sources/alice/media/telegram/u-voice1.batch.transcript.md" });
 
     // Deadline already passed: the note waits as stt_pending (no engine call).
