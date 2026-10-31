@@ -174,6 +174,23 @@ class InferenceTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("rev 3 does not follow 1", p.stderr)
 
+    def test_problem_order_stakes_then_p_at_that_level(self):
+        def r(pid, title, st, p, b, stmt):
+            return row(problem=f"alice:dx:{pid}", problem_title=title, hypothesis=None, kind="status-summary",
+                       statement=stmt, stakes=st, p=p, bucket=b)
+        self.add(r("0001", "Problem Mixed", "can't-miss", 0.1, "5-20%", "Mixed low."),
+                 r("0001", "Problem Mixed", "housekeeping", 0.9, ">50%", "Mixed high."),
+                 r("0002", "Problem Critical", "can't-miss", 0.4, "20-50%", "Critical."),
+                 r("0003", "Problem House", "housekeeping", 0.95, ">50%", "House."),
+                 row(problem=None, problem_title=None, hypothesis=None, kind="status-summary",
+                     statement="Loose.", stakes="can't-miss", p=0.9, bucket=">50%"))
+        self.assertEqual(self.run_tool("gen").returncode, 0)
+        page = (self.root / "docs/health/alice/status.md").read_text()
+        heads = [l for l in page.splitlines() if l.startswith("## ")]
+        self.assertEqual([h.split(" (")[0] for h in heads],
+                         ["## Problem Critical", "## Problem Mixed", "## Problem House", "## Other inferences"])
+        self.assertLess(page.index("Mixed low."), page.index("Mixed high."))  # rows: stakes first
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

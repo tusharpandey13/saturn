@@ -102,6 +102,13 @@ INFERENCES = [
     dict(BASE_INF, id="alice:inf:0002", rev=1, status="active", statement="An older belief that was later retired."),
     dict(BASE_INF, id="alice:inf:0002", rev=2, status="retired", status_reason="explained",
          statement="An older belief that was later retired."),
+    # ordering: Mixed has a low can't-miss row and a high housekeeping row; Critical must still come first
+    dict(BASE_INF, id="alice:inf:0003", rev=1, status="active", problem="alice:dx:0002", problem_title="Zz Mixed",
+         stakes="can't-miss", p=0.1, bucket="5-20%", statement="Mixed low."),
+    dict(BASE_INF, id="alice:inf:0004", rev=1, status="active", problem="alice:dx:0002", problem_title="Zz Mixed",
+         stakes="housekeeping", p=0.9, statement="Mixed high."),
+    dict(BASE_INF, id="alice:inf:0005", rev=1, status="active", problem="alice:dx:0003", problem_title="Zz Critical",
+         stakes="can't-miss", p=0.4, bucket="20-50%", statement="Critical."),
 ]
 
 
@@ -241,6 +248,11 @@ class SiteTest(unittest.TestCase):
         self.assertIn("../notes/", st)  # the run note is linked
         self.assertIn('class="inferred"', self.pages["alice/overview.html"])
         self.assertNotIn('class="inferred"', self.pages["alice/results.html"])
+
+    def test_status_problem_order_matches_inference_gen(self):
+        st = self.pages["alice/status.html"]
+        heads = [st.index(t) for t in ("Zz Critical", "Zz Mixed", "Potassium above the range")]
+        self.assertEqual(heads, sorted(heads))
 
     def test_questions_and_todos(self):
         ov = self.pages["alice/overview.html"]

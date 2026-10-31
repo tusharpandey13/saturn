@@ -649,8 +649,14 @@ class Builder:
         if self.infs:
             groups = {}
             for i in self.infs:
-                groups.setdefault(i.get("problem_title") or "Other inferences", []).append(i)
-            for title, rows in groups.items():
+                groups.setdefault(i.get("problem"), []).append(i)
+
+            def gkey(item):  # same as tools/inference status_page: stakes, p at that level, problem id
+                k, rs = item
+                top = min(STAKES_ORDER.get(r.get("stakes"), 9) for r in rs)
+                return (k is None, top, -max((r.get("p") or 0) for r in rs if STAKES_ORDER.get(r.get("stakes"), 9) == top), k or "")
+            for pid, rows in sorted(groups.items(), key=gkey):
+                title = (max(rows, key=lambda r: r.get("recorded_at") or "").get("problem_title") if pid else None) or "Other inferences"
                 out.append(f'<h2>{ESC(title)} <span class="muted small">· {len(rows)}</span></h2>')
                 out += [self.inf_html(path, i) for i in rows]
         else:

@@ -449,7 +449,8 @@ def status_page(ns, display, cur):
 
     def gkey(item):
         k, rs = item
-        return (k is None, min(STAKE_RANK[r["stakes"]] for r in rs), -max(r["p"] for r in rs), k or "")
+        top = min(STAKE_RANK[r["stakes"]] for r in rs)
+        return (k is None, top, -max(r["p"] for r in rs if STAKE_RANK[r["stakes"]] == top), k or "")
 
     for pid, rs in sorted(groups.items(), key=gkey):
         title = max(rs, key=lambda r: r["recorded_at"])["problem_title"] if pid else None

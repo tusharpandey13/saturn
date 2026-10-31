@@ -81,6 +81,6 @@ Example (synthetic):
 - **`diff <ns> --run <path>`**: a belief diff for the run's rows against what they superseded: new, moved
   (old p → new p, bucket change), retired by the run, and active rows the run did not touch.
 - **`gen [--check]`**: writes `docs/health/<ns>/status.md` for every ns with `inferences/<ns>/inferences.ndjson`:
-  active inferences grouped by problem, problems and rows ordered by stakes (`can't-miss` first) then `p`; each row
+  active inferences grouped by problem, problems ordered by stakes (a problem's stakes is the most severe of its active rows; `can't-miss` first), then the highest `p` among the rows at that level, then problem id; rows within a problem by stakes then `p`; rows with no problem go last; each row
   with its bucket, reason, evidence ids, citations, what would change it, the review mark and the label.
   `--check` exits 1 when a page is stale.
