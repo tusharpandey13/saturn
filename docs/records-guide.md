@@ -53,6 +53,7 @@ Format: `<ns>:<class>:<local>`. `ns` is one of the `namespaces` in `records.yaml
 | Household to-dos | `docs/health/family/actions.md` |
 | Extraction notes, hard-reads, chat triage, analyses | `docs/log/…` (dated, append-only) |
 | Cross-check flags and claims register (ADR 012) | `crossref/` (checks, owner feedback, derived flag and claim state, run log) and the generated `docs/health/<ns>/flags.md`, `claims.md`; written by `tools/crossref` ([README](../tools/crossref/README.md)); give feedback with its `feedback` command |
+| Agent-inferred records (inferences; diagnostic loop, ADR 013) | `inferences/<ns>/inferences.ndjson` (append-only snapshots, last row per id wins) and the generated `docs/health/<ns>/status.md`; written only by `tools/inference` ([README](../tools/inference/README.md)); never KB facts |
 | Records-local config | `records.yaml`, `config/thresholds.yaml` (optional red-flag thresholds, below), `meta/stt-vocab.txt` (optional STT vocabulary), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
 
 ### `config/thresholds.yaml` (red-flag thresholds)
@@ -64,6 +65,15 @@ The product ships the rule engine but **no clinical values**. The values that tu
 - **Header fields:** `version`, `status` (`pending_clinician_signoff` or `signed_off`), `setBy`, `effectiveFrom` (`YYYY-MM-DD`). The digest prints the status next to every annotation.
 - **Changing values:** edit the file, bump `version`, set `setBy` and `effectiveFrom`, commit. Set `status: signed_off` only after the treating clinician has reviewed the values; until then keep `pending_clinician_signoff` and write "unverified; doctor sign-off pending" in the header comment. Cite the source of each value in a comment (guideline or doctor), and mark any value without a source `PLACEHOLDER`.
 - **Shape:** see the synthetic example `fixtures/records-example/config/thresholds.yaml` (example values for tests; not clinical guidance).
+
+### Inferences (agent-inferred records)
+
+Only a records repo whose `AGENTS.md` allows labelled interpretation keeps them ([diagnostic loop](methods/diagnostic-loop.md) step 8). An inference is one plain-language sentence produced by analysis (`hypothesis`, `interpretation`, `trend`, `risk` or `status-summary`) with a probability `p` and its bucket, the reason, the KB ids for and against, verified citations, what would change it, and the run note that produced it. It is never a KB fact and never a medicine instruction.
+
+- Write them only with `tools/inference` (`add`, `supersede`, `retire`, `review`); the tool checks the fields, that every KB id exists, the citation format and the word list, and fails loudly. Never edit `inferences.ndjson` by hand: a change is a new line (the last row per id wins).
+- A changed belief is a **supersede** (a new id with `supersedes`); an excluded or explained item is **retired** with a reason. The owner marks items `accepted` or `disputed` with `review`.
+- `docs/health/<ns>/status.md` is generated (`gen`, also run by the batch); every item there carries "Agent-inferred" and "Not a diagnosis. Doctors decide."
+- To turn the Status page on for a person, create an empty `inferences/<ns>/inferences.ndjson` and run `gen`.
 
 Technical state, run history and deploy decisions belong in the env repo, not here. Product decisions belong in the product `docs/decisions/`.
 
