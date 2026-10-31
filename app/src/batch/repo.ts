@@ -3,6 +3,7 @@
 //   data/telegram/YYYY-MM.ndjson      extracted rows ("rt": "d1.messages|d1.readings|d1.report_items|d1.symptoms|d1.context"), read by
 //                                     tools/kb/build (d1.context: life-context signals, ADR 010; not a D1 table)
 //   data/telegram/directory.ndjson    persons and chats ("rt": "d1.persons|d1.chats")
+//   data/telegram/handled-manually.ndjson  owner-written: messages whose facts tools/kb/build drops (not read here)
 //   data/queue/needs_deep.jsonl       work for the offline Opus agent (append-only)
 //   data/telegram/digests.jsonl       admin digests sent (IST date, message ids): one digest per day (append-only)
 //   sources/<person>/media/telegram/<file_unique_id>.<ext>   photos, PDFs, voice notes (ADR 003)
@@ -206,7 +207,7 @@ export class Repo {
   // ---------- extracted rows ----------
 
   kbRows(): Row[] {
-    return this.files("data/telegram", ".ndjson").filter((f) => !f.endsWith("directory.ndjson") && !f.endsWith("subject-overrides.ndjson")).flatMap((f) => readLines<Row>(f));
+    return this.files("data/telegram", ".ndjson").filter((f) => !f.endsWith("directory.ndjson") && !f.endsWith("subject-overrides.ndjson") && !f.endsWith("handled-manually.ndjson")).flatMap((f) => readLines<Row>(f));
   }
 
   /**

@@ -325,6 +325,64 @@ class ReportTest(unittest.TestCase):
         self.assertFalse(any(".-100.9." in f for f in facts))
 
 
+class HandledManuallyTest(unittest.TestCase):
+    """data/telegram/handled-manually.ndjson: replaced_by / duplicate_of messages keep their source, lose their facts."""
+    T = "2026-10-30T07:00:00.000Z"
+
+    def rows(self):
+        msg = lambda i, kind: {"rt": "d1.messages", "id": f"-100:{i}", "external_id": f"tg:90{i}", "person_id": "alice",
+                               "sender_person_id": "alice", "chat_id": "-100", "kind": kind, "media_ref": None, "raw_text": None,
+                               "received_at": f"2026-10-30T05:0{i}:00.000Z", "extraction_status": "ok", "extracted_at": self.T}
+        rd = lambda i, typ, v: {"rt": "d1.readings", "id": f"-100:{i}:r0", "source_message_id": f"-100:{i}", "person_id": "alice",
+                                "type": typ, "value": v, "value2": 80 if typ == "bp" else None, "value3": None, "unit": "x",
+                                "measured_at": f"2026-10-30T10:0{i}:00+05:30", "confidence": 0.9, "confirmed": 0, "extracted_at": self.T}
+        return [msg(1, "document"), rd(1, "potassium", 4.9), msg(2, "image"), rd(2, "bp", 120), msg(3, "image"), rd(3, "bp", 120),
+                msg(4, "text"), rd(4, "weight", 60)]
+
+    def run_build(self, handled):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tg = pathlib.Path(tmp.name) / "telegram"
+        tg.mkdir()
+        (tg / "2026-10.ndjson").write_text("".join(json.dumps(r) + "\n" for r in self.rows()))
+        (tg / "handled-manually.ndjson").write_text("".join(json.dumps(r) + "\n" for r in handled))
+        db = pathlib.Path(tmp.name) / "kb.sqlite"
+        out = build("--records", str(RECORDS), "--telegram", str(tg), "--db", str(db))
+        return out, (sqlite3.connect(db) if db.exists() else None)
+
+    def h(self, uid, **kw):
+        return {"update_id": uid, "reason": "synthetic", "at": "2026-10-31", "by": "tester", **kw}
+
+    def test_replaced_and_duplicate(self):
+        out, con = self.run_build([self.h(901, replaced_by=SRC), self.h(903, duplicate_of=902)])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.addCleanup(con.close)
+        facts = [r[0] for r in con.execute("SELECT id FROM fact WHERE id LIKE 'alice:fact:%-tg.-100.%' ORDER BY id")]
+        self.assertEqual(facts, ["alice:fact:2026-10-30-tg.-100.2.r0", "alice:fact:2026-10-30-tg.-100.4.r0"])
+        src = {r[0]: r[1:] for r in con.execute("SELECT id, rank, duplicate_of, tags, note FROM source WHERE id LIKE 'alice:src:%-tg.-100.%'")}
+        self.assertEqual(len(src), 4)  # every message stays recorded as evidence
+        r1, r3 = src["alice:src:2026-10-30-tg.-100.1"], src["alice:src:2026-10-30-tg.-100.3"]
+        self.assertEqual(r1[:3], ("copy", SRC, '["handled-manually"]'))
+        self.assertIn(f"replaced by {SRC}", r1[3])
+        self.assertEqual(r3[:3], ("copy", "alice:src:2026-10-30-tg.-100.2", '["handled-manually", "duplicate"]'))
+        self.assertEqual(src["alice:src:2026-10-30-tg.-100.2"][:2], ("original", None))
+
+    def test_errors(self):
+        cases = [([self.h(999, replaced_by=SRC)], "update_id 999 is not a recorded Telegram message"),
+                 ([self.h(901, replaced_by="alice:src:no-such-doc")], "replaced_by 'alice:src:no-such-doc' is not a source"),
+                 ([self.h(901)], "exactly one of replaced_by"),
+                 ([self.h(901, replaced_by=SRC, duplicate_of=902)], "exactly one of replaced_by"),
+                 ([self.h(903, duplicate_of=998)], "duplicate_of 998 is not a recorded Telegram message"),
+                 ([self.h(901, replaced_by=SRC), self.h(901, replaced_by=SRC)], "already marked")]
+        for rows, msg in cases:
+            with self.subTest(msg=msg):
+                out, con = self.run_build(rows)
+                if con:
+                    con.close()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn(msg, out.stderr + out.stdout)
+
+
 class ContextValidationTest(unittest.TestCase):
     run_case, append, expect_fail = ValidationTest.run_case, ValidationTest.append, ValidationTest.expect_fail
 

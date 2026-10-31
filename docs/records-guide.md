@@ -97,6 +97,17 @@ Never create a new list of questions, to-dos or gaps. Add to `questions.md` or `
 - ADRs change status only, with forward links both ways.
 - Answered questions move to "Answered" with the answer and its source. Never strike through in place.
 
+### Telegram messages handled manually
+
+Facts the KB build derives from Telegram (`data/telegram/YYYY-MM.ndjson`) cannot be superseded by hand. When the owner ingests a Telegram document properly as a manual source, or the same photo was sent twice before the batch's media dedup (v0.8.0; it checks new messages only, not pairs already extracted), append one line to **`data/telegram/handled-manually.ndjson`**:
+
+```json
+{"update_id": 900000001, "replaced_by": "alice:src:2026-01-15-example-lab-cbc", "reason": "ingested manually from the PDF", "at": "2026-10-31", "by": "owner"}
+{"update_id": 900000003, "duplicate_of": 900000002, "reason": "same photo sent twice", "at": "2026-10-31", "by": "owner"}
+```
+
+`tools/kb/build` then emits no facts for that message. Its source row stays as evidence (raw message and media untouched), tagged `handled-manually`, with `rank: copy` and `duplicate_of` pointing at the `replaced_by` source or at the first message's source. Each row needs exactly one of `replaced_by` or `duplicate_of`. The build fails on an unknown `update_id`, a `replaced_by` that is not a source in `data/`, or an `update_id` listed twice. Append only; remove a line only to undo a mistake.
+
 ## 8. Ingest fan-out (what each new input must update)
 
 | New input | Update |
