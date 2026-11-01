@@ -34,7 +34,7 @@ at pauses/punctuation (at most 12 s) so quotes have useful time ranges. MMS word
 time; MMS words far from any whisper segment (speech whisper skipped) keep their own rows.
 
 **Diarization** runs only when `~/.config/saturn/hf.token` exists (mode 0600; `SATURN_HF_TOKEN_FILE` overrides) and
-the owner has accepted the terms of `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0` on Hugging Face.
+the owner has accepted the terms of `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0` and `pyannote/speaker-diarization-community-1` (pyannote.audio 4.x fetches `xvec_transform.npz` from it) on Hugging Face.
 Without it the transcript has no speaker labels and says so in its banner and front matter. Each segment gets the
 speaker with the most overlap (`S1+S2` when two overlap substantially). Labels are per file (`S1` in one recording is
 not `S1` in another) and never name a person.
