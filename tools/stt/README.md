@@ -8,7 +8,7 @@ processed on a Mac (Apple silicon, Metal) when it is awake. The GitHub batch kee
 tools/stt/setup-mac.sh                                    # engines into ~/Library/Caches/saturn-stt (pinned, sha256-checked)
 tools/stt/stt doctor                                      # what is ready (engines, venv, HF token, claude)
 tools/stt/stt pending --records <dir>                     # audio without a .mac.transcript.md
-tools/stt/stt transcribe <audio> --records <dir>          # one file
+tools/stt/stt transcribe <audio> --records <dir> [--min-speakers 2]   # one file (a call: at least two speakers)
 tools/stt/stt run --records <dir> [--limit N]             # all pending + answer proposals + eval; prints changed paths
 tools/stt/mac-run.sh --records <clone>                    # one runner pass (lock, battery, pull, run, signed commit, push)
 tools/answers/answers list|propose|confirm|reject ...      # answer proposals from recordings
@@ -22,7 +22,7 @@ python3 -I tools/stt/test_stt.py                          # synthetic tests (fak
 |---|---|---|
 | ASR 1 | whisper.cpp `whisper-cli`, Metal build | v1.9.5, commit `d1be6fde11ac`; model `ggml-large-v3-turbo-q5_0` sha256 `394221709cd5` |
 | ASR 2 | Meta MMS-1b-all + Hindi adapter (CTC, transformers, MPS else CPU), 20 s chunks | HF revision `3d33597edbda`; every file sha256-checked |
-| Speakers (optional) | pyannote `speaker-diarization-3.1` | revision `84fd25912480`; needs the owner's HF token |
+| Speakers (optional) | pyannote `speaker-diarization-community-1` | revision `3533c8cf8e36`; every file sha256-checked; the owner's HF token fetches it once, runs are offline |
 | Suggested reading | Opus (`claude -p --model claude-opus-5-5 --tools ""`) | no tools; env = model auth, locale, paths |
 | Python deps | `requirements-mac.txt` | hash-pinned (`uv pip compile --generate-hashes`), Python 3.12 venv |
 
@@ -34,10 +34,26 @@ at pauses/punctuation (at most 12 s) so quotes have useful time ranges. MMS word
 time; MMS words far from any whisper segment (speech whisper skipped) keep their own rows.
 
 **Diarization** runs only when `~/.config/saturn/hf.token` exists (mode 0600; `SATURN_HF_TOKEN_FILE` overrides) and
-the owner has accepted the terms of `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0` and `pyannote/speaker-diarization-community-1` (pyannote.audio 4.x fetches `xvec_transform.npz` from it) on Hugging Face.
-Without it the transcript has no speaker labels and says so in its banner and front matter. Each segment gets the
-speaker with the most overlap (`S1+S2` when two overlap substantially). Labels are per file (`S1` in one recording is
-not `S1` in another) and never name a person.
+the owner has accepted the terms of `pyannote/speaker-diarization-community-1` on Hugging Face; `setup-mac.sh` then
+copies the pinned weights into the cache. Without it the transcript has no speaker labels and says so in its banner
+and front matter. Labels are per file (`S1` in one recording is not `S1` in another) and never name a person.
+Community-1 replaced 3.1 because it keeps a short second voice as its own turn where 3.1 folds it into the main one.
+
+- **Speaker count.** Default: free (`min 1`, no max), for voice notes. `stt transcribe` takes `--speakers N`,
+  `--min-speakers N`, `--max-speakers N`; a file named like a call (`...-call-...`) gets `--min-speakers 2`.
+- **Second-voice check** (free runs only, clips of 5 s or more, when the first pass finds one speaker). The voice of
+  each 1 s window of speech is compared with the file's median voice. If a stretch stands out (distance >= 0.7 with a
+  robust z-score >= 3.5), or the pipeline heard a second speaker only under the first, the pipeline runs again with
+  `min_speakers=2`. That pass is kept only when its speakers' voices differ (centroid distance >= 0.4). Forced splits of
+  one voice score 0.07-0.16 and real second speakers 0.64+, so otherwise the one-speaker result stays and the stretch that
+  stood out becomes `S?`. The front matter records the outcome. The thresholds come from few clips.
+- **Assignment.** Whisper words go to the speaker with the most time overlap in the pipeline's exclusive diarization
+  (one speaker at a time). A line splits where the speaker changes, unless the words have only estimated times.
+  There are no combined labels such as `S1+S2`.
+- **`S?` (needs a listener)** replaces a confident label when the line is in a speaker's stretch shorter than 2 s in a
+  multi-speaker file (gaps up to 1 s join a stretch), when under 30% of its word time overlaps its speaker, when no
+  turn covers it, or when the second-voice check marked it. Each one is in the Listener checks list, and
+  `speaker_uncertain_rows` in the front matter counts them. Whisper word times are coarse, so a boundary can be off by a word.
 
 **IndicConformer** (AI4Bharat) is a planned optional third engine: it needs the same token file and its own terms.
 Add it as a `workers.py` subcommand plus a raw section; the reconcile prompt and the eval pick up new sections.
@@ -49,7 +65,7 @@ reason), reconcile status and the number of auto-flagged words. Then a "machine 
 banner, and sections, every line `[mm:ss.s → mm:ss.s] [speaker] text` (speaker only with diarization):
 
 1. **Suggested reading** (agent-reconciled, agent-inferred, not verified), in Devanagari, uncertain words `(?)`.
-2. **Listener checks**: numbers, doses, medicine names and body parts, and every word no engine supports.
+2. **Listener checks**: numbers, doses, medicine names and body parts, every word no engine supports, and every `S?` line.
 3. **Raw whisper** and **Raw MMS**: verbatim engine output. These are the record of what the machines heard.
 
 Rules given to Opus: use only words at least one engine supports (this segment or a neighbour); never add content or

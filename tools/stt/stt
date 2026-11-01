@@ -3,7 +3,7 @@
 
 Usage:
   tools/stt/stt pending --records DIR                       audio without a .mac.transcript.md (one path per line)
-  tools/stt/stt transcribe AUDIO --records DIR [--force] [--no-reconcile]
+  tools/stt/stt transcribe AUDIO --records DIR [--force] [--no-reconcile] [--speakers N] [--min-speakers N] [--max-speakers N]
   tools/stt/stt run --records DIR [--limit N] [--written FILE] [--no-answers] [--no-eval]
   tools/stt/stt doctor                                      engines, cache, token: what is ready (no content)
 
@@ -11,8 +11,9 @@ Per audio file (sources/<ns>/media/**.{ogg,oga,m4a,mp3,wav,opus}) it writes `<au
   1. whisper.cpp large-v3-turbo q5_0 on Metal, the production settings of adapters/stt/whisper-cpp.ts (Hindi first,
      auto fallback, loop protection, repetition post-check; never a translation pass); word times from token offsets;
   2. Meta MMS-1b-all + Hindi adapter (CTC, MPS/CPU) in 20 s chunks, words aligned to the whisper segments by time;
-  3. speaker diarization (pyannote/speaker-diarization-3.1) only when the owner's token file exists
-     (~/.config/saturn/hf.token, 0600); otherwise no speaker labels, and the file says so;
+  3. speaker diarization (pyannote/speaker-diarization-community-1) only when the owner's token file exists
+     (~/.config/saturn/hf.token, 0600); otherwise no speaker labels, and the file says so. Speakers are assigned per
+     word by time overlap, lines split at speaker changes, and doubtful attributions are labelled S? for a listener;
   4. a reconciled "suggested reading" per segment (Opus via `claude -p --tools ""`, strict rules: README), checked
      deterministically: any word no engine supports is marked "(?)" and listed for the listener.
 Raw engine outputs stay in the file and are the record; the suggestion is labelled agent-inferred.
@@ -37,6 +38,12 @@ DETECT_CONFIDENT = 0.8
 MARK = "---\ngenerator: saturn-mac-stt"
 SUB_MAX_SEC, SUB_SPLIT_SEC = 12.0, 4.0  # sub-segment long whisper segments at pauses/punctuation (display + quotes)
 BATCH_ROWS, BATCH_CHARS = 30, 6000
+DIAR_MODEL_DIR = "models/speaker-diarization-community-1"
+UNSURE_SPEAKER = "S?"
+SHORT_TURN_SEC, TURN_MERGE_GAP_SEC = 2.0, 1.0  # a speaker's stretch shorter than this, in a multi-speaker file, is doubtful
+LOW_SHARE = 0.3  # a line with less of its word time under its speaker is doubtful (whisper word times are coarse: not 0.5)
+NEAR_SEC, TINY_RUN_SEC = 0.5, 0.25
+CALL_NAME = re.compile(r"(^|[-_.])call([-_.]|$)", re.I)
 
 
 def log(msg):
@@ -150,7 +157,7 @@ def parse_whisper_full(raw):
             for ch in str(t.get("text", "")):
                 chars.append(ch)
                 times.append((o.get("from", 0) / 1000, o.get("to", 0) / 1000))
-        words = []
+        words, timed = [], True
         if "".join(chars).strip() == text and "�" not in text:
             cur, cs, ce = "", None, None
             for ch, (a, b) in zip(chars, times):
@@ -167,12 +174,12 @@ def parse_whisper_full(raw):
         else:
             parts = text.split()
             total = sum(len(p) for p in parts) or 1
-            t = start
+            t, timed = start, False
             for p in parts:
                 d = (end - start) * len(p) / total
                 words.append({"w": p, "start": round(t, 2), "end": round(t + d, 2)})
                 t += d
-        segs.append({"start": start, "end": end, "text": text, "words": words})
+        segs.append({"start": start, "end": end, "text": text, "words": words, "timed": timed})
     return (j.get("result") or {}).get("language"), segs
 
 
@@ -253,7 +260,14 @@ def run_mms(wav, audio_sec, cache):
     return r
 
 
-def run_diarize(wav, audio_sec, cache):
+def speaker_hints(audio, speakers=None, min_speakers=None, max_speakers=None):
+    """Explicit flags win; a file named like a call (`...-call-...`) has at least two speakers; else the free default."""
+    if not (speakers or min_speakers or max_speakers) and CALL_NAME.search(pathlib.Path(audio).stem):
+        min_speakers = 2
+    return {k: v for k, v in (("speakers", speakers), ("min_speakers", min_speakers), ("max_speakers", max_speakers)) if v}
+
+
+def run_diarize(wav, audio_sec, cache, hints=None):
     tf = token_file()
     if not tf.is_file():
         return {"status": "off", "note": f"no Hugging Face token file (~/{tf.relative_to(pathlib.Path.home()) if str(tf).startswith(str(pathlib.Path.home())) else tf.name}); no speaker labels"}
@@ -261,9 +275,11 @@ def run_diarize(wav, audio_sec, cache):
         return {"status": "off", "note": "token file is readable by others (chmod 600 it); diarization skipped"}
     with tempfile.TemporaryDirectory(prefix="saturn-stt-d-") as d:
         out = os.path.join(d, "diar.json")
-        code, _ = run_worker(cache, ["diarize", wav, "--token-file", str(tf), "--out", out], max(900, int(audio_sec * 3)))
+        flags = [x for k, v in (hints or {}).items() for x in ("--" + k.replace("_", "-"), str(v))]
+        code, _ = run_worker(cache, ["diarize", wav, "--model", str(cache / DIAR_MODEL_DIR), "--out", out] + flags,
+                             max(900, int(audio_sec * 3)), {"HF_HUB_OFFLINE": "1"})
         if code != 0 or not os.path.isfile(out):
-            return {"status": "off", "note": "diarization model unavailable (token valid? pyannote terms accepted?); no speaker labels"
+            return {"status": "off", "note": "diarization model unavailable (run tools/stt/setup-mac.sh with the token; pyannote terms accepted?); no speaker labels"
                     if code == 2 else f"diarization failed ({'timeout' if code is None else code}); no speaker labels"}
         with open(out, encoding="utf-8") as f:
             r = json.load(f)
@@ -276,7 +292,7 @@ def split_segment(s):
     """Long whisper segments -> sub-segments at pauses or punctuation (word times), at most SUB_MAX_SEC each."""
     words = s["words"]
     if not words or s["end"] - s["start"] <= SUB_MAX_SEC:
-        return [{"start": s["start"], "end": s["end"], "text": s["text"]}]
+        return [{"start": s["start"], "end": s["end"], "text": s["text"], "words": words if s.get("timed", True) else []}]
     out, cur = [], []
     for i, w in enumerate(words):
         cur.append(w)
@@ -291,14 +307,100 @@ def split_segment(s):
     for i, ws in enumerate(out):
         st = s["start"] if i == 0 else ws[0]["start"]
         en = s["end"] if i == len(out) - 1 else ws[-1]["end"]
-        rows.append({"start": st, "end": max(en, st), "text": " ".join(w["w"] for w in ws)})
+        rows.append({"start": st, "end": max(en, st), "text": " ".join(w["w"] for w in ws), "words": ws if s.get("timed", True) else []})
     return rows
+
+
+def overlap_by_speaker(start, end, turns):
+    ov = {}
+    for t in turns:
+        o = min(end, t["end"]) - max(start, t["start"])
+        if o > 0:
+            ov[t["speaker"]] = ov.get(t["speaker"], 0) + o
+    return ov
+
+
+def word_speaker(w, turns):
+    """The speaker with the most overlap; a word in a gap takes the nearest turn within NEAR_SEC; else None."""
+    ov = overlap_by_speaker(w["start"], w["end"], turns)
+    if ov:
+        return max(ov, key=ov.get)
+    d, spk = min(((min(abs(w["start"] - t["end"]), abs(w["end"] - t["start"])), t["speaker"]) for t in turns), key=lambda x: x[0])
+    return spk if d <= NEAR_SEC else None
+
+
+def split_at_speakers(row, turns):
+    """One row -> rows at speaker changes (word times). Needs real word times; a lone tiny word cannot make a change."""
+    words = row.get("words") or []
+    if len(words) < 2:
+        return [row]
+    labels = [word_speaker(w, turns) for w in words]
+    for order in (range(1, len(labels)), range(len(labels) - 2, -1, -1)):  # a word in a gap takes a neighbour's label
+        for i in order:
+            labels[i] = labels[i] or labels[i - 1 if order.step > 0 else i + 1]
+    for i in range(1, len(words) - 1):
+        if labels[i - 1] == labels[i + 1] != labels[i] != UNSURE_SPEAKER and words[i]["end"] - words[i]["start"] < TINY_RUN_SEC:
+            labels[i] = labels[i - 1]
+    groups, out = [], []
+    for w, lab in zip(words, labels):
+        if groups and groups[-1][0] == lab:
+            groups[-1][1].append(w)
+        else:
+            groups.append((lab, [w]))
+    if len(groups) == 1:
+        return [row]
+    for i, (_, ws) in enumerate(groups):
+        st = row["start"] if i == 0 else ws[0]["start"]
+        en = row["end"] if i == len(groups) - 1 else ws[-1]["end"]
+        out.append({"start": st, "end": max(en, st), "text": " ".join(w["w"] for w in ws), "words": ws})
+    return out
+
+
+def short_stretches(turns):
+    """A speaker's stretches (same speaker, no one else between, gaps up to TURN_MERGE_GAP_SEC) shorter than
+    SHORT_TURN_SEC. None in a one-speaker file: a short phrase there has no one to be confused with."""
+    known = [t for t in sorted(turns, key=lambda t: t["start"]) if t["speaker"] != UNSURE_SPEAKER]
+    if len({t["speaker"] for t in known}) < 2:
+        return []
+    runs = []
+    for t in known:
+        if runs and runs[-1]["speaker"] == t["speaker"] and t["start"] - runs[-1]["end"] <= TURN_MERGE_GAP_SEC:
+            runs[-1]["end"] = t["end"]
+        else:
+            runs.append(dict(t))
+    return [r for r in runs if r["end"] - r["start"] < SHORT_TURN_SEC]
+
+
+def attribute_row(row, turns, short):
+    """Sets row["speaker"] (most overlap over the row's words, else its span) and row["speaker_why"] when doubtful."""
+    words = [w for w in row.get("words") or [] if w["end"] > w["start"]]
+    spans = [(w["start"], w["end"]) for w in words] or [(row["start"], row["end"])]
+    ov = {}
+    for a, b in spans:
+        for k, v in overlap_by_speaker(a, b, turns).items():
+            ov[k] = ov.get(k, 0) + v
+    row["speaker"], row["speaker_why"] = UNSURE_SPEAKER, None
+    if not ov:
+        row["speaker_why"] = "no speaker turn covers this line"
+        return
+    best = max(ov, key=ov.get)
+    spoken = sum(b - a for a, b in spans) if words else sum(ov.values())  # a row without word times spans its pauses
+    if best == UNSURE_SPEAKER:
+        row["speaker_why"] = "this stretch does not sound like the main voice; possibly a second speaker"
+    elif ov[best] / max(spoken, 0.01) < LOW_SHARE:
+        row["speaker_why"] = "low overlap with any speaker turn"
+    elif sum(sum(overlap_by_speaker(a, b, [t]).get(best, 0) for a, b in spans) for t in short if t["speaker"] == best) >= ov[best] / 2:
+        row["speaker_why"] = f"short turn (under {SHORT_TURN_SEC:.0f} s)"
+    else:
+        row["speaker"] = best
 
 
 def build_rows(whisper, mms, diar):
     rows = []
+    turns = diar.get("turns") or []
     for s in whisper.get("segments") or []:
-        rows.extend(split_segment(s))
+        for r in split_segment(s):
+            rows.extend(split_at_speakers(r, turns) if turns else [r])
     for r in rows:
         r["mms"] = []
     gap = []
@@ -323,21 +425,13 @@ def build_rows(whisper, mms, diar):
     for g in groups:
         rows.append({"start": g[0]["start"], "end": g[-1]["end"], "text": "", "mms": [w["w"] for w in g]})
     rows.sort(key=lambda r: r["start"])
-    turns = diar.get("turns") or []
+    short = short_stretches(turns)
     for i, r in enumerate(rows):
         r["id"] = i + 1
         r["mms"] = " ".join(r["mms"])
-        r["speaker"] = None
+        r["speaker"], r["speaker_why"] = None, None
         if turns:
-            ov = {}
-            for t in turns:
-                o = min(r["end"], t["end"]) - max(r["start"], t["start"])
-                if o > 0:
-                    ov[t["speaker"]] = ov.get(t["speaker"], 0) + o
-            if ov:
-                top = sorted(ov.items(), key=lambda kv: -kv[1])
-                span = max(r["end"] - r["start"], 0.01)
-                r["speaker"] = "+".join(k for k, v in top if v >= 0.3 * span) or top[0][0]
+            attribute_row(r, turns, short)
     return rows
 
 
@@ -466,12 +560,25 @@ def product_version():
         return "unknown"
 
 
+def diar_summary(d):
+    out = f"{d.get('engine', '')} rev {str(d.get('revision', ''))[:12]}, {d.get('speakers')} speakers"
+    if d.get("hints"):
+        out += ", hints " + " ".join(f"{k}={v}" for k, v in d["hints"].items())
+    c = d.get("second_voice_check") or {}
+    if c.get("retried"):
+        out += f", second-voice retry {'accepted' if c.get('accepted') else 'rejected'} (voice distance {c.get('centroid_distance')})"
+        if c.get("uncertain_stretches"):
+            out += f", {c['uncertain_stretches']} stretch(es) marked S?"
+    return out
+
+
 def render(o):
     w, m, d, rc, rows, sugg = o["whisper"], o["mms"], o["diar"], o["rmeta"], o["rows"], o["sugg"]
     spk = d["status"] == "on"
     att = "; ".join(f"{a['language']}/t{a['temperature']}:{a['verdict']}" for a in w["attempts"])
     det = f"{w['detected'][0]} p={w['detected'][1]}" if w.get("detected") else "none"
-    dnote = d.get("note") or f"{d.get('engine', '')} rev {str(d.get('revision', ''))[:12]}, {d.get('speakers')} speakers"
+    dnote = d.get("note") or diar_summary(d)
+    unsure = [r for r in rows if r.get("speaker_why")]
     fm = [
         "---", "generator: saturn-mac-stt", f"status: {'machine-transcript' if w['accepted'] else 'rejected'}", "listened: false",
         f"audio: {q(o['rel'])}", f"audio_sha256: {o['sha']}", f"duration_sec: {round(o['audio_sec'], 1)}",
@@ -484,7 +591,7 @@ def render(o):
         f"mms_status: {m['status']}", f"mms_device: {m.get('device', 'n/a')}", f"mms_elapsed_sec: {m.get('elapsed_sec', 0)}",
         f"diarization: {d['status']}",
         f"diarization_note: {q(dnote)}",
-        f"diarization_elapsed_sec: {d.get('elapsed_sec', 0)}",
+        f"diarization_elapsed_sec: {d.get('elapsed_sec', 0)}", f"speaker_uncertain_rows: {len(unsure)}",
         f"reconcile_model: {rc['model']}", f"reconcile_status: {rc['status']}", f"reconcile_elapsed_sec: {rc['elapsed_sec']}",
         f"reconcile_flagged_words: {rc['flagged_words']}", f"segments: {len(rows)}", "---", "",
     ]
@@ -499,6 +606,9 @@ def render(o):
         body += [">", "> **REJECTED:** every whisper attempt failed the loop/repetition post-check."]
     if not spk:
         body += [">", f"> **No speaker labels:** {d.get('note', 'diarization off')}."]
+    elif unsure:
+        body += [">", f"> **Speaker uncertain on {len(unsure)} line(s), labelled `S?` (needs a listener):** a short turn or weak",
+                 "> overlap; the machine cannot say who spoke. They are listed under Listener checks."]
     body += [
         ">", "> After listening, record it as the records guide says (Telegram voice notes: one line in",
         "> `data/telegram/listened.ndjson`). A corrected transcript goes in `<audio-stem>.groundtruth.md` (it feeds the",
@@ -519,6 +629,8 @@ def render(o):
         body.append(f"[{L.ts(r['start'])} → {L.ts(r['end'])}] {tag(r)}{text}")
     checks = []
     for r in rows:
+        if r.get("speaker_why"):
+            checks.append(f"- [{L.ts(r['start'])}] who is speaking? S? — {r['speaker_why']}: needs a listener")
         s = sugg.get(r["id"])
         if not s:
             continue
@@ -551,7 +663,7 @@ def audio_seconds(wav):
     return max(0.0, (os.path.getsize(wav) - 44) / 32000)
 
 
-def transcribe(audio, records, force=False, do_reconcile=True):
+def transcribe(audio, records, force=False, do_reconcile=True, hints=None):
     audio = audio.resolve()
     rel = str(audio.relative_to(records.resolve()))
     out = mac_path(audio)
@@ -569,7 +681,7 @@ def transcribe(audio, records, force=False, do_reconcile=True):
         sec = audio_seconds(wav)
         w = run_whisper(wav, sec, cache)
         m = run_mms(wav, sec, cache)
-        dz = run_diarize(wav, sec, cache)
+        dz = run_diarize(wav, sec, cache, hints if hints is not None else speaker_hints(audio))
     rows = build_rows(w, m, dz)
     sugg, rmeta = reconcile(rows, do_reconcile)
     if rmeta["status"] == "failed":  # auth, rate limit, outage: write nothing, so the next run retries
@@ -596,7 +708,8 @@ def cmd_pending(a):
 
 def cmd_transcribe(a):
     records = pathlib.Path(a.records).resolve()
-    out = transcribe(pathlib.Path(a.audio), records, a.force, not a.no_reconcile)
+    hints = speaker_hints(a.audio, a.speakers, a.min_speakers, a.max_speakers)
+    out = transcribe(pathlib.Path(a.audio), records, a.force, not a.no_reconcile, hints)
     if out:
         print(out.relative_to(records))
     return 0
@@ -652,6 +765,7 @@ def cmd_doctor(a):
     print(f"venv: {ok(os.access(venv_python(cache), os.X_OK))}")
     tf = token_file()
     print(f"hf token: {'present (diarization on)' if tf.is_file() else 'absent (diarization off)'}")
+    print(f"diarization model: {ok((cache / DIAR_MODEL_DIR / 'config.yaml').is_file())}")
     print(f"claude: {ok(shutil.which('claude'))}")
     return 0
 
@@ -666,6 +780,9 @@ def main(argv=None):
     t.add_argument("--records", required=True)
     t.add_argument("--force", action="store_true", help="redo a .mac.transcript.md this tool wrote")
     t.add_argument("--no-reconcile", action="store_true")
+    t.add_argument("--speakers", type=int, help="exact speaker count, when you know it")
+    t.add_argument("--min-speakers", type=int, help="at least this many speakers (a call: 2)")
+    t.add_argument("--max-speakers", type=int)
     r = sub.add_parser("run")
     r.add_argument("--records", required=True)
     r.add_argument("--limit", type=int, default=0)

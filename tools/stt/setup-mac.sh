@@ -6,8 +6,10 @@
 #   models/ggml-large-v3-turbo-q5_0.bin                       sha256 checked (same model as the batch)
 #   models/mms-1b-all/       facebook/mms-1b-all at a pinned revision, base model + Hindi adapter, sha256 checked
 #   venv/                    Python 3.12 (uv) with requirements-mac.txt (hash-pinned: torch, transformers, pyannote.audio)
-# Diarization weights (pyannote/speaker-diarization-3.1) are gated: they are fetched on first use, only when the owner's
-# Hugging Face token file exists (~/.config/saturn/hf.token, 0600), into CACHE/hf. Prints paths and versions, no content.
+#   models/speaker-diarization-community-1/   pyannote weights at a pinned revision, sha256 checked. Gated: fetched only
+#                            when the owner's Hugging Face token file exists (~/.config/saturn/hf.token, 0600), read from
+#                            that file into a curl header (never on a command line, never printed); runs need no network.
+# Prints paths and versions, no content.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cache="${1:-${SATURN_STT_CACHE:-$HOME/Library/Caches/saturn-stt}}"
@@ -26,6 +28,15 @@ MMS_FILES=(   # file sha256 (public model files; the hashes are not secrets)
   "tokenizer_config.json 42a65547cf0654d12263ece7c909c4b0c574b660c78658f806c772cc223bc01b"  # gitleaks:allow
   "vocab.json 0375a07a977a599040a7ff333b6974996965cd93754020619518c15db7691f01"
 )
+DIAR_REV=3533c8cf8e369892e6b79ff1bf80f7b0286a54ee
+DIAR_FILES=(   # file sha256 (public model files; the hashes are not secrets)
+  "config.yaml 5ce2bfa9a938dc132cec1172592d65173cbb8f444ea1e4133f10f9391de155be"
+  "embedding/pytorch_model.bin 6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"
+  "segmentation/pytorch_model.bin 7ad24338d844fb95985486eb1a464e32d229f6d7a03c9abe60f978bacf3f816e"
+  "plda/plda.npz 9b77bcd840692710dd3496f62ecfeed8d8e5f002fd991b785079b244eab7d255"
+  "plda/xvec_transform.npz 325f1ce8e48f7e55e9c8aa47e05d2766b7c48c4b25b8de8dd751e7a4cc5fbe8f"
+)
+token_file="${SATURN_HF_TOKEN_FILE:-$HOME/.config/saturn/hf.token}"
 mkdir -p "$cache/bin" "$cache/models/mms-1b-all" "$cache/hf"
 ok() { [ -f "$2" ] && [ "$(shasum -a 256 "$2" | cut -d' ' -f1)" = "$1" ]; }
 fetch() { # fetch URL DEST SHA256
@@ -53,6 +64,21 @@ for entry in "${MMS_FILES[@]}"; do
   fetch "https://huggingface.co/facebook/mms-1b-all/resolve/$MMS_REV/$f" "$cache/models/mms-1b-all/$f" "$sha"
 done
 
+fetch_diar() {
+  local f="$1" sha="$2" dest="$cache/models/speaker-diarization-community-1/$1"
+  ok "$sha" "$dest" && return 0
+  mkdir -p "$(dirname "$dest")"
+  curl -fsSL --retry 3 -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$token_file")") -o "$dest.part" \
+    "https://huggingface.co/pyannote/speaker-diarization-community-1/resolve/$DIAR_REV/$f" || { rm -f "$dest.part"; return 1; }
+  ok "$sha" "$dest.part" || { rm -f "$dest.part"; echo "setup-mac: checksum mismatch for $f" >&2; exit 1; }
+  mv "$dest.part" "$dest"; echo "setup-mac: fetched $f (sha256 ${sha:0:12})"
+}
+if [ -f "$token_file" ]; then
+  for entry in "${DIAR_FILES[@]}"; do
+    fetch_diar "${entry%% *}" "${entry##* }" || { echo "setup-mac: diarization model not fetched (token valid? terms of pyannote/speaker-diarization-community-1 accepted?): diarization off" >&2; break; }
+  done
+fi
+
 req="$here/requirements-mac.txt"
 stamp="$cache/venv/.req-sha256"
 want="$(shasum -a 256 "$req" | cut -d' ' -f1)"
@@ -62,5 +88,5 @@ if [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
   echo "$want" > "$stamp"
   echo "setup-mac: venv ready (requirements sha256 ${want:0:12})"
 fi
-if [ -f "$HOME/.config/saturn/hf.token" ]; then echo "setup-mac: HF token present: diarization enabled"; else echo "setup-mac: no HF token: diarization off"; fi
+if [ -f "$token_file" ]; then echo "setup-mac: HF token present: diarization enabled"; else echo "setup-mac: no HF token: diarization off"; fi
 echo "setup-mac: ready ($cache)"

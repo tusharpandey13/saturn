@@ -20,6 +20,7 @@ def load(name, path):
 
 
 STT = load("stt_tool", HERE / "stt")
+WORKERS = load("stt_workers", HERE / "workers.py")
 ANS = load("answers_tool", ROOT / "tools/answers/answers")
 EVAL = load("stt_eval_tool", ROOT / "tools/stt-eval/stt-eval")
 
@@ -56,7 +57,8 @@ if cmd == "mms":
              {"w": "पानी", "start": 20.0, "end": 20.5}]
     json.dump({"engine": "facebook/mms-1b-all (adapter hin)", "revision": "fake", "device": "cpu", "words": words, "elapsed_sec": 0.1}, open(out, "w"), ensure_ascii=False)
 else:
-    json.dump({"engine": "fake", "revision": "fake", "speakers": 2, "turns": [{"start": 0, "end": 6.6, "speaker": "S1"}, {"start": 6.6, "end": 30, "speaker": "S2"}], "elapsed_sec": 0.1}, open(out, "w"))
+    open(__file__ + ".diar-args", "w").write(json.dumps(a))
+    json.dump({"engine": "fake", "revision": "fake", "speakers": 2, "turns": [{"start": 0, "end": 6.6, "speaker": "S1"}, {"start": 7.0, "end": 8.5, "speaker": "S2"}, {"start": 8.5, "end": 30, "speaker": "S1"}], "elapsed_sec": 0.1}, open(out, "w"))
 '''
 
 # Fake `claude`: answers by schema. Reconcile echoes whisper but invents "बुखार" in segment 1 (must be flagged).
@@ -186,6 +188,102 @@ class Unit(unittest.TestCase):
         self.assertEqual(rows[3]["text"], "")
         self.assertEqual([r["speaker"] for r in rows], ["S1", "S1", "S2", "S2"])
 
+    def seg_words(self, *spans):
+        """A timed whisper segment of neutral synthetic words, one per (start, end) span."""
+        words = [{"w": f"w{i}", "start": a, "end": b} for i, (a, b) in enumerate(spans)]
+        return {"start": spans[0][0], "end": spans[-1][1], "text": " ".join(w["w"] for w in words), "words": words, "timed": True}
+
+    def speakers(self, seg, turns):
+        return [(r["text"], r["speaker"]) for r in STT.build_rows({"segments": [seg]}, {"words": []}, {"turns": turns})]
+
+    def test_line_splits_at_speaker_change(self):
+        seg = self.seg_words((0, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 12))
+        turns = [{"start": 0, "end": 6, "speaker": "S1"}, {"start": 6, "end": 12, "speaker": "S2"}]
+        self.assertEqual(self.speakers(seg, turns), [("w0 w1 w2", "S1"), ("w3 w4 w5", "S2")])
+
+    def test_no_combined_label_and_second_speaker_kept(self):
+        # Two speakers overlap the same long line equally: never "S1+S2", and a line wholly inside S2 stays S2.
+        seg = {"start": 0, "end": 10, "text": "x", "words": []}
+        turns = [{"start": 0, "end": 5, "speaker": "S1"}, {"start": 5, "end": 10, "speaker": "S2"}]
+        self.assertIn(self.speakers(seg, turns)[0][1], ("S1", "S2"))
+        seg2 = {"start": 6, "end": 9, "text": "y", "words": []}
+        self.assertEqual(self.speakers(seg2, turns), [("y", "S2")])
+
+    def test_short_turn_is_uncertain(self):
+        seg = self.seg_words((0, 3), (3, 6), (6, 7), (7, 10), (10, 13))
+        turns = [{"start": 0, "end": 6, "speaker": "S1"}, {"start": 6, "end": 7, "speaker": "S2"}, {"start": 7, "end": 13, "speaker": "S1"}]
+        rows = STT.build_rows({"segments": [seg]}, {"words": []}, {"turns": turns})
+        self.assertEqual([(r["text"], r["speaker"]) for r in rows], [("w0 w1", "S1"), ("w2", "S?"), ("w3 w4", "S1")])
+        self.assertIn("short turn", rows[1]["speaker_why"])
+
+    def test_short_phrases_of_one_voice_are_not_uncertain(self):
+        seg = {"start": 0, "end": 1.5, "text": "x", "words": []}
+        self.assertEqual(self.speakers(seg, [{"start": 0, "end": 1.5, "speaker": "S1"}]), [("x", "S1")])
+
+    def test_turns_with_small_gaps_make_one_stretch(self):
+        seg = {"start": 0, "end": 1, "text": "x", "words": []}
+        turns = [{"start": 0, "end": 1, "speaker": "S1"}, {"start": 1.5, "end": 3.5, "speaker": "S1"}, {"start": 4, "end": 9, "speaker": "S2"}]
+        self.assertEqual(self.speakers(seg, turns), [("x", "S1")])
+
+    def test_low_overlap_and_no_turn_are_uncertain(self):
+        turns = [{"start": 0, "end": 3, "speaker": "S1"}, {"start": 30, "end": 40, "speaker": "S2"}]
+        rows = STT.build_rows({"segments": [self.seg_words((2.9, 8.0)), self.seg_words((15, 16))]}, {"words": []}, {"turns": turns})
+        self.assertEqual([r["speaker"] for r in rows], ["S?", "S?"])
+        self.assertIn("low overlap", rows[0]["speaker_why"])
+        self.assertIn("no speaker turn", rows[1]["speaker_why"])
+
+    def test_estimated_word_times_do_not_split(self):
+        seg = dict(self.seg_words((0, 2), (2, 4)), timed=False)
+        turns = [{"start": 0, "end": 2, "speaker": "S1"}, {"start": 2, "end": 4, "speaker": "S2"}]
+        self.assertEqual(len(self.speakers(seg, turns)), 1)
+
+    def test_second_voice_stretch_found(self):
+        times = [i * 0.25 for i in range(40)]
+        dists = [0.3 + (i % 3) * 0.02 for i in range(40)]
+        self.assertEqual(WORKERS.spread_groups(times, dists), [])  # one steady voice
+        dists[30:33] = [0.9, 0.85, 0.8]
+        self.assertEqual(WORKERS.spread_groups(times, dists), [(7.5, 9.0)])
+        dists = [0.3 + (i % 3) * 0.02 for i in range(40)]
+        dists[30] = 0.65  # stands out, but not by enough
+        self.assertEqual(WORKERS.spread_groups(times, dists), [])
+        self.assertEqual(WORKERS.spread_groups([0, 1], [0.9, 0.9]), [])  # too little to measure
+
+    def test_forced_two_speaker_pass_kept_only_if_voices_differ(self):
+        first = {"turns": [{"start": 0, "end": 10, "speaker": "S1"}], "speakers": 1}
+        apart = {"turns": [{"start": 0, "end": 5, "speaker": "S1"}, {"start": 5, "end": 10, "speaker": "S2"}], "speakers": 2, "embeddings": [[1.0, 0.0], [0.0, 1.0]]}
+        turns, n, c = WORKERS.choose_pass(first, apart, [(4, 5)])
+        self.assertEqual((n, c["accepted"], turns), (2, True, apart["turns"]))
+        close = dict(apart, embeddings=[[1.0, 0.0], [1.0, 0.1]])
+        turns, n, c = WORKERS.choose_pass(first, close, [(4, 5)])
+        self.assertEqual((n, c["accepted"], c["uncertain_stretches"]), (1, False, 1))
+        self.assertEqual(turns, [{"start": 0, "end": 4, "speaker": "S1"}, {"start": 4, "end": 5, "speaker": "S?"}, {"start": 5, "end": 10, "speaker": "S1"}])
+        self.assertEqual(WORKERS.choose_pass(first, dict(apart, embeddings=[[0.0, 0.0], [0.0, 1.0]]), [])[1], 1)  # zero voice vector: unmeasured
+
+    def test_uncertain_stretch_separates_a_short_interjection(self):
+        # One voice, one word in a stretch the check marked: the rest of the line keeps its label.
+        seg = self.seg_words((0, 3), (3, 6), (6, 6.8), (6.8, 8))
+        turns = WORKERS.carve_uncertain([{"start": 0, "end": 8, "speaker": "S1"}], [(6.0, 6.8)])
+        self.assertEqual(self.speakers(seg, turns), [("w0 w1", "S1"), ("w2", "S?"), ("w3", "S1")])
+
+    def test_speaker_hints(self):
+        self.assertEqual(STT.speaker_hints("note1.ogg"), {})
+        self.assertEqual(STT.speaker_hints("2026-01-02-clinic-call.ogg"), {"min_speakers": 2})
+        self.assertEqual(STT.speaker_hints("recall.ogg"), {})
+        self.assertEqual(STT.speaker_hints("x-call-y.ogg", speakers=3), {"speakers": 3})
+        self.assertEqual(STT.speaker_hints("x-call-y.ogg", max_speakers=1), {"max_speakers": 1})
+        self.assertTrue(WORKERS.wants_second_voice_check({}, 60))
+        self.assertFalse(WORKERS.wants_second_voice_check({}, 3))
+        for h in ({"num_speakers": 2}, {"min_speakers": 2}, {"max_speakers": 1}):
+            self.assertFalse(WORKERS.wants_second_voice_check(h, 60), h)
+
+    def test_diarization_pin_matches_setup(self):
+        setup = (HERE / "setup-mac.sh").read_text()
+        self.assertIn(f"DIAR_REV={WORKERS.DIAR_REV}", setup)
+        self.assertEqual(WORKERS.DIAR_MODEL.split("/")[1], pathlib.Path(STT.DIAR_MODEL_DIR).name)
+        self.assertEqual(WORKERS.UNSURE, STT.UNSURE_SPEAKER)
+        block = setup[setup.index("DIAR_FILES=("):setup.index("token_file=")]
+        self.assertEqual(len(re.findall(r'"\S+ [0-9a-f]{64}"', block)), 5)  # every file carries a sha256
+
     def test_support_check_flags_more_specific_word(self):
         rows = [{"text": "लेकिन बीमार भी नहीं हैं", "mms": "लेकिन बिमार भि नहि है"}]
         out, bad = STT.support_check("लेकिन बुखार भी नहीं हैं", rows, 0)
@@ -302,6 +400,38 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("confirmed by owner", page)
         r4 = self.run_tool(str(ROOT / "tools/answers/answers"), "confirm", "alice:prop:note1.01", "--records", str(self.rec))
         self.assertNotEqual(r4.returncode, 0)
+
+    def diarization_on(self):
+        token = self.tmp / "token"
+        token.write_text("synthetic")
+        token.chmod(0o600)
+        self.env["SATURN_HF_TOKEN_FILE"] = str(token)
+
+    def test_uncertain_speaker_reaches_transcript_and_checks(self):
+        self.diarization_on()
+        r = self.run_tool(str(HERE / "stt"), "transcribe", str(self.audio), "--records", str(self.rec), "--min-speakers", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        md = self.audio.with_name("note1.mac.transcript.md").read_text()
+        self.assertIn("[00:00.0 → 00:03.0] [S1]", md)
+        self.assertIn("[S?]", md)  # the 1.5 s S2 turn
+        self.assertNotIn("+S", md)
+        self.assertRegex(md, r"speaker_uncertain_rows: [1-9]")
+        self.assertRegex(md, r"- \[00:07\.0\] who is speaking\? S\? — short turn \(under 2 s\): needs a listener")
+        self.assertIn("needs a listener", md[md.index("## Listener checks"):])
+        args = json.loads((self.tmp / "cache/venv/bin/python.diar-args").read_text())
+        self.assertEqual(args[args.index("--min-speakers") + 1], "2")
+        self.assertNotIn("--token-file", args)
+        lines = L.section(md, "Raw whisper")
+        self.assertIn("S?", [l["speaker"] for l in lines])  # the eval and answers parsers read the label
+
+    def test_call_name_is_a_speaker_hint(self):
+        self.diarization_on()
+        call = self.audio.with_name("2026-01-02-clinic-call.ogg")
+        shutil.copy(self.audio, call)
+        r = self.run_tool(str(HERE / "stt"), "transcribe", str(call), "--records", str(self.rec))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = json.loads((self.tmp / "cache/venv/bin/python.diar-args").read_text())
+        self.assertEqual(args[args.index("--min-speakers") + 1], "2")
 
     def test_reject_and_keep_open(self):
         self.run_tool(str(HERE / "stt"), "run", "--records", str(self.rec), "--no-eval")
