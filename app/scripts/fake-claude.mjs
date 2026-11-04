@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Canned `claude -p` for the local e2e tier (CLAUDE_BIN=scripts/fake-claude.mjs). No network, no account.
 // Answers the batch extraction call (--json-schema, json or stream-json) by regex: "120/80 72" -> a BP reading;
-// an attachment -> an unreadable device photo. FAKE_CLAUDE_MODE: ok (default) | auth | limit.
+// an attachment -> an unreadable device photo. Mode ok (default) | auth | limit: FAKE_CLAUDE_MODE, or (the batch passes the
+// CLI only CHILD_ENV_ALLOW) a CLAUDE_CONFIG_DIR ending in fake-claude-<mode>.
 import { readFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
@@ -13,7 +14,7 @@ const out = (o) => {
   if (stream) console.log(JSON.stringify({ type: "system", subtype: "init", model: "fake" }));
   console.log(JSON.stringify({ type: "result", subtype: "success", ...o }));
 };
-const mode = process.env.FAKE_CLAUDE_MODE || "ok";
+const mode = process.env.FAKE_CLAUDE_MODE || /fake-claude-(auth|limit)$/.exec(process.env.CLAUDE_CONFIG_DIR ?? "")?.[1] || "ok";
 if (mode === "auth") {
   out({ is_error: true, api_error_status: 401, terminal_reason: "api_error", result: "Failed to authenticate. API Error: 401 OAuth access token is invalid." });
   process.exit(1);

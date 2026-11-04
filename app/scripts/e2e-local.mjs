@@ -190,7 +190,7 @@ async function main() {
   check(media.length === 1, `expected 1 media file in git, got ${media}`);
 
   console.log("7/9 extract with Claude auth failing -> exit 3, extraction delayed, rows stay new");
-  const delayed = await batch(["extract"], { FAKE_CLAUDE_MODE: "auth" });
+  const delayed = await batch(["extract"], { CLAUDE_CONFIG_DIR: join(tmpdir(), "fake-claude-auth") }); // the CLI child gets CHILD_ENV_ALLOW only
   check(delayed.code === 3, `expected exit 3, got ${delayed.code}: ${delayed.out}`);
   check(!existsSync(digest), "a delayed run wrote a digest file (the family would get it)");
   const waiting = (await proxy.env.DB.prepare("SELECT status FROM inbox").all()).results;

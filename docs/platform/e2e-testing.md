@@ -82,7 +82,7 @@ sequenceDiagram
 | 4 | Edit | `messages.editMessage` → `edited_message` → "सुधार: …" ack, one corrected fact | unit | ✓ | ✓ |
 | 5 | Photo / PDF media | synthetic PNG of a BP display; a synthetic one-page PDF → `needs_deep` | ✓ | ✓ | ✓ |
 | 6 | Voice, no Sarvam | synthetic OGG/Opus tone; no `SARVAM_API_KEY` → "🎤 … transcription pending" | unit | ✓ | |
-| 7 | Claude auth or limit failure | `FAKE_CLAUDE_MODE=auth\|limit` → exit 3, "⚠ extraction delayed", rows stay `new`; the next run extracts | ✓ | ✓ | |
+| 7 | Claude auth or limit failure | `FAKE_CLAUDE_MODE=auth\|limit` (or `CLAUDE_CONFIG_DIR=.../fake-claude-auth`, the var the batch passes through) → exit 3, "⚠ extraction delayed", rows stay `new`; the next run extracts | ✓ | ✓ | |
 | 8 | Stranger / other chat | second test user outside the allowlist; an unlisted group → stored or ignored, no reply | unit | ✓ | |
 | 9 | Agent-service down | `AGENT_ROUTER_URL` → closed port; batch green, item stays `open`; next run with the router up → 200 existing / 201 | planned | ✓ | |
 | 10 | Lease expiry | `LEASE_S=20`, `MOCK_MODE=sleep`, kill dispatcher 1 → dispatcher 2 reclaims; the zombie gets 409 `lease-lost` | unit | ✓ | |
