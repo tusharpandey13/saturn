@@ -151,17 +151,19 @@ class TestWithOrigin(Base):
         self.assertEqual(st, 200, body)
         self.assertTrue(h["Content-Type"].startswith("text/html"))
         self.assertIn("Recorded: heard for u-voice-ex1 by owner@example.com.", body)
+        self.assertIn("The site shows this within about ten minutes (it rebuilds on a timer).", body)
         self.assertNotIn("<a ", body)
         self.assertNotIn("<script", body)
         self.assertEqual(self.listened()[-1]["by"], "owner@example.com")
         # form save with the speaker-prefixed and terms: lines kept
-        st, _, body = self.call("/voice/alice/u-voice-ex2", {"action": "save", "text": "[bob] हाँ\nठीक है\nterms: गोली\nnotes: x\n\nraw"},
-                                form=True)
+        st, _, body = self.call("/voice/alice/u-voice-ex2", {"action": "save",
+                                "text": "[bob] हाँ\nठीक है\n[papa] नहीं\n[?] शायद\n[?]\nterms: गोली\nnotes: x\n\nraw"}, form=True)
         self.assertEqual(st, 200, body)
         md = (self.rec / "sources/alice/media/telegram/u-voice-ex2.groundtruth.md").read_text(encoding="utf-8")
-        self.assertIn("[bob] हाँ\n[alice] ठीक है\nterms: गोली\nnotes: x\n\nraw\n", md)
+        # [?] (unresolved by the listener) is dropped and the line falls back to [<ns>]; an explicit name is kept
+        self.assertIn("[bob] हाँ\n[alice] ठीक है\n[papa] नहीं\n[alice] शायद\nterms: गोली\nnotes: x\n\nraw\n", md)
         lines, terms = EVAL.parse_groundtruth(md)
-        self.assertEqual([l["speaker"] for l in lines], ["bob", "alice"])
+        self.assertEqual([l["speaker"] for l in lines], ["bob", "alice", "papa", "alice"])
         self.assertEqual(terms, ["गोली"])
         self.assertEqual(len([r for r in self.listened() if r["update_id"] == 900000005]), 1)  # fixture row kept
         self.build_ok()

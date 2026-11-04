@@ -1237,7 +1237,10 @@ class Builder:
                 if re.match(r"^\[[^\]]+\]\s+", st) or st.startswith("terms:"):
                     text_lines.append(st)
         else:
-            sug = [l["text"] for l in sttlib.section(mac_md, "Suggested reading")] if mac_md else []
+            sug = []  # diarization tag -> label: S1 (dominant voice) is this person; S? is unresolved; Sn stays
+            for l in sttlib.section(mac_md, "Suggested reading") if mac_md else []:
+                sp = l.get("speaker")
+                sug.append(("" if not sp else "[?] " if sp == "S?" else f"[{p.ns if sp == 'S1' else sp}] ") + l["text"])
             if sug:
                 text_lines, source = sug, "suggested reading (agent-reconciled, not verified)"
             else:
@@ -1265,9 +1268,9 @@ class Builder:
                        'it in the page; download and open it in another player).</p>')
         else:
             out.append('<p class="notice">Audio file not in the records repo.</p>')
-        out.append(f'<h2>Transcript</h2><p class="xs muted">Source: {ESC(source)}. One line per sentence; a line may start '
-                   f'with <code>[{ESC(p.ns)}]</code> (the speaker). Correct it as heard, in Devanagari or Latin; '
-                   "uncertain words keep (?). Facts as written; not advice.</p>")
+        out.append(f'<h2>Transcript</h2><p class="xs muted">Source: {ESC(source)}. One line per sentence; lines start with the '
+                   'speaker in square brackets, and <code>[?]</code> means the machine was unsure who spoke, so replace it '
+                   'with the right name, for example <code>[papa]</code>. Facts as written; not advice.</p>')
         text = "\n".join(text_lines)
         if self.voice_api:
             action = f"{self.voice_api}/voice/{p.ns}/{n['stem']}"

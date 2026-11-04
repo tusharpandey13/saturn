@@ -60,6 +60,8 @@ def groundtruth_lines(ns, text):
             out.append(raw); continue
         line = raw.rstrip()
         s = line.lstrip()
+        if s.startswith("[?]"):  # unresolved speaker from the page prefill: not a name
+            line = s = s[3:].lstrip()
         if not s:
             continue
         if s.startswith("notes:"):
@@ -264,7 +266,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if is_form and out.get("ok"):
             page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
                     f"<title>Recorded</title></head><body><p>Recorded: {esc(action)} for {esc(stem)} by {esc(out['by'])}. "
-                    "Go back to the voice note page.</p></body></html>")
+                    "Go back to the voice note page. The site shows this within about ten minutes (it rebuilds on a timer).</p></body></html>")
             self._send(status, page, "text/html; charset=utf-8")
         else:
             self._json(status, out)

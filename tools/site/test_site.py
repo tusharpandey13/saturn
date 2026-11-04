@@ -295,7 +295,7 @@ class SiteTest(unittest.TestCase):
         self.assertTrue((self.out / "files/sources/alice/media/telegram/u-voice-ex1.ogg").is_file())
         self.assertIn("Not heard yet", one)
         self.assertIn("suggested reading", one)  # the Mac transcript's reconciled lines fill the text box
-        self.assertIn(">आज मौसम अच्छा(?) है\nशाम को दो गोली</textarea>", one)
+        self.assertIn(">[alice] आज मौसम अच्छा(?) है\n[alice] शाम को दो गोली</textarea>", one)  # S1 (dominant voice) -> [<ns>]
         self.assertIn("<summary>Raw whisper (verbatim, timed)</summary>", one)
         self.assertIn("[00:00.0 → 00:03.5] [S1] आज मौसम अच्छा है", one)
         self.assertNotIn("<form", one)  # no endpoint given: read-only
@@ -319,6 +319,20 @@ class SiteTest(unittest.TestCase):
             self.assertIn('<button type="submit" name="action" value="save">Save corrections</button>', one)
             self.assertIn("form-action https://api.example.invalid\"", one)
             self.assertNotIn("<script", one.lower())
+            self.assertIn("<code>[?]</code> means the machine was unsure who spoke", one)
+            # diarization tags: S1 -> [alice], S? -> [?], other Sn -> [Sn], none -> no prefix
+            mac = self.rec / "sources/alice/media/telegram/u-voice-ex1.mac.transcript.md"
+            orig = mac.read_text(encoding="utf-8")
+            mac.write_text(orig.replace("[00:03.5 → 00:07.0] [S1] शाम को दो गोली\n\n## Listener",
+                                        "[00:03.5 → 00:05.0] [S?] शाम को\n[00:05.0 → 00:06.0] [S2] दो गोली\n"
+                                        "[00:06.0 → 00:07.0] हाँ\n\n## Listener"), encoding="utf-8")
+            try:
+                r = run(self.rec, out, "--voice-api", "https://api.example.invalid/voice-api/")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                one = (out / "alice/voice/u-voice-ex1.html").read_text(encoding="utf-8")
+                self.assertIn(">[alice] आज मौसम अच्छा(?) है\n[?] शाम को\n[S2] दो गोली\nहाँ</textarea>", one)
+            finally:
+                mac.write_text(orig, encoding="utf-8")
             # a corrected transcript beside the audio is what the box shows (and it is linked)
             gt = self.rec / "sources/alice/media/telegram/u-voice-ex1.groundtruth.md"
             gt.write_text("---\ntype: ground-truth-transcript\nlistened: true\n---\n\n# Ground truth\n\n"
