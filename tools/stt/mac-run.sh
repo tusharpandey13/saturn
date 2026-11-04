@@ -37,6 +37,7 @@ if echo "$batt" | grep -q "Battery Power"; then
 fi
 
 cd "$records" || exit 1
+ssh-add --apple-load-keychain -q 2>/dev/null || true   # the deploy and signing keys' passphrases live in the login keychain; needed before the first pull
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then say "records clone has uncommitted changes: skipped"; exit 0; fi
 git pull -q --rebase origin main || { git rebase --abort 2>/dev/null; say "pull failed: skipped"; exit 1; }
 
@@ -48,7 +49,6 @@ if [ -s "$written" ]; then
   while IFS= read -r f; do git add -- "$f"; done < "$written"
 fi
 if ! git diff --cached --quiet; then
-  ssh-add --apple-load-keychain -q 2>/dev/null || true   # the signing key's passphrase lives in the login keychain
   git commit -q -m "data: mac machine transcripts ($n audio), answer proposals, STT eval [skip ci]" || { say "commit failed (signing?)"; git reset -q; exit 1; }
 fi
 [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ] || { say "nothing new"; exit 0; }
