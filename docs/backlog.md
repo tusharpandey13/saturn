@@ -45,6 +45,8 @@ Goal: keep packages, NixOS inputs and local models current, with a cheap automat
 
 ## Separate signing identity for agents (parked 31-Oct-2026)
 
+05-Nov-2026: done for the home server's `saturn-voice-api` (its records_rw key signs; saturn-env-prod records-integrity accepts it for the two voice paths only). Other agents still parked.
+
 Agents sign with their own key, so the owner's key (optionally behind Touch ID via Secretive) means the owner
 approved. The records-integrity check gets the agent key as a signer limited to its paths. About 1 hour.
 
