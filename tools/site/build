@@ -1,13 +1,15 @@
 #!/usr/bin/env -S python3 -I
 """Build the family health site (static HTML) from a records repo's KB. Design: docs/design/health-site.md.
 
-Usage: tools/site/build --records DIR --out DIR [--person NS] [--db PATH] [--today YYYY-MM-DD]
+Usage: tools/site/build --records DIR --out DIR [--person NS] [--db PATH] [--today YYYY-MM-DD] [--voice-api URL]
 
 Reads <records>/data/kb.sqlite (read-only; built by tools/kb/build: run that first, or the site builds the KB into a
 temp file when it is missing) through the existing views, plus docs/health/<ns>/questions.md, family/actions.md, the
 cross-check pages and agent inference rows when present. Writes <out>/index.html (person picker),
 <out>/<ns>/{overview,status,medicines,results,history,wiki}.html, trend pages under <out>/<ns>/trend/, rendered
-Markdown pages, linked originals under <out>/files/, one style.css and build.json.
+Markdown pages, linked originals under <out>/files/, one style.css and build.json. Voice notes (Telegram audio in
+data/telegram/<month>.ndjson): <out>/<ns>/voice.html and <out>/<ns>/voice/<stem>.html (player, transcript to correct;
+with --voice-api URL the page posts a plain form to tools/site/voice-api; without it the page is read-only).
 
 Rules: static HTML, relative links only (served under a path prefix), no JS, no external URL anywhere, colour only
 from the lab's printed flag, agent-inferred content visibly apart from facts. Refuses an --out inside the product repo
@@ -20,8 +22,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 PRODUCT = HERE.parents[1]
 sys.path.insert(0, str(HERE))  # python3 -I drops the script dir
 sys.path.insert(0, str(PRODUCT / "tools" / "kb"))
+sys.path.insert(0, str(PRODUCT / "tools" / "stt"))
 import charts, md  # noqa: E402
 import records_config  # noqa: E402
+import sttlib  # noqa: E402  (transcript sections and front matter; stdlib only)
 
 _loader = importlib.machinery.SourceFileLoader("gen_views", str(PRODUCT / "tools" / "kb" / "gen-views"))
 _spec = importlib.util.spec_from_loader("gen_views", _loader)
@@ -137,13 +141,15 @@ class Site:
         shutil.copy2(HERE / "style.css", self.out / "style.css")
 
 
-def head(title, path):
+def head(title, path, form_action=None):
+    """form_action: an origin a page may post a form to (the voice review endpoint); every other page posts nowhere."""
     css = Site.rel(path, "style.css")
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
             "<meta name=\"robots\" content=\"noindex, nofollow\"><meta name=\"referrer\" content=\"no-referrer\">"
             "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; img-src 'self' data:; "
-            "style-src 'self'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'\">"
+            "media-src 'self'; style-src 'self'; script-src 'none'; object-src 'none'; base-uri 'none'; "
+            f"form-action {ESC(form_action) if form_action else chr(39) + 'none' + chr(39)}\">"
             f"<title>{ESC(title)} · Saturn</title><link rel=\"stylesheet\" href=\"{css}\"></head>")
 
 
@@ -163,7 +169,7 @@ class Person:
         return (w[0][:1] + (w[1][:1] if len(w) > 1 else w[0][1:2])).upper() if w else "?"
 
 
-def shell(p, path, title, body, tab=None, badge=None):
+def shell(p, path, title, body, tab=None, badge=None, form_action=None):
     """Page with top bar, body, footer and the six-tab bottom bar."""
     top = (f'<header class="top"><div class="row"><a class="who" href="{Site.rel(path, "index.html")}">'
            f'<span class="avatar">{ESC(p.initials)}</span>{ESC(p.display)}</a>'
@@ -174,8 +180,8 @@ def shell(p, path, title, body, tab=None, badge=None):
         on = ' class="on" aria-current="page"' if key == tab else ""
         b = f'<span class="badge">{badge}</span>' if key == "wiki" and badge else ""
         nav.append(f'<a href="{Site.rel(path, f"{p.ns}/{key}.html")}"{on}>{icon(key)}<span>{label}{b}</span></a>')
-    return (head(f"{title} · {p.display}", path) + "<body><div class=\"wrap\">" + top + body + footer() + "</div>"
-            '<div class="tabs"><nav aria-label="Main">' + "".join(nav) + "</nav></div></body></html>")
+    return (head(f"{title} · {p.display}", path, form_action) + "<body><div class=\"wrap\">" + top + body + footer()
+            + "</div>" '<div class="tabs"><nav aria-label="Main">' + "".join(nav) + "</nav></div></body></html>")
 
 
 # ---------------------------------------------------------------------------------------------------------- KB layer
@@ -377,8 +383,10 @@ def inferred_box(inf, kb=None, link_src=lambda x: None, run_href=None, short=Fal
 
 # -------------------------------------------------------------------------------------------------------- the build
 class Builder:
-    def __init__(self, root, out, kb, rc, today):
+    def __init__(self, root, out, kb, rc, today, voice_api=None):
         self.root, self.kb, self.rc, self.today = root, kb, rc, today
+        self.voice_api = voice_api.rstrip("/") if voice_api else None
+        self.voice_count = {}  # ns -> (notes, not yet heard), filled by voice()
         self.site = Site(out, root)
         self.data = Data(kb, root, rc)
         self.md_pages = {}  # records-relative .md path -> out-relative html path (rendered on demand)
@@ -479,6 +487,7 @@ class Builder:
             self.infs = load_inferences(self.root, p.ns)
             trend, latest = self.data.trend(p.ns), self.data.latest(p.ns)
             self.trend_pages(p, trend, latest)
+            self.voice(p)
             self.overview(p, trend, latest)
             self.status(p)
             self.medicines(p)
@@ -623,6 +632,12 @@ class Builder:
         if self.infs:
             out.append(self.inf_html(path, self.infs[0], short=True)
                        + '<p class="small"><a href="status.html">All agent inferences</a></p>')
+        n_voice, n_unheard = self.voice_count.get(p.ns, (0, 0))
+        if n_voice:
+            out.append('<h2>Voice notes</h2><div class="list">'
+                       f'<a href="voice.html"><b>{n_voice} voice note{"s" if n_voice != 1 else ""}</b> · '
+                       f'{n_unheard} to hear<div class="small muted">Play, read the transcript, correct it or mark it '
+                       'heard.</div></a></div>')
         out.append('<div class="modes"><a href="doctor.html">' + icon("visit") + 'Doctor view</a>'
                    '<a href="simple.html">' + icon("overview") + 'Simple view</a></div>')
         self.site.pages[path] = shell(p, path, "Overview", "".join(out), tab="overview")
@@ -1128,6 +1143,155 @@ class Builder:
             out.append('<p class="muted">No open to-dos.</p>')
         self.site.pages[path] = shell(p, path, "To-dos", "".join(out), tab="wiki")
 
+
+    # ---- Voice notes (Telegram audio): list + one review page per note
+    def voice_notes(self, p):
+        """Audio messages of this person from data/telegram/<month>.ndjson (newest first), with the files beside the
+        audio: transcripts (batch / Mac), ground truth (a person's corrected text) and the listened marker."""
+        tg = self.root / "data" / "telegram"
+        if not tg.is_dir():
+            return []
+        heard = {}
+        lf = tg / "listened.ndjson"
+        if lf.is_file():
+            for line in lf.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        h = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(h.get("update_id"), int) and h["update_id"] not in heard:
+                        heard[h["update_id"]] = h
+        pmap = self.rc.get("d1_person_map", {})
+        notes = []
+        for f in sorted(tg.glob("*.ndjson")):
+            if f.name in ("directory.ndjson", "subject-overrides.ndjson", "handled-manually.ndjson", "listened.ndjson"):
+                continue
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("rt") != "d1.messages" or r.get("kind") != "audio" or r.get("extraction_status") == "private":
+                    continue
+                if pmap.get(r.get("person_id"), r.get("person_id")) != p.ns or not r.get("media_ref"):
+                    continue
+                stem = str(r["media_ref"]).split("/")[-1]
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", stem):
+                    continue
+                m = re.fullmatch(r"tg:(\d+)", str(r.get("external_id") or ""))
+                uid = int(m.group(1)) if m else None
+                audio = next((a for a in sorted((self.root / "sources" / p.ns / "media" / "telegram").glob(f"{stem}.*"))
+                              if a.suffix.lower() in (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav")), None)
+                if not audio:
+                    continue
+                def side(suffix):
+                    f = audio.with_name(f"{stem}{suffix}")
+                    return f if f.is_file() else None
+                sender = pmap.get(r.get("sender_person_id"), r.get("sender_person_id")) or p.ns
+                notes.append({"stem": stem, "row": r, "update_id": uid, "audio": audio.relative_to(self.root).as_posix(),
+                              "heard": heard.get(uid), "sender": self.rc.get("display", {}).get(sender, sender),
+                              "mac": side(".mac.transcript.md"), "batch": side(".batch.transcript.md") or side(".transcript.md"),
+                              "groundtruth": side(".groundtruth.md"), "duration": r.get("duration_sec")})
+        notes.sort(key=lambda n: (str(n["row"].get("received_at") or ""), n["stem"]), reverse=True)
+        return notes
+
+    def voice(self, p):
+        notes = self.voice_notes(p)
+        self.voice_count[p.ns] = (len(notes), sum(1 for n in notes if not n["heard"]))
+        if not notes:
+            return
+        path = f"{p.ns}/voice.html"
+        out = ['<p><a class="back" href="overview.html">‹ Overview</a></p><h1>Voice notes</h1>'
+               f'<p class="muted small">{len(notes)} Telegram voice notes, newest first. Open one to play it, read the '
+               'transcript, correct it or mark it heard.</p><div class="list">']
+        for n in notes:
+            dur = f"{int(n['duration'])} s" if isinstance(n["duration"], (int, float)) else "length unknown"
+            status = "heard" if n["heard"] else "not heard yet"
+            out.append(f'<a href="voice/{ESC(n["stem"])}.html"><b>{ESC(fdate(str(n["row"].get("received_at") or "")) or "undated")}'
+                       f'</b> · {ESC(dur)} · {ESC(n["sender"])}<div class="small muted">{status}'
+                       f'{" · corrected transcript saved" if n["groundtruth"] else ""}</div></a>')
+        out.append("</div>")
+        self.site.pages[path] = shell(p, path, "Voice notes", "".join(out), tab="overview")
+        for n in notes:
+            self.voice_note(p, n)
+
+    def voice_note(self, p, n):
+        path = f"{p.ns}/voice/{n['stem']}.html"
+        r = n["row"]
+        when = fdate(str(r.get("received_at") or "")) or "undated"
+        dur = f"{int(n['duration'])} s" if isinstance(n["duration"], (int, float)) else ""
+        audio_href = self.site.original(n["audio"])
+        mac_md = n["mac"].read_text(encoding="utf-8") if n["mac"] else ""
+        batch_md = n["batch"].read_text(encoding="utf-8") if n["batch"] else ""
+        if n["groundtruth"]:
+            gt = n["groundtruth"].read_text(encoding="utf-8")
+            body = gt.split("\n---", 1)[1] if gt.startswith("---\n") else gt
+            text_lines, source = [], "corrected transcript (saved by a listener)"
+            for raw in body.splitlines():
+                st = raw.strip()
+                if st.startswith("notes:"):
+                    break
+                if re.match(r"^\[[^\]]+\]\s+", st) or st.startswith("terms:"):
+                    text_lines.append(st)
+        else:
+            sug = [l["text"] for l in sttlib.section(mac_md, "Suggested reading")] if mac_md else []
+            if sug:
+                text_lines, source = sug, "suggested reading (agent-reconciled, not verified)"
+            else:
+                tr = [l["text"] for l in sttlib.section(batch_md, "Transcript")] if batch_md else []
+                if tr:
+                    text_lines, source = tr, "machine transcript (not checked by a person)"
+                else:
+                    text_lines, source = str(r.get("transcript") or "").splitlines(), "machine transcript (not checked by a person)"
+        raw_src = "Raw whisper" if mac_md else "Transcript"
+        raw_lines = sttlib.section(mac_md, "Raw whisper") if mac_md else (sttlib.section(batch_md, "Transcript") if batch_md else [])
+        heard = n["heard"]
+        out = [f'<p><a class="back" href="../voice.html">‹ Voice notes</a></p><h1>Voice note · {ESC(when)}</h1>',
+               '<p class="muted small">' + ESC(" · ".join(x for x in [dur, f"sent by {n['sender']}",
+                                                                      f"update {n['update_id']}" if n["update_id"] else ""] if x)) + "</p>"]
+        if heard:
+            out.append(f'<p class="small"><b>Heard</b> by {ESC(str(heard.get("by", "")))} on {ESC(fdate(str(heard.get("at", ""))) or "")}'
+                       f'{": " + ESC(str(heard["note"])) if heard.get("note") else ""}.</p>')
+        else:
+            out.append('<p class="small"><b>Not heard yet.</b></p>')
+        if audio_href:
+            href = Site.rel(path, audio_href)
+            mime = {"ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg", "mp3": "audio/mpeg", "m4a": "audio/mp4", "wav": "audio/wav"}[audio_href.rsplit(".", 1)[-1].lower()]
+            out.append(f'<audio controls preload="none"><source src="{ESC(href)}" type="{mime}"></audio>'
+                       f'<p class="xs muted"><a href="{ESC(href)}">Download the audio</a> (Ogg/Opus: iOS Safari may not play '
+                       'it in the page; download and open it in another player).</p>')
+        else:
+            out.append('<p class="notice">Audio file not in the records repo.</p>')
+        out.append(f'<h2>Transcript</h2><p class="xs muted">Source: {ESC(source)}. One line per sentence; a line may start '
+                   f'with <code>[{ESC(p.ns)}]</code> (the speaker). Correct it as heard, in Devanagari or Latin; '
+                   "uncertain words keep (?). Facts as written; not advice.</p>")
+        text = "\n".join(text_lines)
+        if self.voice_api:
+            action = f"{self.voice_api}/voice/{p.ns}/{n['stem']}"
+            out.append(f'<form method="post" action="{ESC(action)}" accept-charset="utf-8" class="voice">'
+                       f'<textarea name="text" rows="{max(4, min(24, len(text_lines) + 2))}" lang="hi" spellcheck="false">{ESC(text)}</textarea>'
+                       '<div class="modes"><button type="submit" name="action" value="heard">Heard, no changes</button>'
+                       '<button type="submit" name="action" value="save">Save corrections</button></div>'
+                       '<p class="xs muted">Heard: records the listened marker. Save: also writes the corrected transcript '
+                       '(ground truth) beside the audio; the batch re-reads the note from it.</p></form>')
+        else:
+            out.append(f'<textarea rows="{max(4, min(24, len(text_lines) + 2))}" lang="hi" readonly>{ESC(text)}</textarea>'
+                       '<p class="xs muted">Read-only build: this site was built without a voice review endpoint.</p>')
+        if raw_lines:
+            out.append(f'<details class="prov"><summary>{ESC(raw_src)} (verbatim, timed)</summary><pre class="raw">'
+                       + ESC("\n".join(f"[{sttlib_ts(l['start'])} → {sttlib_ts(l['end'])}]{' [' + l['speaker'] + ']' if l.get('speaker') else ''} {l['text']}"
+                                        for l in raw_lines)) + "</pre></details>")
+        for label, f in (("Mac transcript", n["mac"]), ("Batch transcript", n["batch"]), ("Ground truth", n["groundtruth"])):
+            if f:
+                orig = self.site.original(f.relative_to(self.root).as_posix())
+                if orig:
+                    out.append(f'<p class="xs"><a href="{ESC(Site.rel(path, orig))}">{label} file</a></p>')
+        origin = re.match(r"^[a-z][a-z0-9+.-]*://[^/]+", self.voice_api).group(0) if self.voice_api else None
+        self.site.pages[path] = shell(p, path, f"Voice note {when}", "".join(out), tab="overview", form_action=origin)
+
     def documents(self, p):
         path = f"{p.ns}/documents.html"
         rows = self.kb.q("SELECT * FROM source WHERE ns = ? AND status = 'active' "
@@ -1151,6 +1315,11 @@ class Builder:
 
 def tslug(code):
     return re.sub(r"[^a-z0-9.-]", "-", code.split(":")[-1].lower())
+
+
+def sttlib_ts(sec):
+    m = int(sec // 60)
+    return f"{m:02d}:{sec - m * 60:04.1f}"
 
 
 # -------------------------------------------------------------------------------------------------------- guards, io
@@ -1206,7 +1375,12 @@ def main(argv=None):
     ap.add_argument("--person", action="append", help="only this namespace (repeatable)")
     ap.add_argument("--db", default=None, help="KB sqlite (default <records>/data/kb.sqlite)")
     ap.add_argument("--today", default=datetime.date.today().isoformat(), help="date for 'last 14 days' (tests)")
+    ap.add_argument("--voice-api", default=None, help="base URL of tools/site/voice-api (e.g. https://host/voice-api); "
+                    "without it the voice pages are read-only")
     a = ap.parse_args(argv)
+    if a.voice_api and not re.match(r"^https?://[^/\s]+(/[^\s]*)?$", a.voice_api):
+        print("error: --voice-api must be an absolute http(s) URL", file=sys.stderr)
+        return 2
     root = pathlib.Path(a.records).resolve()
     out = pathlib.Path(a.out).resolve()
     try:
@@ -1244,7 +1418,7 @@ def main(argv=None):
     out.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=".site-", dir=out.parent))
     try:
-        b = Builder(root, stage, kb, rc, datetime.date.fromisoformat(a.today))
+        b = Builder(root, stage, kb, rc, datetime.date.fromisoformat(a.today), a.voice_api)
         b.build(people)
         b.site.write()
         meta = {"records_commit": records_commit(root), "built_at": datetime.datetime.now(datetime.timezone.utc)

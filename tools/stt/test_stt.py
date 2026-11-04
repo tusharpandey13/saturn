@@ -331,6 +331,14 @@ class Unit(unittest.TestCase):
         self.assertEqual(s["terms_total"], 3)
         self.assertEqual(s["terms_hit"], 3)
         self.assertLess(s["cer"], 0.35)
+        # A Devanagari ground truth (the review page writes what the listener typed) scores the same way.
+        deva = GROUNDTRUTH.replace("Aaj mausam achchha hai.", "आज मौसम अच्छा है।").replace("Maine khaana nahin khaaya.", "मैंने खाना नहीं खाया।").replace("Shaam ko do goli.", "शाम को दो गोली।")
+        lines_d, terms_d = EVAL.parse_groundtruth(deva)
+        self.assertEqual([l["text"] for l in lines_d][0], "आज मौसम अच्छा है।")
+        s_d = EVAL.score(lines_d, hyp, terms_d)
+        self.assertEqual(s_d["terms_hit"], 3)
+        self.assertEqual(s_d["cer"], 0.0)
+        self.assertEqual(s_d["wer"], 0.0)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg missing")

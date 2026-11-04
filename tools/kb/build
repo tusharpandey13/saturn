@@ -150,6 +150,12 @@ def _report_at(r, msg):
     return ist(t)[:16] + "+05:30", "minute", t, "received"
 
 
+def _transcript_tag(msg):
+    """machine-transcript: read from a local speech-recognition transcript; needs a listener.
+    listened-transcript: read from a person's corrected transcript (<audio>.groundtruth.md; transcript_engine groundtruth)."""
+    return "listened-transcript" if (msg or {}).get("transcript_engine") == "groundtruth" else "machine-transcript"
+
+
 def _envelope(row, msg, quote, ns, src_id):
     # confirmed: 1 = patient confirmed, -1 = rejected, 0 = not confirmed (ADR 005 has no confirm step: always 0 now).
     confirmed = row.get("confirmed", 0)
@@ -163,7 +169,7 @@ def _envelope(row, msg, quote, ns, src_id):
     elif (msg or {}).get("kind") == "audio":
         tags.append("patient-reported")  # the subject's own voice note
     if (msg or {}).get("kind") == "audio" and (msg or {}).get("transcript_engine"):
-        tags.append("machine-transcript")  # read from a local speech-recognition transcript; needs a listener
+        tags.append(_transcript_tag(msg))
     return {
         "ns": ns, "source_id": src_id, "quote": quote[:200] if quote else None,
         "recorded_by": row.get("extracted_by") or (msg or {}).get("extracted_by") or "telegram-bot",
@@ -309,7 +315,7 @@ def telegram_records(rows, root, codes=None, handled=None):
                     at, prec, id_ts = ist(msg.get("received_at") or r["extracted_at"])[:16] + "+05:30", "minute", msg.get("received_at") or r["extracted_at"]
                 own = r.get("speaker") == "sender" and sender == ns
                 conf = r.get("confidence")
-                tags = (["patient-reported"] if own else ["family-reported"]) + ["machine-transcript"] \
+                tags = (["patient-reported"] if own else ["family-reported"]) + [_transcript_tag(msg)] \
                     + (["negated"] if r.get("negated") else []) + (["low-confidence"] if conf is not None and conf < 0.8 else []) \
                     + (["subject-hint"] if msg.get("subject_hint") or r.get("about") else [])
                 detail = {k: r[k] for k in ("category", "time_frame", "when_text", "speaker", "speaker_name", "about") if r.get(k) not in (None, "")}
@@ -318,7 +324,8 @@ def telegram_records(rows, root, codes=None, handled=None):
                     "id": f"{ns}:fact:{tg_local(id_ts, r['id'])}", "kind": "event", "at": at, "at_precision": prec, "ns": ns,
                     "locator": f"tg:{r['source_message_id']}",
                     "source_id": src_ids.get(r["source_message_id"], f"{ns}:src:missing-tg.{r['source_message_id']}"),
-                    "data": {"type": "other", "label": ("voice (machine transcript): " + ("NOT: " if r.get("negated") else "") + r["summary"])[:200],
+                    "data": {"type": "other", "label": (("voice (listened transcript): " if _transcript_tag(msg) == "listened-transcript" else "voice (machine transcript): ")
+                                                        + ("NOT: " if r.get("negated") else "") + r["summary"])[:200],
                              "detail": detail},
                     "quote": (r.get("quote") or "")[:300] or None, "verification": "unverified", "status": "active", "tags": tags,
                     "recorded_by": r.get("extracted_by") or "telegram-bot",

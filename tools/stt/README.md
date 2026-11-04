@@ -102,8 +102,8 @@ it with a dated update line and names it as the open remainder). Listen to the c
 
 ## Evaluation (`tools/stt-eval`)
 
-A person who listens and writes `<audio-stem>.groundtruth.md` (front matter, then `[speaker] text` lines in Latin
-transliteration, an optional `terms:` line and `notes:`) adds a clip to the eval set. `stt-eval` (also run by every
+A person who listens and writes `<audio-stem>.groundtruth.md` (front matter, then `[speaker] text` lines in Devanagari
+or Latin transliteration, an optional `terms:` line and `notes:`; the voice review page writes one) adds a clip to the eval set. `stt-eval` (also run by every
 `stt run`) scores each available output for that audio: `mac:suggested`, `mac:whisper`, `mac:mms`, `batch:whisper`.
 
 - **CER / WER**: edit distance over normalised characters / words divided by the reference length.

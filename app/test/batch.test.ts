@@ -685,6 +685,47 @@ describe("voice notes: local transcript, verbatim statements, needs a listener",
     expect(() => kbBuild()).toThrow(/not a recorded voice note/);
   });
 
+  it("a corrected transcript beside the audio (<stem>.groundtruth.md) is re-extracted once per content, without STT, tagged listened-transcript", async () => {
+    const { repo, key } = await setup();
+    await extract({ repo, extractor: new VoiceExtractor(), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW }); // machine transcript first
+    const gtPath = join(root, "sources/alice/media/telegram/u-voice1.groundtruth.md");
+    const gt = (line2: string) => ["---", "audio: u-voice1.ogg", "listened_by: owner", "---", "", "# Ground truth", "", "[alice] कल रात चक्कर आया था", `[alice] ${line2}`, "",
+      "terms: चक्कर (dizziness)", "notes: she sounded fine; बेहोश हो गई was NOT said", ""].join("\n");
+    writeFileSync(gtPath, gt("आज चक्कर नहीं आया"));
+    const llm = new VoiceExtractor();
+    const r = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r).toMatchObject({ extracted: 1, sttPending: 0, voice: { notes: 0, statements: 2, dropped: 1 } });
+    expect(llm.calls).toHaveLength(1);
+    expect(llm.calls[0].voice).toBeTruthy();
+    expect(llm.calls[0].text).toContain("[alice] कल रात चक्कर आया था");
+    expect(llm.calls[0].text).toContain("[alice] आज चक्कर नहीं आया");
+    expect(llm.calls[0].text).not.toMatch(/notes:|terms:|Ground truth|listened_by/);
+    const row = ndjson(repo).find((x) => x.id === key)!;
+    expect(row).toMatchObject({ extraction_status: "ok", transcript_engine: "groundtruth", transcript_confidence: 1, transcript_language: null, transcript_path: "sources/alice/media/telegram/u-voice1.groundtruth.md" });
+    expect(row.transcript_sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(ndjson(repo).filter((x) => x.rt === "d1.statements").map((x) => x.quote)).toEqual(["कल रात चक्कर आया था", "आज चक्कर नहीं आया"]); // the invented one dropped
+    expect(r.digest).toContain("voice note (7 s): listened transcript (ground truth), 2 item(s) recorded");
+    expect(r.digest).not.toContain("(unchecked)");
+    expect(kbBuild()).toMatch(/^ok:/);
+    const db = new DatabaseSync(join(root, "kb.sqlite"));
+    const tags = (db.prepare("SELECT tags FROM fact WHERE locator = ? ORDER BY at").all(`tg:${key}`) as { tags: string }[]).map((f) => JSON.parse(f.tags) as string[]);
+    expect(tags).toHaveLength(2);
+    for (const t of tags) {
+      expect(t).toEqual(expect.arrayContaining(["patient-reported", "listened-transcript"]));
+      expect(t).not.toContain("machine-transcript");
+    }
+    db.close();
+
+    // Same file again: nothing to do (content sha, not mtime). An edited file: re-extracted once more.
+    const again = await extract({ repo, extractor: new VoiceExtractor(), stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(again.extracted).toBe(0);
+    writeFileSync(gtPath, gt("अभी चक्कर नहीं आया"));
+    const edited = await extract({ repo, extractor: new VoiceExtractor(), stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(edited.extracted).toBe(1);
+    expect(ndjson(repo).find((x) => x.id === key)!.transcript_sha256).not.toBe(row.transcript_sha256);
+    expect((await extract({ repo, extractor: new VoiceExtractor(), stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW })).extracted).toBe(0);
+  });
+
   it("a note read with low confidence (< 0.5; the photo bar of 0.8 would flag most notes) is asked about and listed to check until listened", async () => {
     const { repo, updateId } = await setup();
     const r = await extract({ repo, extractor: new VoiceExtractor(0.4), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });

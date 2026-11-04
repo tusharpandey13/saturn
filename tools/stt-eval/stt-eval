@@ -36,7 +36,7 @@ CLIN = ["exact", "more_specific", "less_specific", "wrong", "missing"]
 TERM_SIM = 0.75
 
 JUDGE_RULES = f"""You evaluate a speech-to-text output (HYPOTHESIS) against a human ground truth (REFERENCE) of the same Hindi/Hinglish health recording. Rubric {RUBRIC_VERSION}; apply it literally and the same way every time.
-The reference is in Latin transliteration with [speaker] tags; the hypothesis may be in Devanagari, Latin or mixed, with or without speaker tags. Script and spelling differences are NOT errors; judge meaning only.
+The reference is in Devanagari, Latin transliteration or mixed, with [speaker] tags; the hypothesis may be in Devanagari, Latin or mixed, with or without speaker tags. Script and spelling differences are NOT errors; judge meaning only.
 
 (a) Meaning fidelity, one label per reference line (index = 1-based line number):
 - same: the hypothesis conveys the same meaning (wording may differ).

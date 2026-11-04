@@ -1,0 +1,309 @@
+#!/usr/bin/env -S python3 -I
+"""Voice review API: records that a person listened to a voice note, optionally with a corrected transcript.
+
+Usage: tools/site/voice-api --records DIR --bind ADDR --port N [--branch main] [--remote origin] [--no-push]
+
+Routes:
+  GET  /health                 -> {"ok": true}
+  POST /voice/<ns>/<stem>      body JSON (application/json) or a form (application/x-www-form-urlencoded):
+                                 action=heard|save  text=<transcript, required for save>  by=<who, optional>
+                               A `Tailscale-User-Login` header overrides `by`; default "voice-review".
+Writes (records repo): action save -> sources/<ns>/media/telegram/<stem>.groundtruth.md (front matter, then
+`[speaker] text` lines; the stt-eval format); both actions -> one data/telegram/listened.ndjson line per update_id.
+Then `git add` of the touched paths, a commit as "saturn voice-review" (message `data: voice review <action> <ns>/<stem>`),
+`git push <remote> HEAD:<branch>` (pull --rebase before writing and once more on a failed push; 502 when the push
+still fails: the commit stays local and the next request carries it). --no-push: commit only, no pull or push.
+Stdlib only; one lock serialises all writes; bodies capped at 256 KiB, text at 64 KiB; request bodies are never
+logged (stderr: method, path, status, action). Record and flag only: nothing here diagnoses or advises.
+"""
+import argparse, datetime, hashlib, http.server, json, pathlib, re, subprocess, sys, threading, urllib.parse
+
+HERE = pathlib.Path(__file__).resolve().parent
+PRODUCT = HERE.parents[1]
+sys.path.insert(0, str(PRODUCT / "tools" / "kb"))
+import records_config  # noqa: E402
+
+AUDIO_EXTS = ("ogg", "oga", "opus", "mp3", "m4a", "wav")
+NS_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+STEM_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+SPEAKER_RE = re.compile(r"^\[[^\]]+\]")
+ROUTE_RE = re.compile(r"^/voice/([a-z][a-z0-9-]*)/([A-Za-z0-9_-]+)$")
+MAX_BODY = 256 * 1024
+MAX_TEXT = 64 * 1024
+MAX_BY = 120
+DEFAULT_BY = "voice-review"
+NOTES = {"save": "voice review: saved corrections", "heard": "voice review: heard, no changes"}
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+SKIP_TG = {"subject-overrides.ndjson", "handled-manually.ndjson", "listened.ndjson"}
+GIT_IDENT = ["-c", "user.name=saturn voice-review", "-c", "user.email=voice-review@saturn.invalid", "-c", "commit.gpgsign=false"]
+FOOT = "Facts as written; not advice; doctors decide."
+HEADERS = (("Cache-Control", "no-store"), ("X-Robots-Tag", "noindex, nofollow"), ("Referrer-Policy", "no-referrer"),
+           ("X-Content-Type-Options", "nosniff"))
+
+
+class ApiError(Exception):
+    def __init__(self, status, msg):
+        super().__init__(msg)
+        self.status, self.msg = status, msg
+
+
+def clean_by(v):
+    v = re.sub(r"[^\x20-\x7e\u0080-￿]", "", str(v or "")).strip()
+    return v[:MAX_BY] or DEFAULT_BY
+
+
+def groundtruth_lines(ns, text):
+    """-> body lines: `[speaker] text` per non-blank line; terms:/notes: kept; after notes: everything stays as-is."""
+    out, verbatim = [], False
+    for raw in text.splitlines():
+        if verbatim:
+            out.append(raw); continue
+        line = raw.rstrip()
+        s = line.lstrip()
+        if not s:
+            continue
+        if s.startswith("notes:"):
+            verbatim = True; out.append(line)
+        elif s.startswith("terms:") or SPEAKER_RE.match(s):
+            out.append(line)
+        else:
+            out.append(f"[{ns}] {s}")
+    return out
+
+
+class Store:
+    def __init__(self, root, branch="main", remote="origin", push=True):
+        self.root = pathlib.Path(root).resolve()
+        self.branch, self.remote, self.push = branch, remote, push
+        self.lock = threading.Lock()
+        self.cfg = records_config.load(self.root)
+
+    def audio_path(self, ns, stem):
+        if ns not in self.cfg["persons"]:
+            return None
+        for ext in AUDIO_EXTS:
+            p = self.root / "sources" / ns / "media" / "telegram" / f"{stem}.{ext}"
+            if p.is_file():
+                return p
+        return None
+
+    def find_message(self, stem):
+        """-> {update_id, id, duration_sec} of the d1.messages audio row whose media_ref ends in /<stem>, else None."""
+        tg = self.root / "data" / "telegram"
+        for f in sorted(tg.glob("*.ndjson")) if tg.is_dir() else []:
+            if f.name in SKIP_TG:
+                continue
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("rt") != "d1.messages" or r.get("kind") != "audio":
+                    continue
+                if str(r.get("media_ref") or "").rsplit("/", 1)[-1] != stem:
+                    continue
+                m = re.fullmatch(r"tg:(\d+)", str(r.get("external_id") or ""))
+                if m:
+                    return {"update_id": int(m.group(1)), "id": r.get("id"), "duration_sec": r.get("duration_sec")}
+        return None
+
+    def _git(self, *args, check=True):
+        return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True, check=check)
+
+    def _listened_has(self, uid):
+        p = self.root / "data" / "telegram" / "listened.ndjson"
+        if not p.is_file():
+            return False
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                if json.loads(line).get("update_id") == uid:
+                    return True
+            except (json.JSONDecodeError, AttributeError):
+                continue
+        return False
+
+    def _write_groundtruth(self, ns, stem, audio, msg, by, text):
+        rel = audio.relative_to(self.root).as_posix()
+        now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        fm = ["type: ground-truth-transcript", f'audio: "{rel}"', f"audio_sha256: {hashlib.sha256(audio.read_bytes()).hexdigest()}",
+              f'message_id: "{msg["id"]}"', f"update_id: {msg['update_id']}"]
+        if msg.get("duration_sec") is not None:
+            fm.append(f"duration_sec: {msg['duration_sec']}")
+        fm += ["script: as written by the listener (Devanagari or Latin)", f"speakers: [{ns}]", "listened: true",
+               f"transcribed_by: {by} (voice review page)", f"transcribed_at: {now}",
+               "purpose: STT evaluation and re-extraction. Verbatim, not tidied."]
+        body = ["---", *fm, "---", "", f"# Ground truth: voice note {stem} ({ns})", "", FOOT, "", *groundtruth_lines(ns, text), ""]
+        p = audio.with_name(f"{stem}.groundtruth.md")
+        p.write_text("\n".join(body), encoding="utf-8")
+        return p
+
+    def _append_listened(self, uid, by, note):
+        p = self.root / "data" / "telegram" / "listened.ndjson"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        old = p.read_text(encoding="utf-8") if p.is_file() else ""
+        row = json.dumps({"update_id": uid, "by": by, "at": datetime.datetime.now(IST).strftime("%Y-%m-%d"), "note": note},
+                         ensure_ascii=False)
+        p.write_text(old + ("" if not old or old.endswith("\n") else "\n") + row + "\n", encoding="utf-8")
+        return p
+
+    def apply(self, ns, stem, action, text, by):
+        """-> (status, result dict). Validates, writes, commits and pushes under the one lock."""
+        audio = self.audio_path(ns, stem)
+        if audio is None:
+            raise ApiError(404, "not found")
+        msg = self.find_message(stem)
+        if msg is None:
+            raise ApiError(409, "voice note not recorded by the batch yet")
+        uid = msg["update_id"]
+        with self.lock:
+            if self.push:
+                self._git("pull", "--rebase", "--quiet", self.remote, self.branch, check=False)
+            touched = []
+            if action == "save":
+                touched.append(self._write_groundtruth(ns, stem, audio, msg, by, text))
+            if not self._listened_has(uid):
+                touched.append(self._append_listened(uid, by, NOTES[action]))
+            out = {"ok": True, "action": action, "ns": ns, "stem": stem, "update_id": uid, "by": by,
+                   "changed": bool(touched), "commit": None}
+            if not touched:
+                return 200, out
+            self._git("add", "--", *[str(p.relative_to(self.root)) for p in touched])
+            self._git(*GIT_IDENT, "commit", "--quiet", "-m", f"data: voice review {action} {ns}/{stem}")
+            out["commit"] = self._git("rev-parse", "HEAD").stdout.strip()
+            if self.push:
+                r = self._git("push", "--quiet", self.remote, f"HEAD:{self.branch}", check=False)
+                if r.returncode:
+                    self._git("pull", "--rebase", "--quiet", self.remote, self.branch, check=False)
+                    r = self._git("push", "--quiet", self.remote, f"HEAD:{self.branch}", check=False)
+                if r.returncode:
+                    out.update(ok=False, error="push failed; the write and its commit are kept locally",
+                               commit=self._git("rev-parse", "HEAD").stdout.strip())
+                    return 502, out
+            return 200, out
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "saturn-voice-api"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # no default access log (it would carry the query string)
+        pass
+
+    def _send(self, status, body, ctype):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in HEADERS:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, status, obj):
+        self._send(status, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+
+    def _done(self, status, action=None):
+        sys.stderr.write(f"{self.command} {self.path.split('?')[0]} {status} {action or '-'}\n")
+        sys.stderr.flush()
+
+    def do_GET(self):
+        if self.path.split("?")[0] == "/health":
+            self._json(200, {"ok": True}); self._done(200)
+        else:
+            self._json(404, {"ok": False, "error": "not found"}); self._done(404)
+
+    def _fields(self):
+        """-> (fields dict, is_form). Reads and parses the body; raises ApiError."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ApiError(400, "bad content-length")
+        if n > MAX_BODY:
+            raise ApiError(413, "body too large")
+        raw = self.rfile.read(n) if n else b""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype == "application/x-www-form-urlencoded":
+            q = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+            return {k: v[0] for k, v in q.items()}, True
+        if ctype == "application/json":
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ApiError(400, "bad JSON")
+            if not isinstance(obj, dict):
+                raise ApiError(400, "JSON body must be an object")
+            return obj, False
+        raise ApiError(415, "send application/json or application/x-www-form-urlencoded")
+
+    def do_POST(self):
+        is_form, action = False, None
+        try:
+            m = ROUTE_RE.match(self.path.split("?")[0])
+            if not m:
+                raise ApiError(404, "not found")
+            ns, stem = m.group(1), m.group(2)
+            fields, is_form = self._fields()
+            action = fields.get("action")
+            if action not in NOTES:
+                raise ApiError(400, "action must be heard or save")
+            text = fields.get("text")
+            text = text if isinstance(text, str) else ""
+            if action == "save" and not text.strip():
+                raise ApiError(400, "save needs text")
+            if len(text.encode("utf-8")) > MAX_TEXT:
+                raise ApiError(413, "text too large")
+            by = clean_by((self.headers.get("Tailscale-User-Login") or "").strip() or fields.get("by"))
+            status, out = self.server.store.apply(ns, stem, action, text, by)
+        except ApiError as e:
+            self._json(e.status, {"ok": False, "error": e.msg}); self._done(e.status, action); return
+        except subprocess.CalledProcessError:
+            self._json(500, {"ok": False, "error": "git failed"}); self._done(500, action); return
+        if is_form and out.get("ok"):
+            page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
+                    f"<title>Recorded</title></head><body><p>Recorded: {esc(action)} for {esc(stem)} by {esc(out['by'])}. "
+                    "Go back to the voice note page.</p></body></html>")
+            self._send(status, page, "text/html; charset=utf-8")
+        else:
+            self._json(status, out)
+        self._done(status, action)
+
+
+def esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, store):
+        super().__init__(addr, Handler)
+        self.store = store
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--records", required=True)
+    ap.add_argument("--bind", required=True)
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--branch", default="main")
+    ap.add_argument("--remote", default="origin")
+    ap.add_argument("--no-push", action="store_true")
+    a = ap.parse_args(argv)
+    store = Store(a.records, a.branch, a.remote, push=not a.no_push)
+    srv = Server((a.bind, a.port), store)
+    sys.stderr.write(f"voice-api listening on {srv.server_address[0]}:{srv.server_address[1]}\n")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

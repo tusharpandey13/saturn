@@ -197,12 +197,17 @@ function toExtract(repo: Repo, retryFailed: boolean, sttAvailable: boolean, alia
   const done = new Map(repo.kbRows().filter((r) => r.rt === "d1.messages").map((r) => [r.id as string, r]));
   return [...latest.values()]
     .map((t) => ({ ...t, subject: subjectOf(t.raw, t.msg.text, overrides, repo, aliases) }))
-    .filter(({ msg, subject }) => {
+    .filter(({ raw, msg, subject }) => {
       const prev = done.get(msg.key);
       if (!prev) return true;
       if (prev.person_id !== subject.id) return true; // re-attributed (override or /for): re-extract into the new subject
       if (retryFailed && prev.extraction_status === "failed") return true;
       if (sttAvailable && prev.extraction_status === "stt_pending") return true; // backfill once a key exists
+      if (msg.kind === "audio" && raw.media_path && prev.extraction_status !== "private") {
+        // A person's corrected transcript landed or changed (content sha, never mtime): re-extract from it, no STT needed.
+        const gt = repo.groundtruth(raw.media_path);
+        if (gt && (prev.transcript_engine !== "groundtruth" || prev.transcript_sha256 !== gt.sha256)) return true;
+      }
       return Number(prev.edit_date ?? 0) < msg.editDate;
     })
     .sort((a, b) => a.raw.update_id - b.raw.update_id);
@@ -227,10 +232,12 @@ type Base = {
   context_status?: string;
   /** extraction_status duplicate: the message key whose identical file (same bytes, same subject) was recorded. */
   duplicate_of?: string;
-  /** Voice notes: length (Telegram), the transcript file next to the audio, and the engine that made it. */
+  /** Voice notes: length (Telegram), the transcript file next to the audio, and the engine that made it
+   *  ("groundtruth" = a person's corrected transcript, `<audio>.groundtruth.md`; transcript_sha256 = that file's bytes). */
   duration_sec?: number;
   transcript_path?: string;
   transcript_engine?: string;
+  transcript_sha256?: string;
 };
 interface Item {
   raw: RawRow;
@@ -324,6 +331,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     items.push(item);
     try {
       let transcript: Transcript | null = null;
+      let groundtruth: ReturnType<Repo["groundtruth"]> = null;
       const media = raw.media_path ? { data: d.repo.readMedia(raw.media_path), mimeType: raw.media_mime ?? MIME_OF_EXT[raw.media_path.split(".").pop()!] ?? "application/octet-stream" } : undefined;
       if (media && (msg.kind === "image" || msg.kind === "document")) {
         const k = `${subject.id}|${sha(media.data)}`;
@@ -339,7 +347,12 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
         }
         seenMedia.set(k, msg.key);
       }
-      if (msg.kind === "audio" && media) {
+      if (msg.kind === "audio" && media && (groundtruth = d.repo.groundtruth(raw.media_path!))) {
+        // A person's corrected transcript beside the audio: read as is (no engine, not counted in voice.notes).
+        base.duration_sec = msg.durationSec ?? 0;
+        Object.assign(base, { transcript: groundtruth.text, transcript_engine: "groundtruth", transcript_confidence: 1, transcript_language: null, transcript_path: groundtruth.path, transcript_sha256: groundtruth.sha256 });
+        transcript = { text: groundtruth.text };
+      } else if (msg.kind === "audio" && media) {
         const dur = msg.durationSec ?? 0;
         base.duration_sec = dur;
         const capped = d.stt?.local && ((voice.notes > 0 && voice.audioSec + dur > (d.sttMaxAudioSec ?? Infinity)) || Date.now() > (d.sttDeadline ?? Infinity));
@@ -395,7 +408,8 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
         item.extractedBy = "vitals-parser";
       } else {
         item.input = { text, media: msg.kind === "audio" ? undefined : media, now: msg.ts, replyTo: msg.replyToText };
-        if (transcript?.segments?.length) item.input = { ...item.input, text: timedLines(transcript), voice: { durationSec: transcript.meta?.audioSec || msg.durationSec || 0 }, replyTo: undefined };
+        if (groundtruth) item.input = { ...item.input, voice: { durationSec: msg.durationSec ?? 0 }, replyTo: undefined };
+        else if (transcript?.segments?.length) item.input = { ...item.input, text: timedLines(transcript), voice: { durationSec: transcript.meta?.audioSec || msg.durationSec || 0 }, replyTo: undefined };
         const forwarded = ["forward_origin", "forward_from", "forward_date", "forward_sender_name"].some((k) => k in ((raw.update.message ?? raw.update.edited_message ?? {}) as object));
         if (contextEligible({ mode, senderConsented: consented.has(raw.person_id), text, forwarded, vitalsOnly: !!vit?.complete })) {
           if (contextLeft > 0) {
@@ -468,7 +482,9 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     base.subject_hint = hint;
     out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now), ...statementRows(msg.key, subject.id, raw.person_id, statements ?? [], ex.confidence, extractedBy!, d.now),
       ...contextRows(msg.key, raw.person_id, context ?? [], mode, extractedBy!, d.now));
-    if (statements) entry.notes = [...(entry.notes ?? []), `voice note (${durationEn(base.duration_sec ?? 0)}): machine transcript, ${statements.length} item(s) recorded (unchecked)`];
+    if (statements) entry.notes = [...(entry.notes ?? []), base.transcript_engine === "groundtruth"
+      ? `voice note (${durationEn(base.duration_sec ?? 0)}): listened transcript (ground truth), ${statements.length} item(s) recorded`
+      : `voice note (${durationEn(base.duration_sec ?? 0)}): machine transcript, ${statements.length} item(s) recorded (unchecked)`];
     replaced.add(msg.key);
     ctx.signals += context?.length ?? 0;
     if (mode === "shadow" && context?.length)

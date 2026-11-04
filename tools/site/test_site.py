@@ -282,6 +282,61 @@ class SiteTest(unittest.TestCase):
             self.assertIn("Alice: example analysis", st)
             self.assertIn("../notes/", st)
 
+    def test_voice_pages(self):
+        lst = self.pages["alice/voice.html"]
+        self.assertLess(lst.index("voice/u-voice-ex2.html"), lst.index("voice/u-voice-ex1.html"))  # newest first
+        self.assertRegex(lst, r'u-voice-ex2\.html"><b>12-Jun-2026</b> · 12 s · Alice<div class="small muted">heard')
+        self.assertRegex(lst, r'u-voice-ex1\.html"><b>11-Jun-2026</b> · 7 s · Alice<div class="small muted">not heard yet')
+        self.assertIn('href="voice.html"><b>2 voice notes</b> · 1 to hear', self.pages["alice/overview.html"])
+        self.assertNotIn("bob/voice.html", self.pages)  # no voice notes: no page, no link
+        self.assertNotIn("voice.html", self.pages["bob/overview.html"])
+        one = self.pages["alice/voice/u-voice-ex1.html"]
+        self.assertIn('<source src="../../files/sources/alice/media/telegram/u-voice-ex1.ogg" type="audio/ogg">', one)
+        self.assertTrue((self.out / "files/sources/alice/media/telegram/u-voice-ex1.ogg").is_file())
+        self.assertIn("Not heard yet", one)
+        self.assertIn("suggested reading", one)  # the Mac transcript's reconciled lines fill the text box
+        self.assertIn(">आज मौसम अच्छा(?) है\nशाम को दो गोली</textarea>", one)
+        self.assertIn("<summary>Raw whisper (verbatim, timed)</summary>", one)
+        self.assertIn("[00:00.0 → 00:03.5] [S1] आज मौसम अच्छा है", one)
+        self.assertNotIn("<form", one)  # no endpoint given: read-only
+        self.assertIn("Read-only build", one)
+        self.assertIn("form-action 'none'", one)
+        two = self.pages["alice/voice/u-voice-ex2.html"]
+        self.assertIn("<b>Heard</b> by owner on 13-Jun-2026", two)
+        self.assertIn("machine transcript", two)  # no Mac transcript: the batch transcript is the fallback
+        self.assertIn(">टेस्ट रिकॉर्डिंग एक दो तीन</textarea>", two)
+
+    def test_voice_form_with_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "site"
+            r = run(self.rec, out, "--voice-api", "https://api.example.invalid/voice-api/")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            one = (out / "alice/voice/u-voice-ex1.html").read_text(encoding="utf-8")
+            self.assertIn('<form method="post" action="https://api.example.invalid/voice-api/voice/alice/u-voice-ex1" '
+                          'accept-charset="utf-8"', one)
+            self.assertIn('<textarea name="text"', one)
+            self.assertIn('<button type="submit" name="action" value="heard">Heard, no changes</button>', one)
+            self.assertIn('<button type="submit" name="action" value="save">Save corrections</button>', one)
+            self.assertIn("form-action https://api.example.invalid\"", one)
+            self.assertNotIn("<script", one.lower())
+            # a corrected transcript beside the audio is what the box shows (and it is linked)
+            gt = self.rec / "sources/alice/media/telegram/u-voice-ex1.groundtruth.md"
+            gt.write_text("---\ntype: ground-truth-transcript\nlistened: true\n---\n\n# Ground truth\n\n"
+                          "[alice] आज मौसम अच्छा है\n[alice] शाम को दो गोली\n\nnotes: synthetic\n", encoding="utf-8")
+            try:
+                r = run(self.rec, out, "--voice-api", "https://api.example.invalid/voice-api")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                one = (out / "alice/voice/u-voice-ex1.html").read_text(encoding="utf-8")
+                self.assertIn("corrected transcript", one)
+                self.assertIn(">[alice] आज मौसम अच्छा है\n[alice] शाम को दो गोली</textarea>", one)
+                self.assertNotIn("notes: synthetic", one)
+                self.assertIn("Ground truth file", one)
+                self.assertIn("corrected transcript saved", (out / "alice/voice.html").read_text(encoding="utf-8"))
+            finally:
+                gt.unlink()
+            r = run(self.rec, out, "--voice-api", "not-a-url")
+            self.assertEqual(r.returncode, 2)
+
     def test_output_guard(self):
         r = run(self.rec, PRODUCT / "tools" / "site" / "out-test")
         self.assertEqual(r.returncode, 2)

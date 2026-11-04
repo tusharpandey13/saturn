@@ -12,6 +12,7 @@
 // the same input writes identical bytes.
 
 import type { DigestEntry } from "./digest.js";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { TgUpdate } from "../channel/telegram.js";
@@ -218,6 +219,26 @@ export class Repo {
     if (existsSync(this.p(rel)) && !readFileSync(this.p(rel), "utf8").startsWith(TRANSCRIPT_MARK)) rel = `${stem}.batch.transcript.md`;
     writeIfChanged(this.p(rel), md);
     return rel;
+  }
+
+  /** A person's corrected transcript beside the audio: `<audio-name>.groundtruth.md` (written on the review site; the
+   *  format tools/stt-eval scores against). `text` = the `[speaker] text` body lines as written, joined with "\n":
+   *  front matter, headings, blank lines and the `terms:` line are skipped; everything from `notes:` on is left out.
+   *  `sha256` is over the file bytes: the batch re-extracts once per content. null when there is no such file. */
+  groundtruth(audioRel: string): { path: string; text: string; sha256: string } | null {
+    const rel = `${audioRel.replace(/\.[^./]+$/, "")}.groundtruth.md`;
+    if (!existsSync(this.p(rel))) return null;
+    const bytes = readFileSync(this.p(rel));
+    const md = bytes.toString("utf8");
+    const body = md.startsWith("---\n") ? md.slice(4).split(/^---[ \t]*$/m).slice(1).join("---") : md;
+    const lines: string[] = [];
+    for (const raw of body.split("\n")) {
+      const s = raw.trim();
+      if (s.startsWith("terms:")) continue;
+      if (s.startsWith("notes:")) break;
+      if (/^\[[^\]:]+\]\s+\S/.test(s)) lines.push(s);
+    }
+    return { path: rel, text: lines.join("\n"), sha256: createHash("sha256").update(bytes).digest("hex") };
   }
 
   /** update_ids a person has listened to (data/telegram/listened.ndjson; append-only, see the records guide). */

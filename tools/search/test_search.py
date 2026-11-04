@@ -105,7 +105,8 @@ class Search(unittest.TestCase):
         with open(self.rec / "data/ref/code.ndjson", "a") as f:
             f.write("\n")
         s = self.index()
-        n_fact_files = len([p for p in (self.rec / "data").rglob("*.ndjson") if "ref" not in p.parts])
+        # the KB fact files (data/<ns>/docs/*.ndjson): not refs, not the telegram rows the indexer skips (search line ~38)
+        n_fact_files = len([p for p in (self.rec / "data").rglob("*.ndjson") if not {"ref", "meta", "telegram", "queue"} & set(p.parts)])
         self.assertEqual(s["files_changed"], n_fact_files)
 
     def test_model_change_reindexes_everything(self):
