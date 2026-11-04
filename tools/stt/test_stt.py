@@ -146,6 +146,7 @@ class Unit(unittest.TestCase):
         dec = json.loads(re.sub(r"(\w+):", r'"\1":', dec))
         self.assertEqual(dec, STT.DECODE)
         self.assertIn("TEMPERATURES = [0.0, 0.4]", ts)
+        self.assertIn(f"PROMPT_CHARS = {L.PROMPT_CHARS};", ts)
         setup = (HERE / "setup-mac.sh").read_text()
         self.assertIn(STT.WHISPER_COMMIT, setup)
         self.assertIn(STT.WHISPER_MODEL_SHA256, setup)
@@ -156,6 +157,24 @@ class Unit(unittest.TestCase):
         self.assertNotIn("-tr", args)
         self.assertIn("--output-json-full", args)
         self.assertEqual(args[args.index("--max-context") + 1], "0")
+        self.assertNotIn("--prompt", args)
+        args = STT.whisper_args("m", "w", "o", "hi", 0.0, 4, "alpha, beta")
+        self.assertEqual(args[args.index("--prompt") + 1], "alpha, beta")
+
+    def test_terms_prompt(self):
+        self.assertEqual(L.terms_prompt("# medicines\nTermA\n\n  TermB  # brand\n# symptoms\nterm c\n"), ("TermA, TermB, term c", 3))
+        self.assertEqual(L.terms_prompt(""), ("", 0))
+        self.assertEqual(L.terms_prompt("# only a comment\n\n"), ("", 0))
+        prompt, n = L.terms_prompt("\n".join(f"term{i:03d}" for i in range(200)))  # 7 chars each, ", " between
+        self.assertEqual(L.PROMPT_CHARS, 700)
+        self.assertLessEqual(len(prompt), 700)
+        self.assertEqual(n, 78)  # 78 * 7 + 77 * 2 = 700; the 79th would make 709
+        self.assertTrue(prompt.startswith("term000, term001") and prompt.endswith("term077"))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(L.load_terms_prompt(d), ("", 0))
+            os.mkdir(os.path.join(d, "eval"))
+            pathlib.Path(d, "eval/stt-terms.txt").write_text("# list\nalpha\nbeta\n", encoding="utf-8")
+            self.assertEqual(L.load_terms_prompt(d), ("alpha, beta", 2))
 
     def test_repetition(self):
         self.assertEqual(STT.repetition_verdict([{"text": "एक दो तीन"}]), "ok")

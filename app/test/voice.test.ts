@@ -1,9 +1,10 @@
 // Voice notes: whisper.cpp adapter (fake engine), loop post-check, no-translation guard, statement validation.
 // Synthetic data only. The real-engine test runs only when WHISPER_MODEL points at a model file (CI env, or locally).
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildArgs, devanagariShare, repetitionVerdict, WhisperCppSpeechToText, WhisperError } from "../../adapters/stt/whisper-cpp.js";
+import { buildArgs, devanagariShare, loadTermsPrompt, PROMPT_CHARS, repetitionVerdict, termsPrompt, WhisperCppSpeechToText, WhisperError } from "../../adapters/stt/whisper-cpp.js";
 import { durationEn, parseStatements } from "../src/extract/voice.js";
 import type { TranscriptSegment } from "../src/types.js";
 
@@ -38,6 +39,33 @@ describe("no translation, loop protection flags", () => {
   });
 });
 
+describe("initial prompt from the records key-term list", () => {
+  it("joins the non-comment lines in file order; empty or comment-only text gives no prompt", () => {
+    expect(termsPrompt("# medicines\nTermA\n\n  TermB  # brand\n# symptoms\nterm c\n")).toEqual({ prompt: "TermA, TermB, term c", terms: 3 });
+    expect(termsPrompt("")).toEqual({ prompt: "", terms: 0 });
+    expect(termsPrompt("# only a comment\n\n")).toEqual({ prompt: "", terms: 0 });
+  });
+  it("caps the prompt at 700 characters, whole terms, keeping the first ones", () => {
+    const text = Array.from({ length: 200 }, (_, i) => `term${String(i).padStart(3, "0")}`).join("\n"); // 7 chars each, ", " between
+    const r = termsPrompt(text);
+    expect(PROMPT_CHARS).toBe(700);
+    expect(r.prompt.length).toBeLessThanOrEqual(700);
+    expect(r.terms).toBe(78); // 78 * 7 + 77 * 2 = 700; the 79th would make 709
+    expect(r.prompt.startsWith("term000, term001")).toBe(true);
+    expect(r.prompt.endsWith("term077")).toBe(true);
+  });
+  it("reads <records>/eval/stt-terms.txt; a missing file means no --prompt", () => {
+    const dir = mkdtempSync(join(tmpdir(), "stt-terms-"));
+    expect(loadTermsPrompt(dir)).toEqual({ prompt: "", terms: 0 });
+    mkdirSync(join(dir, "eval"));
+    writeFileSync(join(dir, "eval", "stt-terms.txt"), "# list\nalpha\nbeta\n");
+    expect(loadTermsPrompt(dir)).toEqual({ prompt: "alpha, beta", terms: 2 });
+    expect(buildArgs({ model: "m.bin", wav: "a.wav", out: "o", language: "hi", temperature: 0, threads: 2 })).not.toContain("--prompt");
+    const a = buildArgs({ model: "m.bin", wav: "a.wav", out: "o", language: "hi", temperature: 0, threads: 2, prompt: "alpha, beta" });
+    expect(a[a.indexOf("--prompt") + 1]).toBe("alpha, beta");
+  });
+});
+
 /** Fake ffmpeg + whisper-cli: ffmpeg writes a WAV of `sec` seconds; whisper answers from `outputs` in order. */
 function fakeEngine(outputs: (string[] | "fail")[], detect = "hi", p = 0.97, sec = 12) {
   const calls: string[][] = [];
@@ -69,6 +97,13 @@ describe("WhisperCppSpeechToText (fake engine)", () => {
     expect(t.meta).toMatchObject({ accepted: true, audioSec: 12, attempts: [{ language: "hi", temperature: 0, verdict: "ok" }] });
     expect(t.meta!.settings).toMatch(/--max-context 0.*no translation/);
     expect(f.calls.flat()).not.toContain("--translate");
+  });
+  it("passes the initial prompt to the transcription pass only (not the detection pass)", async () => {
+    const f = fakeEngine([["बीपी ठीक है"]]);
+    await new WhisperCppSpeechToText({ model: "m.bin", exec: f.exec, prompt: "alpha, beta" }).transcribe(OGG);
+    const [detect, pass] = f.calls.filter((c) => c[0] === "whisper-cli");
+    expect(detect).not.toContain("--prompt");
+    expect(pass[pass.indexOf("--prompt") + 1]).toBe("alpha, beta");
   });
   it("a looping output is rejected and retried at a higher temperature, then with auto-detect", async () => {
     const loop = Array(4).fill("दवाई ले ली है");

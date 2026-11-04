@@ -29,7 +29,10 @@ python3 -I tools/stt/test_stt.py                          # synthetic tests (fak
 whisper runs with the batch's production settings (`adapters/stt/whisper-cpp.ts`; `test_stt.py` fails if they drift):
 `-l hi` first and auto-detect as the fallback (or first when a detection pass is confident the speech is not
 Hindi/Urdu), `--max-context 0`, entropy/log-prob thresholds, temperature fallback, the repetition post-check, and
-**never** `--translate`. `--output-json-full` gives token times, from which words get times; long segments are split
+**never** `--translate`. Both call sites pass the records key-term list `eval/stt-terms.txt` (non-comment lines in file
+order, joined by ", ") as whisper's initial prompt (`--prompt`), so the engine favours the family's medicine, place and
+symptom words; the prompt is cut at 700 characters (about 180 tokens, whole terms only) and logs carry only the term
+count. `--output-json-full` gives token times, from which words get times; long segments are split
 at pauses/punctuation (at most 12 s) so quotes have useful time ranges. MMS words are aligned to those segments by
 time; MMS words far from any whisper segment (speech whisper skipped) keep their own rows.
 

@@ -21,7 +21,7 @@
 // Never log transcript text: logs carry counts, durations and verdicts only.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Media, SpeechToText, Transcript, TranscriptAttempt, TranscriptSegment } from "../../app/src/types.js";
@@ -37,6 +37,29 @@ export const DECODE = { maxContext: 0, entropyThold: 2.4, logprobThold: -1.0, no
 export const TEMPERATURES = [0.0, 0.4];
 /** A detection pass this confident that the speech is not Hindi/Urdu starts with auto-detect instead of `-l hi`. */
 export const DETECT_CONFIDENT = 0.8;
+/** Character budget of the initial prompt (`--prompt`): about 180 tokens, whisper's decoder context for a prompt. */
+export const PROMPT_CHARS = 700;
+
+/** Initial prompt from the records key-term list (eval/stt-terms.txt: one term per line, `#` comments): the terms in
+ *  file order, joined by ", ", cut at PROMPT_CHARS (whole terms only). Returns the prompt and how many terms it holds. */
+export function termsPrompt(text: string): { prompt: string; terms: number } {
+  const terms = text.split("\n").map((l) => l.split("#")[0].trim()).filter(Boolean);
+  let prompt = "";
+  let n = 0;
+  for (const t of terms) {
+    const next = prompt ? `${prompt}, ${t}` : t;
+    if (next.length > PROMPT_CHARS) break;
+    prompt = next;
+    n++;
+  }
+  return { prompt, terms: n };
+}
+
+/** `<records>/eval/stt-terms.txt` -> prompt; no file: empty prompt (no `--prompt`). */
+export function loadTermsPrompt(recordsDir: string): { prompt: string; terms: number } {
+  const p = join(recordsDir, "eval", "stt-terms.txt");
+  return existsSync(p) ? termsPrompt(readFileSync(p, "utf8")) : { prompt: "", terms: 0 };
+}
 
 export class WhisperError extends Error {
   override name = "WhisperError";
@@ -59,9 +82,11 @@ export interface WhisperOptions {
   exec?: (cmd: string, args: string[], timeoutMs: number) => Promise<{ code: number | null; stderr: string }>;
   /** Engine label in the transcript file. */
   engine?: string;
+  /** Initial prompt (`--prompt`): the records key-term list (loadTermsPrompt). Never logged. */
+  prompt?: string;
 }
 
-export function buildArgs(o: { model: string; wav: string; out: string; language: string; temperature: number; threads: number }): string[] {
+export function buildArgs(o: { model: string; wav: string; out: string; language: string; temperature: number; threads: number; prompt?: string }): string[] {
   const args = [
     "-m", o.model, "-f", o.wav, "-l", o.language, "-t", String(o.threads),
     "--max-context", String(DECODE.maxContext), "--entropy-thold", String(DECODE.entropyThold),
@@ -70,6 +95,7 @@ export function buildArgs(o: { model: string; wav: string; out: string; language
     "--beam-size", String(DECODE.beamSize), "--best-of", String(DECODE.bestOf),
     "--suppress-nst", "--output-json", "--output-file", o.out, "--no-prints",
   ];
+  if (o.prompt) args.push("--prompt", o.prompt);
   if (args.some((a) => a === "-tr" || a === "--translate")) throw new WhisperError("translate_forbidden");
   return args;
 }
@@ -187,7 +213,7 @@ export class WhisperCppSpeechToText implements SpeechToText {
         for (const temperature of TEMPERATURES) {
           const a0 = Date.now();
           const out = join(dir, `out-${attempts.length}`);
-          const r = await this.exec(bin, buildArgs({ model: this.o.model, wav, out, language: l, temperature, threads }), timeoutMs);
+          const r = await this.exec(bin, buildArgs({ model: this.o.model, wav, out, language: l, temperature, threads, prompt: this.o.prompt }), timeoutMs);
           let verdict = "ok";
           let parsed: ReturnType<typeof parseWhisperJson> = { language: null, segments: [] };
           if (r.code !== 0) verdict = r.code === null ? "timeout" : `exit_${r.code}`;

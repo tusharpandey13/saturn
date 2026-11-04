@@ -13,6 +13,30 @@ CLAUDE_ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL
                     "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "NODE_EXTRA_CA_CERTS")
 AUDIO_EXT = (".ogg", ".oga", ".m4a", ".mp3", ".wav", ".opus")
 FACTS_LINE = "Facts as written; not advice; doctors decide."
+PROMPT_CHARS = 700  # whisper initial prompt budget (~180 tokens); mirrors adapters/stt/whisper-cpp.ts
+
+
+def terms_prompt(text: str) -> tuple:
+    """whisper initial prompt from the records key-term list (one term per line, `#` comments): terms in file order
+    joined by ", ", cut at PROMPT_CHARS (whole terms only). Returns (prompt, number of terms in it)."""
+    prompt, n = "", 0
+    for t in (l.split("#")[0].strip() for l in text.splitlines()):
+        if not t:
+            continue
+        nxt = f"{prompt}, {t}" if prompt else t
+        if len(nxt) > PROMPT_CHARS:
+            break
+        prompt, n = nxt, n + 1
+    return prompt, n
+
+
+def load_terms_prompt(records) -> tuple:
+    """`<records>/eval/stt-terms.txt` -> (prompt, terms); no file: ("", 0), so no --prompt."""
+    p = os.path.join(str(records), "eval", "stt-terms.txt")
+    if not os.path.isfile(p):
+        return "", 0
+    with open(p, encoding="utf-8") as f:
+        return terms_prompt(f.read())
 
 
 # ---------------------------------------------------------------- normalisation

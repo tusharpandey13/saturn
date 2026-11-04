@@ -84,13 +84,15 @@ def sha256(path):
 
 
 # ---------------------------------------------------------------- whisper.cpp
-def whisper_args(model, wav, out, language, temperature, threads):
+def whisper_args(model, wav, out, language, temperature, threads, prompt=None):
     args = ["-m", model, "-f", wav, "-l", language, "-t", str(threads),
             "--max-context", str(DECODE["maxContext"]), "--entropy-thold", str(DECODE["entropyThold"]),
             "--logprob-thold", str(DECODE["logprobThold"]), "--no-speech-thold", str(DECODE["noSpeechThold"]),
             "--temperature", str(temperature), "--temperature-inc", str(DECODE["temperatureInc"]),
             "--beam-size", str(DECODE["beamSize"]), "--best-of", str(DECODE["bestOf"]),
             "--suppress-nst", "--output-json-full", "--output-file", out, "--no-prints"]
+    if prompt:
+        args += ["--prompt", prompt]
     if any(a in ("-tr", "--translate") for a in args):
         raise RuntimeError("translate_forbidden")
     return args
@@ -183,7 +185,7 @@ def parse_whisper_full(raw):
     return (j.get("result") or {}).get("language"), segs
 
 
-def run_whisper(wav, audio_sec, cache):
+def run_whisper(wav, audio_sec, cache, prompt=None):
     t0 = time.time()
     bin_, model = str(cache / "bin/whisper-cli"), str(cache / f"models/{WHISPER_MODEL_NAME}.bin")
     if not os.access(bin_, os.X_OK) or not os.path.isfile(model):
@@ -203,7 +205,7 @@ def run_whisper(wav, audio_sec, cache):
             for temp in TEMPERATURES:
                 a0 = time.time()
                 out = os.path.join(d, f"out{len(attempts)}")
-                code, _ = run([bin_] + whisper_args(model, wav, out, lang, temp, threads), timeout)
+                code, _ = run([bin_] + whisper_args(model, wav, out, lang, temp, threads, prompt), timeout)
                 verdict, lang_out, segs = "ok", None, []
                 if code != 0:
                     verdict = "timeout" if code is None else f"exit_{code}"
@@ -679,7 +681,8 @@ def transcribe(audio, records, force=False, do_reconcile=True, hints=None):
         if code != 0:
             raise RuntimeError("ffmpeg_failed")
         sec = audio_seconds(wav)
-        w = run_whisper(wav, sec, cache)
+        prompt, n_terms = L.load_terms_prompt(records)
+        w = run_whisper(wav, sec, cache, prompt)
         m = run_mms(wav, sec, cache)
         dz = run_diarize(wav, sec, cache, hints if hints is not None else speaker_hints(audio))
     rows = build_rows(w, m, dz)
@@ -693,7 +696,7 @@ def transcribe(audio, records, force=False, do_reconcile=True, hints=None):
     tmp.write_text(render(o), encoding="utf-8")
     tmp.replace(out)
     log(f"{audio.stem}: {round(sec)} s audio; whisper {w['elapsed_sec']} s ({'accepted' if w['accepted'] else 'rejected'}, "
-        f"{len(w['attempts'])} attempt(s)); mms {m['status']} {m.get('elapsed_sec', 0)} s; diarization {dz['status']}; "
+        f"{len(w['attempts'])} attempt(s), prompt {n_terms} term(s)); mms {m['status']} {m.get('elapsed_sec', 0)} s; diarization {dz['status']}; "
         f"reconcile {rmeta['status']} {rmeta['elapsed_sec']} s, {rmeta['flagged_words']} flagged; {len(rows)} segments; "
         f"total {o['elapsed']} s")
     return out

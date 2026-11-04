@@ -35,7 +35,7 @@ import { TelegramAdapter } from "../src/channel/telegram.js";
 import { ClaudeCliExtractor, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
 import { Store } from "../src/store.js";
 import { parseVocab, SarvamSpeechToText } from "../../adapters/stt/sarvam.js";
-import { WhisperCppSpeechToText } from "../../adapters/stt/whisper-cpp.js";
+import { loadTermsPrompt, WhisperCppSpeechToText } from "../../adapters/stt/whisper-cpp.js";
 import { loadRecords } from "../src/batch/records.js";
 import type { Person } from "../src/types.js";
 import { aliasesFromRecords } from "../src/subject.js";
@@ -78,8 +78,10 @@ async function main(cmd: string | undefined) {
       if (env.CLAUDE_CODE_OAUTH_TOKEN && !env.CLAUDE_TOKEN_CREATED) console.log("::warning::CLAUDE_TOKEN_CREATED is not set; no token-expiry warning to the admins");
     }
     const sttAdapter = env.STT_ADAPTER || (env.SARVAM_API_KEY ? "sarvam" : "none");
+    const terms = loadTermsPrompt(root);
     const whisper = sttAdapter === "whisper-cpp" && env.WHISPER_MODEL && existsSync(env.WHISPER_MODEL)
-      ? new WhisperCppSpeechToText({ bin: env.WHISPER_BIN || undefined, model: env.WHISPER_MODEL, ffmpeg: env.FFMPEG_BIN || undefined }) : null;
+      ? new WhisperCppSpeechToText({ bin: env.WHISPER_BIN || undefined, model: env.WHISPER_MODEL, ffmpeg: env.FFMPEG_BIN || undefined, prompt: terms.prompt || undefined }) : null;
+    if (whisper) console.log(`stt whisper-cpp: initial prompt from eval/stt-terms.txt: ${terms.terms} term(s)`);
     const stt = whisper ?? (sttAdapter === "sarvam" && env.SARVAM_API_KEY ? new SarvamSpeechToText(env.SARVAM_API_KEY, undefined, undefined, parseVocab(records.sttVocab ?? "")) : null);
     if (sttAdapter === "whisper-cpp" && !whisper) console.log("::warning::extract: STT_ADAPTER whisper-cpp but WHISPER_MODEL is missing; voice notes stay stt_pending");
     if (!stt) console.log(`extract: no STT (${sttAdapter}); voice notes are stored as stt_pending`);
