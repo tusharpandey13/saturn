@@ -35,6 +35,7 @@ class Base(unittest.TestCase):
         self.rec = self.tmp / "records"
         shutil.copytree(FIXTURE, self.rec, ignore=shutil.ignore_patterns("kb.sqlite", "kb.tmp"))
         git(self.rec, "init", "--quiet", "-b", "main")
+        git(self.rec, "config", "commit.gpgsign", "false")  # the API signs only when the clone says so
         git(self.rec, "add", "-A")
         git(self.rec, "commit", "--quiet", "-m", "fixture")
         if self.push:
