@@ -30,6 +30,10 @@ import { dayOf, MIME_OF_EXT, type RawRow, Repo, type Row, type SubjectOverride }
 import { type Alias, displayOf, splitSubject } from "../subject.js";
 
 export const LOW_CONFIDENCE = 0.8; // same bar as v_needs_human in data/schema.sql
+/** Voice notes: the transcript-reading model rates most notes 0.5-0.8, so the photo bar would ask about nearly every one. */
+export const VOICE_LOW_CONFIDENCE = 0.5;
+/** A voice note longer than this with nothing recorded from it is listed for a listener. */
+export const NOTHING_HEARD_SEC = 10;
 const DAY = 86_400_000;
 
 // ---------------------------------------------------------------- pull
@@ -464,7 +468,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     base.subject_hint = hint;
     out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now), ...statementRows(msg.key, subject.id, raw.person_id, statements ?? [], ex.confidence, extractedBy!, d.now),
       ...contextRows(msg.key, raw.person_id, context ?? [], mode, extractedBy!, d.now));
-    if (statements) entry.notes = [...(entry.notes ?? []), `voice note (${durationEn(base.duration_sec ?? 0)}): machine transcript, ${statements.length} item(s) recorded; needs a listener`];
+    if (statements) entry.notes = [...(entry.notes ?? []), `voice note (${durationEn(base.duration_sec ?? 0)}): machine transcript, ${statements.length} item(s) recorded (unchecked)`];
     replaced.add(msg.key);
     ctx.signals += context?.length ?? 0;
     if (mode === "shadow" && context?.length)
@@ -519,7 +523,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       reasons.push("subject_hint");
       entry.questions.push(`may be about "${hint.slice(0, 40)}" but is logged for the sender (${entry.person}). Who is it for?`);
     }
-    if (!nothing && ex.confidence < LOW_CONFIDENCE) {
+    if (!nothing && ex.confidence < (msg.kind === "audio" ? VOICE_LOW_CONFIDENCE : LOW_CONFIDENCE)) {
       reasons.push("low_confidence");
       entry.questions.push("read with low confidence; check the values above.");
     }
@@ -559,17 +563,31 @@ function timedLines(t: Transcript): string {
   return (t.segments ?? []).map((s) => `[${mmss(s.start)}] ${s.text}`).join("\n");
 }
 
-/** Every recorded voice note without a `listened` marker (data/telegram/listened.ndjson), oldest first. */
-export function unlistened(repo: Repo, nameOf: (id: string) => string): { person: string; ts: string; durationSec: number; transcribed: boolean }[] {
+/** Voice notes a person should check, oldest first: not transcribed, read below VOICE_LOW_CONFIDENCE, or nothing recorded
+ *  from more than NOTHING_HEARD_SEC of audio. A note with a `listened` marker (data/telegram/listened.ndjson) is never listed. */
+export function unlistened(repo: Repo, nameOf: (id: string) => string): { person: string; ts: string; durationSec: number; why: string }[] {
   const heard = repo.listenedUpdateIds();
   const dur = new Map<string, number>();
   for (const raw of repo.rawRows()) {
     const ev = parseUpdate(raw.update);
     if (ev?.type === "message" && ev.msg.kind === "audio") dur.set(ev.msg.key, ev.msg.durationSec ?? 0);
   }
-  return repo.kbRows()
+  const rows = repo.kbRows();
+  const items = new Map<string, number>();
+  for (const r of rows) if (r.rt === "d1.statements") items.set(String(r.source_message_id), (items.get(String(r.source_message_id)) ?? 0) + 1);
+  const why = (r: Row, durationSec: number): string | null => {
+    if (!r.transcript) return "not transcribed";
+    if (typeof r.confidence === "number" && r.confidence < VOICE_LOW_CONFIDENCE) return "low confidence";
+    if (!items.get(String(r.id)) && durationSec > NOTHING_HEARD_SEC) return "nothing understood";
+    return null;
+  };
+  return rows
     .filter((r) => r.rt === "d1.messages" && r.kind === "audio" && !["private", "duplicate"].includes(String(r.extraction_status)) && !heard.has(Number(String(r.external_id ?? "").replace(/^tg:/, ""))))
-    .map((r) => ({ person: nameOf(String(r.person_id)), ts: String(r.received_at), durationSec: Number(r.duration_sec ?? dur.get(String(r.id)) ?? 0), transcribed: !!r.transcript }))
+    .map((r) => {
+      const durationSec = Number(r.duration_sec ?? dur.get(String(r.id)) ?? 0);
+      return { person: nameOf(String(r.person_id)), ts: String(r.received_at), durationSec, why: why(r, durationSec) };
+    })
+    .filter((v): v is typeof v & { why: string } => v.why !== null)
     .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
 }
 
