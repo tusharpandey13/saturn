@@ -1,0 +1,104 @@
+#!/usr/bin/env -S python3 -I
+"""lint-actions: wording lint for the open to-dos and questions of a records repo (family context rules).
+
+    python3 -I tools/kb/lint-actions --records <records-dir> [--today YYYY-MM-DD]
+
+Scans <records-dir>/docs/health/family/actions.md and docs/health/<ns>/questions.md. An item is a
+'### <ns>:<q|act>:NNNN: title' block up to the next heading; it is open when its block says '**Status:** open'.
+Only open items are checked:
+
+  urgency    a line says today / ASAP / immediately / rush / urgent(ly), and neither says "Tier A" nor is marked
+             superseded (the bullet starts with "**Superseded"). Text inside double quotes is ignored (verbatim
+             report wording, the family's own diary line).
+  no-tier    the block carries no "Tier A", "Tier B" or "Tier C".
+  stale-now  "**Priority:** now" with an "**Added:** YYYY-MM-DD" more than 7 days before today.
+
+One line per finding: <id> <file>:<line> <rule>: <detail>. Exit 1 when there is any finding, 0 when clean.
+Rules: the records repo's docs/health/family/context.md (section "Rules for every agent recommendation")."""
+import argparse, datetime, pathlib, re, sys
+
+ITEM_RE = re.compile(r"^###\s+([a-z][a-z0-9-]*:(?:q|act):\d{4}):\s*(.*)$")
+HEADING_RE = re.compile(r"^#{1,6}\s")
+URGENCY_RE = re.compile(r"\b(today|asap|immediately|rush|urgent|urgently)\b", re.IGNORECASE)
+TIER_RE = re.compile(r"\bTier [ABC]\b")
+TIER_A_RE = re.compile(r"\bTier A\b")
+QUOTED_RE = re.compile(r"\"[^\"\n]*\"|“[^”\n]*”")
+SUPERSEDED_RE = re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)?\*\*Superseded\b")
+OPEN_RE = re.compile(r"\*\*Status:\*\*\s*open\b")
+PRIORITY_NOW_RE = re.compile(r"\*\*Priority:\*\*\s*now\b")
+ADDED_RE = re.compile(r"\*\*Added:\*\*\s*(\d{4}-\d{2}-\d{2})")
+STALE_DAYS = 7
+
+
+def pages(records):
+    out = [records / "docs" / "health" / "family" / "actions.md"]
+    out += sorted((records / "docs" / "health").glob("*/questions.md"))
+    return [p for p in out if p.is_file()]
+
+
+def items(lines):
+    """Yield (id, start_line_no, [(line_no, text), ...]) for each ### item block."""
+    cur = None
+    for n, line in enumerate(lines, 1):
+        m = ITEM_RE.match(line)
+        if m:
+            if cur:
+                yield cur
+            cur = (m.group(1), n, [(n, line)])
+            continue
+        if cur and HEADING_RE.match(line):
+            yield cur
+            cur = None
+            continue
+        if cur:
+            cur[2].append((n, line))
+    if cur:
+        yield cur
+
+
+def lint_page(path, rel, today):
+    findings = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for item_id, start, block in items(lines):
+        text = "\n".join(t for _, t in block)
+        if not OPEN_RE.search(text):
+            continue
+        for n, line in block:
+            if TIER_A_RE.search(line) or SUPERSEDED_RE.match(line):
+                continue
+            hit = URGENCY_RE.search(QUOTED_RE.sub("", line))
+            if hit:
+                findings.append(f"{item_id} {rel}:{n} urgency: \"{hit.group(0)}\" outside a Tier A line")
+        if not TIER_RE.search(text):
+            findings.append(f"{item_id} {rel}:{start} no-tier: open item without Tier A/B/C")
+        for n, line in block:
+            if PRIORITY_NOW_RE.search(line):
+                m = ADDED_RE.search(line) or ADDED_RE.search(text)
+                if not m:
+                    findings.append(f"{item_id} {rel}:{n} stale-now: priority now without an Added date")
+                    continue
+                age = (today - datetime.date.fromisoformat(m.group(1))).days
+                if age > STALE_DAYS:
+                    findings.append(f"{item_id} {rel}:{n} stale-now: priority now for {age} days (added {m.group(1)})")
+    return findings
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--records", required=True, help="records repo root (docs/health/...)")
+    ap.add_argument("--today", default=None, help="YYYY-MM-DD (default: today), for the stale-now rule")
+    a = ap.parse_args(argv)
+    records = pathlib.Path(a.records).resolve()
+    today = datetime.date.fromisoformat(a.today) if a.today else datetime.date.today()
+    findings = []
+    for p in pages(records):
+        findings += lint_page(p, p.relative_to(records).as_posix(), today)
+    for f in findings:
+        print(f)
+    print(f"ok: {len(pages(records))} pages, no findings" if not findings else f"failed: {len(findings)} findings",
+          file=sys.stderr)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

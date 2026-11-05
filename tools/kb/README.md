@@ -13,6 +13,8 @@ python3 -I tools/kb/gen-views --records <records-dir> [--check]
     # refresh the generated page sections; --check exits 1 if a page is stale (writes nothing)
 python3 -I tools/kb/build --records <records-dir> && python3 -I tools/kb/gen-views --records <records-dir>
     # after every data/ change: rebuild, then refresh the pages
+python3 -I tools/kb/lint-actions --records <records-dir> [--today YYYY-MM-DD]
+    # wording lint for OPEN to-dos and questions; exit 1 on any finding (see below)
 python3 -I tools/kb/test_build.py       # product tests, run against fixtures/records-example/
 python3 -I tools/kb/test_gen.py
 ```
@@ -48,6 +50,19 @@ source path/page. A block whose content has not changed keeps its old date line,
 
 Add a block by placing the two marker lines in a page and running the script; an unknown NAME is an error.
 CI: the records repo runs `gen-views --records . --check` so a stale page fails; the batch runs `gen-views` after the build step.
+
+## Wording lint (`lint-actions`)
+`tools/kb/lint-actions --records <records-dir>` reads `docs/health/family/actions.md` and every `docs/health/<ns>/questions.md`,
+takes each `### <ns>:<q|act>:NNNN:` block whose text says `**Status:** open`, and prints one line per finding
+(`<id> <file>:<line> <rule>: <detail>`; exit 1 if any). Rules, from the records repo's family context page
+(`docs/health/family/context.md`, "Rules for every agent recommendation"): **urgency**: a line with *today*, *ASAP*,
+*immediately*, *rush* or *urgent(ly)* unless the same line says `Tier A` or the bullet starts with `**Superseded`
+(text inside double quotes is ignored: verbatim report wording, the family's own diary line); **no-tier**: no
+`Tier A`, `Tier B` or `Tier C` anywhere in the block (the notation the dx loop writes, e.g. `Tier C (next visit)`);
+**stale-now**: `**Priority:** now` with an `**Added:**` date more than 7 days before today (`--today` for tests).
+Fix a finding in place: append an `- **Update <date> (lint):** Tier C …` line and change the priority; mark a stale
+update by prefixing the bullet with `**Superseded <date> …:**`; never rewrite the Ask or renumber ids.
+`test_gen.py` runs it on `fixtures/records-example/` (or `--records DIR`, as the records CI does) and fails on findings.
 
 ## Model (ADR 007)
 Three concepts: **source** (anything received), **fact** (every clinical statement; `kind` = observation | medication |
