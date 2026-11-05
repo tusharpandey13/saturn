@@ -7,7 +7,8 @@ Reads <records>/data/kb.sqlite (read-only; built by tools/kb/build: run that fir
 temp file when it is missing) through the existing views, plus docs/health/<ns>/questions.md, family/actions.md, the
 cross-check pages and agent inference rows when present. Writes <out>/index.html (person picker),
 <out>/<ns>/{overview,status,medicines,results,history,wiki}.html, trend pages under <out>/<ns>/trend/, rendered
-Markdown pages, linked originals under <out>/files/, one style.css and build.json. Voice notes (Telegram audio in
+Markdown pages (docs/health/<ns>/<page>.md -> <ns>/<page>.html, analysis notes -> notes/, with the person's nav),
+linked originals under <out>/files/, one style.css and build.json. No doctor/simple stubs (hidden until built). Voice notes (Telegram audio in
 data/telegram/<month>.ndjson): <out>/<ns>/voice.html and <out>/<ns>/voice/<stem>.html (player, transcript to correct;
 with --voice-api URL the page posts a plain form to tools/site/voice-api; without it the page is read-only).
 
@@ -32,6 +33,8 @@ _spec = importlib.util.spec_from_loader("gen_views", _loader)
 gv = importlib.util.module_from_spec(_spec)
 _loader.exec_module(gv)  # reuse the KB helpers and queries of the Markdown views (design 10 risk c)
 
+RESERVED_PAGES = {"overview", "status", "medicines", "results", "history", "wiki", "questions", "todos", "documents",
+                  "voice", "index", "trend", "doctor", "simple"}
 TABS = [("overview", "Overview"), ("status", "Status"), ("medicines", "Medicines"), ("results", "Results"),
         ("history", "History"), ("wiki", "Wiki")]
 FOOT = "Facts as written; not advice; doctors decide."
@@ -217,13 +220,37 @@ class Data:
         return {r["code"]: r for r in self.kb.q("SELECT * FROM v_latest WHERE ns = ?", ns)}
 
 
-def obs_display(d):
+def device_average(d):
+    """True when the batch read a stored device average (d1.readings reading_kind average -> components.reading_type;
+    tag device-average). Shown as "(device average)" wherever the value is listed (usability review U-14)."""
     comp = d.get("components") or {}
+    return isinstance(comp, dict) and comp.get("reading_type") == "average"
+
+
+def obs_display(d, qualify=True):
+    comp = d.get("components") or {}
+    q = " (device average)" if qualify and device_average(d) else ""
     if isinstance(comp, dict) and "systolic" in comp and "diastolic" in comp:
-        return f"{num(comp['systolic'])}/{num(comp['diastolic'])}"
+        return f"{num(comp['systolic'])}/{num(comp['diastolic'])}{q}"
     if d.get("value_num") is not None:
-        return num(d["value_num"])
-    return d.get("value_text", "")
+        return num(d["value_num"]) + q
+    return d.get("value_text", "") + q
+
+
+MT_PREFIX = re.compile(r"^voice \((machine|listened) transcript\):\s*")
+MT_UNCHECKED = "machine transcript, unchecked"
+
+
+def transcript_text(label):
+    """A d1.statements label ("voice (machine transcript): [NOT: ]summary") -> (summary, negated). No leading NOT:
+    anywhere on the site (usability review U-06)."""
+    t = MT_PREFIX.sub("", label or "")
+    neg = t.startswith("NOT: ")
+    return (t[5:] if neg else t), neg
+
+
+def withhold_numbers(text):
+    return re.sub(r"\d+(?:[.,/:]\d+)*", "(number)", text)
 
 
 def lab_flagged(d):
@@ -300,7 +327,7 @@ def parse_register(text):
                 val = parts[k + 1].strip().rstrip(".").strip()
                 if key not in it["fields"]:
                     it["fields"][key] = val
-        pr = it["fields"].get("Priority", "").lower()
+        pr = it["fields"].get("Priority", "").lower().strip("* ")  # "**now** = this week" counts as now
         it["prio"] = "now" if pr.startswith("now") else "next" if pr.startswith("next") else "some" if pr else "next"
         st = it["fields"].get("Status", "open").lower()
         it["open"] = not any(w in st for w in ("answered", "done", "dropped", "closed", "superseded")) and \
@@ -395,6 +422,31 @@ class Builder:
         actions = root / "docs" / "health" / "family" / "actions.md"
         if actions.is_file():
             self.todos = parse_register(actions.read_text(encoding="utf-8"))[0]
+        self.heard = {}  # telegram update_id -> listened.ndjson row (a person has heard that voice note)
+        lf = root / "data" / "telegram" / "listened.ndjson"
+        if lf.is_file():
+            for line in lf.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        h = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(h.get("update_id"), int) and h["update_id"] not in self.heard:
+                        self.heard[h["update_id"]] = h
+
+    # ---- machine transcripts (U-06): a statement read by speech recognition that nobody has listened to yet
+    def unchecked(self, fid):
+        """True for a fact read from a machine transcript whose voice note has no listened row: never shown as a fact."""
+        f = self.kb.facts.get(fid)
+        if not f or "machine-transcript" not in (j(f["tags"]) or []):
+            return False
+        s = self.kb.sources.get(f["source_id"])
+        ids = j(s["identifiers"]) if s and s["identifiers"] else {}
+        m = re.fullmatch(r"tg:(\d+)", str(ids.get("external_id") or ""))
+        return not (m and int(m.group(1)) in self.heard)
+
+    def mt_pill(self, fid):
+        return f'<span class="pill mt">{MT_UNCHECKED}</span>' if self.unchecked(fid) else ""
 
     # ---- shared bits
     def src_chip(self, path, fid, label_page=True):
@@ -424,7 +476,9 @@ class Builder:
         if relpath not in self.md_pages:
             parts = relpath.split("/")
             if parts[:2] == ["docs", "health"] and len(parts) == 4:
-                self.md_pages[relpath] = f"{parts[2]}/pages/{parts[3][:-3]}.html"
+                stem = parts[3][:-3]  # <ns>/<page>.html unless a built page owns that name (then <ns>/pages/)
+                sub = "pages/" if stem in RESERVED_PAGES or not re.fullmatch(r"[A-Za-z0-9_-]+", stem) else ""
+                self.md_pages[relpath] = f"{parts[2]}/{sub}{stem}.html"
             else:
                 stem = re.sub(r"[^A-Za-z0-9._-]", "-", relpath[:-3].replace("/", "--"))
                 self.md_pages[relpath] = f"notes/{stem}.html"
@@ -466,17 +520,31 @@ class Builder:
                 fm, body = md.split_front_matter((self.root / relpath).read_text(encoding="utf-8"))
                 title = fm.get("title") or pathlib.Path(relpath).stem
                 parts = relpath.split("/")
-                ns = parts[2] if parts[:2] == ["docs", "health"] else None
+                ns = parts[2] if parts[:2] == ["docs", "health"] else self.note_ns(relpath, fm)
                 p = self.people.get(ns)
                 gen = ' <span class="pill neutral">generated view</span>' if fm.get("generated") == "true" else ""
-                inner = (f'<h1>{ESC(title)}</h1><p class="xs muted">Page from the records repo: <code>{ESC(relpath)}'
+                crumb = ""
+                if p:  # never a dead end: a way back to the person this page was opened from (U-24)
+                    back = ("wiki.html", "Wiki") if parts[:2] == ["docs", "health"] else ("overview.html", p.display)
+                    crumb = (f'<p><a class="back" href="{Site.rel(out_path, f"{p.ns}/{back[0]}")}">‹ {ESC(back[1])}</a></p>')
+                inner = (crumb + f'<h1>{ESC(title)}</h1><p class="xs muted">Page from the records repo: <code>{ESC(relpath)}'
                          f'</code>{gen}</p><div class="md">' + md.render(body, self.md_link(relpath, out_path)) + "</div>")
                 if p:
-                    self.site.pages[out_path] = shell(p, out_path, title, inner, tab="wiki")
+                    self.site.pages[out_path] = shell(p, out_path, title, inner,
+                                                      tab="wiki" if parts[:2] == ["docs", "health"] else "status")
                 else:
                     self.site.pages[out_path] = (head(title, out_path) + '<body><div class="wrap wide">'
                                                  f'<p><a class="back" href="{Site.rel(out_path, "index.html")}">'
                                                  'All people</a></p>' + inner + footer() + "</div></body></html>")
+
+    def note_ns(self, relpath, fm):
+        """The person an analysis note is about (file name tokens or front matter person/ns/subject), else None."""
+        toks = set(re.split(r"[-_.]", pathlib.Path(relpath).stem.lower()))
+        who = {str(fm.get(k, "")).lower() for k in ("person", "ns", "subject")}
+        for ns, p in getattr(self, "people", {}).items():
+            if {ns.lower(), p.display.lower()} & (toks | who):
+                return ns
+        return None
 
     # ---- per person
     def build(self, people):
@@ -497,10 +565,6 @@ class Builder:
             self.questions_page(p)
             self.todos_page(p)
             self.documents(p)
-            for mode, what in (("doctor", "Doctor view"), ("simple", "Simple view")):
-                path = f"{p.ns}/{mode}.html"
-                self.site.pages[path] = shell(p, path, what, f'<h1>{what}</h1><div class="notice">Not in this '
-                                              'slice of the site yet. It will follow the design (section 5).</div>')
         self.index(people)
         self.render_md_pages()
 
@@ -549,7 +613,9 @@ class Builder:
                 for r in rs[:6]:
                     d = j(self.kb.facts[r["id"]]["data"])
                     name = self.kb.name(r["what"])
-                    if lab_flagged(d) and not reported:
+                    if self.unchecked(r["id"]):  # a number said in a voice note nobody has heard: not a value
+                        pills.append(f'<span class="pill mt">{ESC(name)}: {MT_UNCHECKED}</span>')
+                    elif lab_flagged(d) and not reported:
                         pills.append(f'<span class="pill flag">{icon("up" if d["flag"] == "H" else "down")}'
                                      f'{ESC(name)} {ESC(obs_display(d))}</span>')
                     else:
@@ -564,6 +630,18 @@ class Builder:
                 title = r0["label"] or (r0["what"] or "event").replace("_", " ")
                 detail = ""
                 what = r0["what"] or ""
+                if MT_PREFIX.match(title):  # what a voice note says (d1.statements); never a leading "NOT:"
+                    said, neg = transcript_text(title)
+                    neg_pill = '<span class="pill neutral">said as a negative</span>' if neg else ""
+                    if self.unchecked(r0["id"]):
+                        title = f"Voice note ({MT_UNCHECKED})"
+                        held = ('<span class="xs muted">numbers withheld until someone has heard it</span>'
+                                if re.search(r"\d", said) else "")
+                        detail = (f'<div class="small muted">{ESC(gv.short(withhold_numbers(said), 140))}</div>'
+                                  f'<div class="pills"><span class="pill mt">{MT_UNCHECKED}</span>{neg_pill}{held}</div>')
+                    else:
+                        title = f"Voice note: {said}"
+                        detail = f'<div class="pills">{neg_pill}</div>' if neg else ""
                 ic = {"opd": "visit", "teleconsult": "visit", "test_visit": "results", "fall": "fall",
                       "procedure": "hospital", "admission": "hospital", "hospitalisation": "hospital"}.get(what, "event")
                 typ = what.replace("_", " ") or "event"
@@ -571,8 +649,9 @@ class Builder:
             when = fdate(f0["at"], "day" if key[0] == "rep" else f0["at_precision"])
             meta = " · ".join(x for x in [when, typ, party, "family-reported" if reported else "",
                                           "uncertain" if r0["uncertain_ref"] else ""] if x)
+            unchecked = key[0] == "one" and self.unchecked(r0["id"])
             cards.append({"d": day(f0["at"]), "rep": key[0] == "rep", "n": len(rs), "html": (
-                f'<div class="ev{" reported" if reported else ""}"><span class="ic">{icon(ic)}</span>'
+                f'<div class="ev{" reported" if reported else ""}{" unchecked" if unchecked else ""}"><span class="ic">{icon(ic)}</span>'
                 f'<div class="d">{ESC(meta)}</div><div class="t">{ESC(gv.short(title, 140))}</div>{detail}'
                 f'<div>{self.src_chip(path, r0["id"])}</div></div>')})
             if limit and len(cards) >= limit:
@@ -583,6 +662,7 @@ class Builder:
     def overview(self, p, trend, latest):
         path = f"{p.ns}/overview.html"
         out = ['<h1>Overview</h1><p class="muted small">The state at a glance. Tap anything for detail.</p>']
+        out.append(self.this_week(p, path))
         since = self.today - datetime.timedelta(days=CHANGE_DAYS)
         allrecent = self.timeline_cards(p, path, since=since)
         recent = [c for c in allrecent if not c["rep"]][:3]
@@ -625,7 +705,13 @@ class Builder:
         codes = [f"ref:code:{c}" for c in codes] or sorted(latest, key=lambda c: latest[c]["at"], reverse=True)
         tiles = []
         for code in codes[:4]:
-            tiles.append(self.tile(p, code, trend.get(code, []), latest[code]))
+            lr = latest[code]
+            if self.unchecked(lr["id"]):  # a number from an unheard voice note is not a key number
+                checked = [r for r in trend.get(code, []) if not self.unchecked(r["id"])]
+                if not checked:
+                    continue
+                lr = checked[-1]
+            tiles.append(self.tile(p, code, trend.get(code, []), lr))
         if tiles:
             out.append('<h2>Key numbers<a class="more" href="results.html">All results</a></h2>'
                        '<div class="tiles">' + "".join(tiles) + "</div>")
@@ -638,9 +724,64 @@ class Builder:
                        f'<a href="voice.html"><b>{n_voice} voice note{"s" if n_voice != 1 else ""}</b> · '
                        f'{n_unheard} to hear<div class="small muted">Play, read the transcript, correct it or mark it '
                        'heard.</div></a></div>')
-        out.append('<div class="modes"><a href="doctor.html">' + icon("visit") + 'Doctor view</a>'
-                   '<a href="simple.html">' + icon("overview") + 'Simple view</a></div>')
         self.site.pages[path] = shell(p, path, "Overview", "".join(out), tab="overview")
+
+    # ---- "This week" (U-07): the newest analysis note's "For <owner>" numbered steps, each with its tier
+    def week_steps(self, p):
+        """(note_rel, title, anchor, [(tier, text)]) from the newest analysis note of this person that has a
+        "## For <someone>:" section (not "For the family"), or None."""
+        for rel, title, _ in self.analysis_notes(p, n=20):
+            _, body = md.split_front_matter((self.root / rel).read_text(encoding="utf-8"))
+            lines = body.splitlines()
+            start = next((i for i, l in enumerate(lines)
+                          if re.match(r"^#{2,3}\s+For\s+(?!the\s)\S", l)), None)
+            if start is None:
+                continue
+            lvl = len(re.match(r"^#+", lines[start]).group(0))
+            steps = []
+            for l in lines[start + 1:]:
+                if re.match(rf"^#{{1,{lvl}}}\s", l):
+                    break
+                m = re.match(r"^\s*\d+\.\s+(.*)", l)
+                if m:
+                    steps.append(m.group(1))
+            heading = re.sub(r"^#+\s+", "", lines[start]).strip()
+            out = []
+            for st in steps[:5]:
+                plain = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", st)
+                plain = re.sub(r"[*_`]+", "", plain)
+                tm = re.match(r"^\s*Tier\s+([ABC])\b[,:;]?\s*", plain)
+                tier = tm.group(1) if tm else None
+                if tm:
+                    plain = plain[tm.end():]
+                elif re.search(r"\bTier\s+([ABC])\b", plain):
+                    tier = re.search(r"\bTier\s+([ABC])\b", plain).group(1)
+                out.append((tier, " ".join(plain.split())))
+            return rel, title, md.slug(heading), out
+        return None
+
+    def this_week(self, p, path):
+        todos = [t for t in self.todos if t["open"] and t["id"].startswith(f"{p.ns}:") and t["prio"] == "now"]
+        found = self.week_steps(p)
+        if not todos and not found:
+            return ""
+        out = ['<h2>This week<a class="more" href="todos.html">To-dos</a></h2><div class="card">']
+        if todos:
+            out.append(f'<div class="small"><a href="todos.html"><b>{len(todos)} to-do{"s" if len(todos) != 1 else ""} now</b></a>: '
+                       + ESC(" · ".join(gv.short(t["title"], 48) for t in todos[:2]))
+                       + (f' <span class="muted">+{len(todos) - 2}</span>' if len(todos) > 2 else "") + "</div>")
+        if found:
+            rel, title, anchor, steps = found
+            href = Site.rel(path, self.md_href(rel)) + f"#{anchor}"
+            if steps:
+                out.append('<ol class="week">' + "".join(
+                    f'<li>{f"<span class=\"tier\">Tier {ESC(t)}</span>" if t else ""}{ESC(gv.short(x, 110))}</li>'
+                    for t, x in steps) + "</ol>")
+            out.append(f'<p class="xs muted">Next steps as written in the analysis note <a href="{ESC(href)}">'
+                       f'{ESC(gv.short(title, 60))}</a> ({ESC(rel.rsplit("/", 1)[-1][:10])}; agent-written; tiers per the '
+                       'family context page). Not advice; doctors decide.</p>')
+        out.append("</div>")
+        return "".join(out)
 
     def tile(self, p, code, rows, lr):
         f = self.kb.facts[lr["id"]]
@@ -651,9 +792,10 @@ class Builder:
         unit = f' <span class="unit">{ESC(d["unit"])}</span>' if d.get("unit") else ""
         rng = gv.KB.ref_range(d)
         meta = f'{fdate(f["at"])}' + (f" · range {rng}" if rng else "")
+        avg = '<span class="pill neutral">device average</span>' if device_average(d) else ""
         return (f'<a class="tile{" flagged" if lab_flagged(d) and not rep else ""}" href="trend/{tslug(code)}.html">'
-                f'<span class="name">{ESC(self.kb.name(code))}</span><span class="val">{ESC(gv.short(obs_display(d), 18))}'
-                f'{unit}</span><span class="meta">{flag_pill(d, rep)}{charts.sparkline(pts) if len(pts) > 1 else ""}'
+                f'<span class="name">{ESC(self.kb.name(code))}</span><span class="val">{ESC(gv.short(obs_display(d, False), 18))}'
+                f'{unit}</span><span class="meta">{flag_pill(d, rep)}{avg}{charts.sparkline(pts) if len(pts) > 1 else ""}'
                 f'</span><span class="xs muted">{ESC(meta)}</span></a>')
 
     # ---- Status (agent inferences)
@@ -795,7 +937,7 @@ class Builder:
                     + (f'<div class="medsub">As written: “{ESC(d["schedule_raw"])}”</div>'
                        if d.get("schedule_raw") and (not grid or has_dose) else "")
                     + f'<div class="medsub">{ESC(fdate(f["at"], f["at_precision"]))}{" · " + ESC(who) if who else ""}</div>'
-                    + f'<div class="meta">{self.status_pill(r, f)} {self.src_chip(path, r["id"])}</div>'
+                    + f'<div class="meta">{self.status_pill(r, f)} {self.mt_pill(r["id"])} {self.src_chip(path, r["id"])}</div>'
                     + (f'<div class="medsub">{ESC(marks)}</div>' if marks else "") + "</td>")
             if grid:
                 ds = [d.get("dose_m"), d.get("dose_n"), d.get("dose_e")]
@@ -922,7 +1064,7 @@ class Builder:
         return (f'<a class="result" href="trend/{tslug(code)}.html"><span class="n">{ESC(self.kb.name(code))}</span>'
                 + (f'<span class="v">{ESC(val)}{unit}</span>' if not long_text else '<span class="v"></span>')
                 + (f'<span class="txt">{ESC(gv.short(val, 220))}</span>' if long_text else "")
-                + bar + f'<span class="sub">{flag_pill(d, rep)}<span>{ESC(sub)}</span></span></a>')
+                + bar + f'<span class="sub">{self.mt_pill(lr["id"])}{flag_pill(d, rep)}<span>{ESC(sub)}</span></span></a>')
 
     def trend_pages(self, p, trend, latest):
         for code, rows in trend.items():
@@ -1105,7 +1247,7 @@ class Builder:
     def questions_page(self, p):
         path = f"{p.ns}/questions.html"
         items, sections = self.questions[p.ns]
-        out = ['<p><a class="back" href="wiki.html">‹ Wiki</a></p><h1>Questions for the doctors</h1>'
+        out = ['<p><a class="back" href="overview.html">‹ Overview</a></p><h1>Questions for the doctors</h1>'
                '<p class="muted small">Questions to ask. Each “why” is a documented fact, not a conclusion.</p>']
         for pr in ("now", "next", "some"):
             qs = [q for q in items if q["open"] and q["prio"] == pr]
@@ -1126,7 +1268,7 @@ class Builder:
     def todos_page(self, p):
         path = f"{p.ns}/todos.html"
         mine = [t for t in self.todos if t["open"] and (t["id"].startswith(f"{p.ns}:") or t["id"].startswith("family:"))]
-        out = ['<p><a class="back" href="wiki.html">‹ Wiki</a></p><h1>Family to-dos</h1>'
+        out = ['<p><a class="back" href="overview.html">‹ Overview</a></p><h1>Family to-dos</h1>'
                '<p class="muted small">Read-only. Done items are recorded in the records repo.</p>']
         link = self.md_link("docs/health/family/actions.md", path)
         for pr in ("now", "next", "some"):
@@ -1151,17 +1293,7 @@ class Builder:
         tg = self.root / "data" / "telegram"
         if not tg.is_dir():
             return []
-        heard = {}
-        lf = tg / "listened.ndjson"
-        if lf.is_file():
-            for line in lf.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    try:
-                        h = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(h.get("update_id"), int) and h["update_id"] not in heard:
-                        heard[h["update_id"]] = h
+        heard = self.heard
         pmap = self.rc.get("d1_person_map", {})
         notes = []
         for f in sorted(tg.glob("*.ndjson")):
@@ -1183,15 +1315,18 @@ class Builder:
                     continue
                 m = re.fullmatch(r"tg:(\d+)", str(r.get("external_id") or ""))
                 uid = int(m.group(1)) if m else None
-                audio = next((a for a in sorted((self.root / "sources" / p.ns / "media" / "telegram").glob(f"{stem}.*"))
-                              if a.suffix.lower() in (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav")), None)
+                sibs = sorted((self.root / "sources" / p.ns / "media" / "telegram").glob(f"{stem}.*"))
+                audio = next((a for a in sibs if a.suffix.lower() in (".ogg", ".oga", ".opus", ".mp3", ".wav")), None) \
+                    or next((a for a in sibs if a.suffix.lower() == ".m4a"), None)
                 if not audio:
                     continue
+                m4a = next((a for a in sibs if a.suffix.lower() == ".m4a" and a != audio), None)  # transcode beside the original
                 def side(suffix):
                     f = audio.with_name(f"{stem}{suffix}")
                     return f if f.is_file() else None
                 sender = pmap.get(r.get("sender_person_id"), r.get("sender_person_id")) or p.ns
                 notes.append({"stem": stem, "row": r, "update_id": uid, "audio": audio.relative_to(self.root).as_posix(),
+                              "m4a": m4a.relative_to(self.root).as_posix() if m4a else None,
                               "heard": heard.get(uid), "sender": self.rc.get("display", {}).get(sender, sender),
                               "mac": side(".mac.transcript.md"), "batch": side(".batch.transcript.md") or side(".transcript.md"),
                               "groundtruth": side(".groundtruth.md"), "duration": r.get("duration_sec")})
@@ -1263,9 +1398,17 @@ class Builder:
         if audio_href:
             href = Site.rel(path, audio_href)
             mime = {"ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg", "mp3": "audio/mpeg", "m4a": "audio/mp4", "wav": "audio/wav"}[audio_href.rsplit(".", 1)[-1].lower()]
-            out.append(f'<audio controls preload="none"><source src="{ESC(href)}" type="{mime}"></audio>'
-                       f'<p class="xs muted"><a href="{ESC(href)}">Download the audio</a> (Ogg/Opus: iOS Safari may not play '
-                       'it in the page; download and open it in another player).</p>')
+            m4a_href = self.site.original(n["m4a"]) if n.get("m4a") else None
+            if m4a_href and mime != "audio/mp4":  # the m4a first: iOS Safari plays it in the page; the original stays
+                m4a_rel = Site.rel(path, m4a_href)
+                out.append(f'<audio controls preload="none"><source src="{ESC(m4a_rel)}" type="audio/mp4">'
+                           f'<source src="{ESC(href)}" type="{mime}"></audio>'
+                           f'<p class="xs muted"><a href="{ESC(m4a_rel)}">Download the audio (m4a)</a> · '
+                           f'<a href="{ESC(href)}">original ({ESC(audio_href.rsplit(".", 1)[-1].lower())})</a></p>')
+            else:
+                out.append(f'<audio controls preload="none"><source src="{ESC(href)}" type="{mime}"></audio>'
+                           f'<p class="xs muted"><a href="{ESC(href)}">Download the audio</a> (Ogg/Opus: iOS Safari may not play '
+                           'it in the page; download and open it in another player).</p>')
         else:
             out.append('<p class="notice">Audio file not in the records repo.</p>')
         out.append(f'<h2>Transcript</h2><p class="xs muted">Source: {ESC(source)}. One line per sentence; lines start with the '

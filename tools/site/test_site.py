@@ -5,7 +5,7 @@ Run: python3 -I tools/site/test_site.py
 The fixture records are copied to a temp dir and given a few extra synthetic inputs (a second lab report for trends,
 questions, family to-dos, an analysis note with an external URL, an inference row) so every screen has content.
 """
-import html.parser, importlib.machinery, importlib.util, json, pathlib, re, shutil, subprocess, sys, tempfile
+import html.parser, importlib.machinery, importlib.util, json, os, pathlib, re, shutil, subprocess, sys, tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -84,6 +84,69 @@ title: Alice: example analysis
 Agent-written synthetic note. Reference: https://example.org/paper and <https://example.org/x>.
 See [the medicines page](../../health/alice/medications.md) and `sources/alice/documents/2026-03-12-example-lab-lft-rft.md`.
 """
+DX_NOTE = """---
+title: "Alice: diagnostic loop 01 (synthetic)"
+type: analysis
+---
+
+# Alice: diagnostic loop 01 (synthetic)
+
+## For Owner: what the week says
+
+**What changed.** Synthetic prose with a number 5.3 that must not be copied as a fact.
+
+**Next steps (tiered; nothing is Tier A today).**
+1. **Tier C, this week, free (family):** keep the morning seated reading to 30-Jun, one reading per day.
+2. **Tier C, this week (owner, one call):** ask which hand was used on 12-Jun; see [questions](../../health/alice/questions.md).
+3. **Tier B, by 28-Jun (owner books):** repeat potassium at the same lab (`alice:q:0001`).
+4. Tier C: photograph the strip of the new tablet.
+5. **Tier C, someday:** tidy the care-team page.
+6. **Tier C, never shown:** the sixth step is beyond the five the overview shows.
+
+The panel disagreed on step 3.
+
+## 0. Red flags
+
+1. Not a next step: a numbered line in another section.
+
+## F. For the family (plain words)
+
+1. Family step that must not be mixed in.
+"""
+TG_EXTRA = [
+    # what the two fixture voice notes say (d1.statements): ex1 (update 900000004) nobody has heard; ex2 is heard
+    {"rt": "d1.statements", "id": "-1001234567890:21:s0", "source_message_id": "-1001234567890:21", "person_id": "alice",
+     "sender_person_id": "alice", "speaker": "sender", "category": "reading", "summary": "numbers said as 122, 152, 152, not clear which is systolic",
+     "quote": "एक सौ बाईस", "negated": 0, "time_frame": "today", "when_text": None, "when": "2026-06-11", "about": None,
+     "confidence": 0.6, "confirmed": 0, "extracted_by": "fixture-extractor", "extracted_at": "2026-06-11T05:00:00.000Z"},
+    {"rt": "d1.statements", "id": "-1001234567890:21:s1", "source_message_id": "-1001234567890:21", "person_id": "alice",
+     "sender_person_id": "alice", "speaker": "sender", "category": "symptom", "summary": "feeling fine, no problem",
+     "quote": "कोई दिक्कत नहीं", "negated": 1, "time_frame": "today", "when_text": None, "when": "2026-06-11", "about": None,
+     "confidence": 0.9, "confirmed": 0, "extracted_by": "fixture-extractor", "extracted_at": "2026-06-11T05:00:00.000Z"},
+    {"rt": "d1.statements", "id": "-1001234567890:22:s0", "source_message_id": "-1001234567890:22", "person_id": "alice",
+     "sender_person_id": "alice", "speaker": "sender", "category": "medication", "summary": "took the evening tablets",
+     "quote": "शाम की गोली ली", "negated": 0, "time_frame": "today", "when_text": None, "when": "2026-06-12", "about": None,
+     "confidence": 0.9, "confirmed": 0, "extracted_by": "fixture-extractor", "extracted_at": "2026-06-12T05:00:00.000Z"},
+    # two BP photos: a single reading, then a stored device average (reading_kind average) as the latest value
+    {"rt": "d1.messages", "chat_id": "-1001234567890", "confidence": 0.9, "edit_date": 0, "external_id": "tg:900000006",
+     "extracted_at": "2026-06-14T05:00:00.000Z", "extracted_by": "fixture-extractor", "extraction_json": None,
+     "extraction_status": "ok", "id": "-1001234567890:23", "image_class": "device-reading", "kind": "image", "media_ref": None,
+     "person_id": "alice", "raw_text": None, "received_at": "2026-06-14T03:10:00.000Z", "sender_person_id": "alice",
+     "subject_hint": None, "subject_set_by": None, "subject_source": "sender"},
+    {"rt": "d1.readings", "id": "-1001234567890:23:r0", "source_message_id": "-1001234567890:23", "person_id": "alice",
+     "type": "bp", "value": 128, "value2": 80, "value3": 68, "unit": "mmHg", "source_value": None, "source_unit": None,
+     "measured_at": "2026-06-14T08:30:00+05:30", "confidence": 0.9, "confirmed": 0, "extracted_by": "fixture-extractor",
+     "extracted_at": "2026-06-14T05:00:00.000Z"},
+    {"rt": "d1.messages", "chat_id": "-1001234567890", "confidence": 0.9, "edit_date": 0, "external_id": "tg:900000007",
+     "extracted_at": "2026-06-15T05:00:00.000Z", "extracted_by": "fixture-extractor", "extraction_json": None,
+     "extraction_status": "ok", "id": "-1001234567890:24", "image_class": "device-reading", "kind": "image", "media_ref": None,
+     "person_id": "alice", "raw_text": None, "received_at": "2026-06-15T03:10:00.000Z", "sender_person_id": "alice",
+     "subject_hint": None, "subject_set_by": None, "subject_source": "sender"},
+    {"rt": "d1.readings", "id": "-1001234567890:24:r0", "source_message_id": "-1001234567890:24", "person_id": "alice",
+     "type": "bp", "value": 130, "value2": 82, "value3": 70, "unit": "mmHg", "source_value": None, "source_unit": None,
+     "measured_at": "2026-06-15T08:30:00+05:30", "reading_kind": "average", "indicator": "AVG AM", "window": "7 days",
+     "confidence": 0.9, "confirmed": 0, "extracted_by": "fixture-extractor", "extracted_at": "2026-06-15T05:00:00.000Z"},
+]
 BASE_INF = {"schema": "inference/1", "problem": "alice:dx:0001", "problem_title": "Potassium above the range",
             "hypothesis": None, "kind": "trend", "p": 0.7, "bucket": ">50%", "reason": "two results in a row",
             "stakes": "quality-of-life",
@@ -123,6 +186,9 @@ def make_records(tmp, inference=True):
     (rec / "docs/health/family/actions.md").write_text(ACTIONS)
     (rec / "docs/log/analysis").mkdir(parents=True, exist_ok=True)
     (rec / "docs/log/analysis/2026-06-21-alice-example.md").write_text(NOTE)
+    (rec / "docs/log/analysis/2026-06-22-alice-dx-loop-01.md").write_text(DX_NOTE)
+    with (rec / "data/telegram/2026-06.ndjson").open("a", encoding="utf-8") as fh:
+        fh.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in TG_EXTRA))
     if inference:
         (rec / "inferences/alice").mkdir(parents=True)
         (rec / "inferences/alice/inferences.ndjson").write_text("".join(json.dumps(r) + "\n" for r in INFERENCES))
@@ -266,10 +332,146 @@ class SiteTest(unittest.TestCase):
         self.assertNotIn("Old item", todos)
 
     def test_markdown_pages_and_notes(self):
-        self.assertIn("alice/pages/medications.html", self.pages)
+        self.assertIn("alice/medications.html", self.pages)  # docs/health/<ns>/<page>.md -> <ns>/<page>.html
+        self.assertIn("family/actions.html", self.pages)
+        self.assertIn("alice/pages/questions.html", self.pages)  # questions.html is the built page
         notes = [k for k in self.pages if k.startswith("notes/")]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("example.org/paper", self.pages[notes[0]])
+        self.assertEqual(len(notes), 2)
+        ex = self.pages["notes/docs--log--analysis--2026-06-21-alice-example.html"]
+        self.assertIn("example.org/paper", ex)
+        # U-24: a note about a person carries that person's nav and a way back to the overview
+        self.assertIn('<nav aria-label="Main">', ex)
+        self.assertIn('<a class="back" href="../alice/overview.html">‹ Alice</a>', ex)
+        self.assertIn('<a class="back" href="wiki.html">‹ Wiki</a>', self.pages["alice/medications.html"])
+
+    def test_navigation_no_dead_ends(self):
+        for stub in ("alice/doctor.html", "alice/simple.html", "bob/doctor.html", "bob/simple.html"):
+            self.assertNotIn(stub, self.pages)  # stub views hidden until built
+        ov = self.pages["alice/overview.html"]
+        self.assertNotIn("Doctor view", ov)
+        self.assertNotIn("Simple view", ov)
+        self.assertIn('<a class="back" href="overview.html">‹ Overview</a>', self.pages["alice/todos.html"])
+        self.assertIn('<a class="back" href="overview.html">‹ Overview</a>', self.pages["alice/questions.html"])
+        for rel, text in self.pages.items():
+            if rel.count("/") >= 1 and not rel.startswith(("notes/", "family/")):
+                self.assertIn('<nav aria-label="Main">', text, rel)
+
+    def test_this_week_block(self):
+        ov = self.pages["alice/overview.html"]
+        self.assertIn("<h2>This week", ov)
+        self.assertLess(ov.index("<h2>This week"), ov.index("What changed"))  # above the change feed, no scrolling
+        block = ov[ov.index("<h2>This week"):ov.index("What changed")]
+        self.assertIn("<b>1 to-do now</b>", block)
+        self.assertIn("Photograph the strip", block)
+        self.assertEqual(block.count("<li>"), 5)  # at most five steps
+        self.assertEqual(block.count('<span class="tier">Tier C</span>'), 4)
+        self.assertEqual(block.count('<span class="tier">Tier B</span>'), 1)
+        self.assertIn("keep the morning seated reading to 30-Jun", block)
+        self.assertIn("repeat potassium at the same lab", block)
+        self.assertNotIn("sixth step", block)
+        self.assertNotIn("Family step", block)
+        self.assertNotIn("Not a next step", block)
+        self.assertNotIn("**", block)
+        self.assertIn('href="../notes/docs--log--analysis--2026-06-22-alice-dx-loop-01.html#for-owner-what-the-week-says"', block)
+        self.assertLessEqual(len(re.sub(r"<[^>]+>", " ", block).split()), 180)  # fits a phone screen
+        self.assertNotIn("<h2>This week", self.pages["bob/overview.html"])  # no note, no now to-dos: no block
+
+    def test_unchecked_transcripts_never_look_like_facts(self):
+        for rel, text in self.pages.items():
+            self.assertNotIn("NOT: ", re.sub(r"<[^>]+>", "", text), rel)  # never a leading NOT: (U-06)
+        for rel in ("alice/overview.html", "alice/history.html"):
+            page = self.pages[rel]
+            self.assertIn("Voice note (machine transcript, unchecked)", page)
+            self.assertIn('class="ev reported unchecked"', page)
+            self.assertIn("said as a negative", page)  # the negated statement, phrased, not "NOT:"
+            self.assertIn("Voice note: took the evening tablets", page)  # heard note: rendered normally
+            self.assertNotIn("Voice note: numbers said", page)
+            self.assertNotIn("122", page.split("What changed")[-1] if rel.endswith("overview.html") else page)
+        hist = self.pages["alice/history.html"]
+        self.assertIn("numbers said as (number), (number), (number), not clear which is systolic", hist)
+        self.assertIn("numbers withheld until someone has heard it", hist)
+        self.assertEqual(hist.count("numbers withheld"), 1)  # only where the summary had a number
+        # after a listened row the same statements render normally
+        lf = self.rec / "data/telegram/listened.ndjson"
+        orig = lf.read_text(encoding="utf-8")
+        lf.write_text(orig + json.dumps({"update_id": 900000004, "by": "owner", "at": "2026-06-16"}) + "\n")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = pathlib.Path(tmp) / "site"
+                r = run(self.rec, out)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for rel in ("alice/overview.html", "alice/history.html"):
+                    page = (out / rel).read_text(encoding="utf-8")
+                    self.assertNotIn("machine transcript, unchecked", page)
+                    self.assertIn("said as a negative", page)
+                hist = (out / "alice/history.html").read_text(encoding="utf-8")
+                self.assertIn("Voice note: numbers said as 122, 152, 152, not clear which is systolic", hist)
+                self.assertNotIn("numbers withheld", hist)
+        finally:
+            lf.write_text(orig)
+
+    def test_device_average_labelled(self):
+        self.assertEqual(site.obs_display({"components": {"systolic": 130, "diastolic": 82, "reading_type": "average"}}),
+                         "130/82 (device average)")
+        self.assertEqual(site.obs_display({"components": {"systolic": 128, "diastolic": 80}}), "128/80")
+        self.assertEqual(site.obs_display({"value_num": 61, "components": {"reading_type": "average"}}), "61 (device average)")
+        res = self.pages["alice/results.html"]
+        self.assertIn("130/82 (device average)", res)
+        tr = self.pages["alice/trend/bp.html"]
+        self.assertIn("130/82 (device average)", tr)
+        self.assertIn("128/80</td>", tr)
+        hist = self.pages["alice/history.html"]
+        self.assertIn("130/82 (device average)", hist)
+        self.assertIn('<span class="pill neutral">device average</span>', self.pages["alice/overview.html"])
+
+    def test_no_horizontal_overflow(self):
+        css = (self.out / "style.css").read_text(encoding="utf-8")
+        self.assertIn("html, body { overflow-x: hidden;", css)
+        self.assertRegex(css, r"\.pill \{[^}]*white-space: normal")
+        self.assertRegex(css, r"\.pill \{[^}]*max-width: 100%")
+        mods = os.environ.get("SITE_PLAYWRIGHT_MODULES")  # node_modules dir with playwright; else static checks only
+        if not mods or not shutil.which("node"):
+            self.skipTest("set SITE_PLAYWRIGHT_MODULES=<node_modules with playwright> for the 390 px measurement")
+        pages = ["alice/overview.html", "alice/status.html", "alice/questions.html", "alice/voice.html",
+                 "alice/voice/u-voice-ex1.html", "alice/todos.html", "alice/medicines.html", "alice/results.html",
+                 "notes/docs--log--analysis--2026-06-22-alice-dx-loop-01.html"]
+        js = f"""
+import {{ createRequire }} from 'module';
+const require = createRequire({json.dumps(mods.rstrip('/') + '/')});
+const {{ chromium, devices }} = require('playwright');
+const browser = await chromium.launch({{headless: true}});
+const ctx = await browser.newContext({{...devices['iPhone 14']}});
+const page = await ctx.newPage();
+const out = [];
+for (const rel of {json.dumps(pages)}) {{
+  await page.goto('file://' + {json.dumps(str(self.out))} + '/' + rel, {{waitUntil: 'load'}});
+  out.push(await page.evaluate((rel) => {{
+    const wide = [...document.querySelectorAll('body *')].filter(e => e.getBoundingClientRect().right > window.innerWidth + 1)
+      .map(e => e.tagName + '.' + String(e.className).split(' ')[0]).slice(0, 5);
+    const tabs = [...document.querySelectorAll('.tabs nav a')].map(a => a.getBoundingClientRect().right <= window.innerWidth + 1);
+    const last = document.querySelector('.footer'); const fr = last ? last.getBoundingClientRect() : null;
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    const bar = document.querySelector('.tabs'); const br = bar ? bar.getBoundingClientRect() : null;
+    const fr2 = last ? last.getBoundingClientRect() : null;
+    return {{rel, scrollW: document.documentElement.scrollWidth, innerW: window.innerWidth, wide, tabs,
+            footerClear: !(fr2 && br) || fr2.bottom <= br.top + 1}};
+  }}, rel));
+}}
+await browser.close();
+console.log(JSON.stringify(out));
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            script = pathlib.Path(tmp) / "measure.mjs"
+            script.write_text(js)
+            r = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=180)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for m in json.loads(r.stdout.strip().splitlines()[-1]):
+            self.assertLessEqual(m["scrollW"], m["innerW"], m)
+            self.assertEqual(m["wide"], [], m)
+            if not m["rel"].startswith("notes/") or "alice" in m["rel"]:
+                self.assertEqual(len(m["tabs"]), 6, m)
+                self.assertTrue(all(m["tabs"]), m)
+            self.assertTrue(m["footerClear"], m)
 
     def test_status_without_inference_lists_notes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,8 +493,19 @@ class SiteTest(unittest.TestCase):
         self.assertNotIn("bob/voice.html", self.pages)  # no voice notes: no page, no link
         self.assertNotIn("voice.html", self.pages["bob/overview.html"])
         one = self.pages["alice/voice/u-voice-ex1.html"]
-        self.assertIn('<source src="../../files/sources/alice/media/telegram/u-voice-ex1.ogg" type="audio/ogg">', one)
+        # U-08: an .m4a beside the .ogg is offered first (iOS Safari plays it in the page); the original stays
+        self.assertIn('<audio controls preload="none"><source src="../../files/sources/alice/media/telegram/u-voice-ex1.m4a" '
+                      'type="audio/mp4"><source src="../../files/sources/alice/media/telegram/u-voice-ex1.ogg" type="audio/ogg">'
+                      '</audio>', one)
+        self.assertIn('href="../../files/sources/alice/media/telegram/u-voice-ex1.m4a">Download the audio (m4a)</a>', one)
+        self.assertIn('href="../../files/sources/alice/media/telegram/u-voice-ex1.ogg">original (ogg)</a>', one)
         self.assertTrue((self.out / "files/sources/alice/media/telegram/u-voice-ex1.ogg").is_file())
+        self.assertTrue((self.out / "files/sources/alice/media/telegram/u-voice-ex1.m4a").is_file())
+        two_src = self.pages["alice/voice/u-voice-ex2.html"]
+        self.assertIn('<audio controls preload="none"><source src="../../files/sources/alice/media/telegram/u-voice-ex2.ogg" '
+                      'type="audio/ogg"></audio>', two_src)  # no m4a yet: the original only, with the iOS note
+        self.assertIn("iOS Safari may not play", two_src)
+        self.assertNotIn("iOS Safari may not play", one)
         self.assertIn("Not heard yet", one)
         self.assertIn("suggested reading", one)  # the Mac transcript's reconciled lines fill the text box
         self.assertIn(">[alice] आज मौसम अच्छा(?) है\n[alice] शाम को दो गोली</textarea>", one)  # S1 (dominant voice) -> [<ns>]
