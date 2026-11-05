@@ -3,7 +3,9 @@
 1. Fixture: a tiny synthetic KB (schema/schema.sql + a few made-up rows, no real data) rendered into a scratch page with
    every block. Checks markers, header, marks, superseded rows, computed flags, untouched outside text, idempotency.
 2. Staleness: build the real KB into a temp db, run gen-views on a temp copy of docs/health/ and diff it against the
-   committed pages. Fails when someone changed data/ without running gen-views (fix: run it and commit the pages)."""
+   committed pages. Fails when someone changed data/ without running gen-views (fix: run it and commit the pages).
+4. Wording: tools/kb/lint-actions on the open actions and questions of RECORDS (urgency words outside Tier A, items
+   without a tier, "now" older than 7 days), plus a planted-violation case on a scratch copy."""
 import filecmp, json, pathlib, shutil, sqlite3, subprocess, sys, tempfile, unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -16,6 +18,7 @@ if "--records" in sys.argv:
     RECORDS = pathlib.Path(sys.argv[i + 1]).resolve()
     del sys.argv[i:i + 2]
 GEN = HERE / "gen-views"
+LINT = HERE / "lint-actions"
 BLOCKS = ["asof", "timeline", "meds-current", "meds-history", "labs", "quality", "glance", "care-team"]
 PAGE = "---\ntitle: test\n---\n\n# Test page\n\nHand-written text stays.\n\n" + "\n\n".join(
     f"<!-- gen:{b} start -->\n<!-- gen:{b} end -->" for b in BLOCKS) + "\n\nTrailing narrative stays.\n"
@@ -287,6 +290,67 @@ class StalenessTest(unittest.TestCase):
                     stale.append(str(p.relative_to(RECORDS)))
             self.assertEqual(stale, [], "pages out of date with data/: run tools/kb/build --records DIR && "
                                         "tools/kb/gen-views --records DIR, then commit the pages")
+
+
+class LintActionsTest(unittest.TestCase):
+    """Open actions/questions follow the family-context wording rules (tools/kb/lint-actions)."""
+    DIRTY = """---
+title: Family actions
+---
+
+# Family actions
+
+## Open
+
+### alice:act:0003: Call the clinic
+- **Do:** Call the clinic today about the strip; she should say "no episode today" each morning.
+- **Update:** make this call ASAP.
+- **Superseded 2026-06-10 (lint):** re-tiered below. **Update:** call immediately.
+- **Priority:** now. **Added:** 2026-06-01.
+- **Owner:** family. **Status:** open.
+
+### alice:act:0004: Pin the rule
+- **Do:** Tier A: go to the emergency department immediately for a listed red flag.
+- **Priority:** now. **Added:** 2026-06-08.
+- **Owner:** admin. **Status:** open.
+
+## Done
+
+### alice:act:0005: Old
+- **Do:** Call today.
+- **Priority:** now. **Added:** 2026-01-01.
+- **Owner:** family. **Status:** done 2026-01-02.
+"""
+
+    def lint(self, records, today="2026-06-10"):
+        return subprocess.run([sys.executable, "-I", str(LINT), "--records", str(records), "--today", today],
+                              capture_output=True, text=True)
+
+    def test_records_are_clean(self):
+        r = subprocess.run([sys.executable, "-I", str(LINT), "--records", str(RECORDS)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, "open actions/questions break the family-context rules "
+                                          "(docs/health/family/context.md); fix the items:\n" + r.stdout + r.stderr)
+
+    def test_planted_violations(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = pathlib.Path(t) / "docs" / "health" / "family"
+            d.mkdir(parents=True)
+            (d / "actions.md").write_text(self.DIRTY, encoding="utf-8")
+            r = self.lint(t)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            lines = r.stdout.splitlines()
+            self.assertEqual(lines, [
+                'alice:act:0003 docs/health/family/actions.md:10 urgency: "today" outside a Tier A line',
+                'alice:act:0003 docs/health/family/actions.md:11 urgency: "ASAP" outside a Tier A line',
+                "alice:act:0003 docs/health/family/actions.md:9 no-tier: open item without Tier A/B/C",
+                "alice:act:0003 docs/health/family/actions.md:13 stale-now: priority now for 9 days (added 2026-06-01)",
+            ])
+            # Tier A line, a superseded bullet, quoted text and closed items are not findings; 7 days is not stale.
+            self.assertNotIn("alice:act:0004", r.stdout)
+            self.assertNotIn("alice:act:0005", r.stdout)
+            self.assertNotIn(":12 ", r.stdout)
+            r = self.lint(t, today="2026-06-08")
+            self.assertNotIn("stale-now", r.stdout)
 
 
 if __name__ == "__main__":
