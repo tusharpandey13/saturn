@@ -1,16 +1,18 @@
 #!/usr/bin/env -S python3 -I
 """Run-the-loop API (T-01): queues one bounded diagnostic-loop run per press; never runs the agent itself.
 
-Usage: tools/site/dx-api --records DIR --state DIR --bind ADDR --port N [--site URL] [--allow LOGIN]...
+Usage: tools/site/dx-api --records DIR --state DIR --bind ADDR --port N [--site URL] [--allow-login LOGIN]...
                          [--cap-24h 1] [--cap-30d 8] [--cap-scope global|ns]
 
 Routes:
   GET  /health            -> {"ok": true}
-  POST /dx/<ns>/run       form (application/x-www-form-urlencoded) or JSON; optional field `by`. The
-                          `Tailscale-User-Login` header overrides `by` (default "dx-trigger"). Writes one row to
+  POST /dx/<ns>/run       form (application/x-www-form-urlencoded) or JSON. `by` = the `Tailscale-User-Login` header
+                          (tailscale serve adds it; a client cannot set it through serve); it must match one of
+                          --allow-login (case-insensitive; default none, so every POST is 403). A form/JSON `by` is never
+                          an identity. Bind 127.0.0.1 so that only tailscale serve reaches the port. Writes one row to
                           <state>/state.json and a spool file <state>/spool/<ns>.json that tools/dx/run (a host timer)
                           picks up. 202 queued; 409 already queued/running or cap reached ("next allowed at ...");
-                          403 identity not in --allow; 404 unknown namespace; 503 awaiting key (the job's deploy key is
+                          403 identity required / not in --allow-login; 404 unknown namespace; 503 awaiting key (the job's deploy key is
                           not registered yet) or records clone not ready.
   GET  /dx/<ns>/status    last run (state, times, note path, commit, pushed), caps, next_allowed_at; HTML when the
                           client accepts text/html (a browser), else JSON.
@@ -72,9 +74,13 @@ class Api:
             raise ApiError(404, "not found")
 
     def run(self, ns, by, from_header):
-        self.check_ns(ns)
-        if self.allow and (not from_header or by.lower() not in self.allow):
+        # Identity first (before the namespace lookup): no header = 403 "identity required"; a header outside the
+        # allow-list = 403. The default allow-list is empty, so an endpoint started without --allow-login refuses every POST.
+        if not from_header:
+            raise ApiError(403, "identity required")
+        if by.lower() not in self.allow:
             raise ApiError(403, "this identity may not start a run")
+        self.check_ns(ns)
         row, err = self.state.enqueue(ns, by)
         if err:
             status, reason, nxt = err
@@ -137,8 +143,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, status, obj):
         self._send(status, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
 
-    def _done(self, status):
-        sys.stderr.write(f"{self.command} {self.path.split('?')[0]} {status}\n")
+    def _done(self, status, by=None):
+        sys.stderr.write(f"{self.command} {self.path.split('?')[0]} {status} {by or '-'}\n")
         sys.stderr.flush()
 
     def _wants_html(self):
@@ -184,14 +190,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raise ApiError(415, "send application/json or application/x-www-form-urlencoded")
 
     def do_POST(self):
-        is_form = False
+        is_form, hdr = False, None
         try:
             m = ROUTE_RE.match(self.path.split("?")[0])
             if not m or m.group(2) != "run":
                 raise ApiError(404, "not found")
             fields, is_form = self._fields()
             hdr = (self.headers.get("Tailscale-User-Login") or "").strip()
-            by = clean_by(hdr or fields.get("by"))
+            by = clean_by(hdr)
             status, out = self.server.api.run(m.group(1), by, bool(hdr))
         except ApiError as e:
             if is_form:
@@ -200,7 +206,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(e.status, page, "text/html; charset=utf-8")
             else:
                 self._json(e.status, {"ok": False, "error": e.msg, **e.extra})
-            self._done(e.status); return
+            self._done(e.status, hdr); return
         if is_form:
             row = out["run"]
             page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
@@ -211,7 +217,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(status, page, "text/html; charset=utf-8")
         else:
             self._json(status, out)
-        self._done(status)
+        self._done(status, hdr)
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -230,7 +236,8 @@ def main(argv=None):
     ap.add_argument("--bind", required=True)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--site", default=None, help="health site base URL, for links back (e.g. https://host/health)")
-    ap.add_argument("--allow", action="append", default=[], help="tailnet login allowed to start a run (repeatable; default: anyone on the tailnet)")
+    ap.add_argument("--allow-login", "--allow", dest="allow", action="append", default=[], metavar="LOGIN",
+                    help="tailnet login (Tailscale-User-Login) allowed to start a run; repeatable; default none = every POST is 403")
     ap.add_argument("--cap-24h", type=int, default=dxstate.CAP_24H)
     ap.add_argument("--cap-30d", type=int, default=dxstate.CAP_30D)
     ap.add_argument("--cap-scope", choices=("global", "ns"), default="global")

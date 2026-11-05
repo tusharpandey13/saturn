@@ -1,13 +1,18 @@
 #!/usr/bin/env -S python3 -I
 """Voice review API: records that a person listened to a voice note, optionally with a corrected transcript.
 
-Usage: tools/site/voice-api --records DIR --bind ADDR --port N [--branch main] [--remote origin] [--no-push]
+Usage: tools/site/voice-api --records DIR --bind ADDR --port N [--allow-login LOGIN]... [--branch main] [--remote origin] [--no-push]
 
 Routes:
   GET  /health                 -> {"ok": true}
   POST /voice/<ns>/<stem>      body JSON (application/json) or a form (application/x-www-form-urlencoded):
                                  action=heard|save  text=<transcript, required for save>  by=<who, optional>
-                               A `Tailscale-User-Login` header overrides `by`; default "voice-review".
+                               `by` = the `Tailscale-User-Login` header (tailscale serve adds it: the tailnet identity of the
+                               browser; a client cannot set it through serve). The header must match one of --allow-login
+                               (case-insensitive) or the POST is refused with 403 ("identity required" when there is no
+                               header). Default: no login allowed, so every POST is refused. A form/JSON `by` is never an
+                               identity. Bind 127.0.0.1 so that only tailscale serve can reach the port; a tailnet peer
+                               reaching the port directly could forge the header.
 Writes (records repo): action save -> sources/<ns>/media/telegram/<stem>.groundtruth.md (front matter, then
 `[speaker] text` lines; the stt-eval format); both actions -> one data/telegram/listened.ndjson line per update_id.
 Then `git add` of the touched paths, a commit as "saturn voice-review" (message `data: voice review <action> <ns>/<stem>`),
@@ -208,8 +213,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, status, obj):
         self._send(status, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
 
-    def _done(self, status, action=None):
-        sys.stderr.write(f"{self.command} {self.path.split('?')[0]} {status} {action or '-'}\n")
+    def _done(self, status, action=None, by=None):
+        sys.stderr.write(f"{self.command} {self.path.split('?')[0]} {status} {action or '-'} {by or '-'}\n")
         sys.stderr.flush()
 
     def do_GET(self):
@@ -242,13 +247,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raise ApiError(415, "send application/json or application/x-www-form-urlencoded")
 
     def do_POST(self):
-        is_form, action = False, None
+        is_form, action, login = False, None, None
         try:
             m = ROUTE_RE.match(self.path.split("?")[0])
             if not m:
                 raise ApiError(404, "not found")
             ns, stem = m.group(1), m.group(2)
             fields, is_form = self._fields()
+            login = (self.headers.get("Tailscale-User-Login") or "").strip()
+            if not login:
+                raise ApiError(403, "identity required")
+            if login.lower() not in self.server.allow:
+                raise ApiError(403, "this identity may not review voice notes")
             action = fields.get("action")
             if action not in NOTES:
                 raise ApiError(400, "action must be heard or save")
@@ -258,12 +268,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ApiError(400, "save needs text")
             if len(text.encode("utf-8")) > MAX_TEXT:
                 raise ApiError(413, "text too large")
-            by = clean_by((self.headers.get("Tailscale-User-Login") or "").strip() or fields.get("by"))
+            by = clean_by(login)
             status, out = self.server.store.apply(ns, stem, action, text, by)
         except ApiError as e:
-            self._json(e.status, {"ok": False, "error": e.msg}); self._done(e.status, action); return
+            self._json(e.status, {"ok": False, "error": e.msg}); self._done(e.status, action, login); return
         except subprocess.CalledProcessError:
-            self._json(500, {"ok": False, "error": "git failed"}); self._done(500, action); return
+            self._json(500, {"ok": False, "error": "git failed"}); self._done(500, action, login); return
         if is_form and out.get("ok"):
             page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
                     f"<title>Recorded</title></head><body><p>Recorded: {esc(action)} for {esc(stem)} by {esc(out['by'])}. "
@@ -271,7 +281,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(status, page, "text/html; charset=utf-8")
         else:
             self._json(status, out)
-        self._done(status, action)
+        self._done(status, action, login)
 
 
 def esc(s):
@@ -282,9 +292,10 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, store):
+    def __init__(self, addr, store, allow=()):
         super().__init__(addr, Handler)
         self.store = store
+        self.allow = frozenset(a.strip().lower() for a in allow if a.strip())
 
 
 def main(argv=None):
@@ -292,13 +303,15 @@ def main(argv=None):
     ap.add_argument("--records", required=True)
     ap.add_argument("--bind", required=True)
     ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--allow-login", action="append", default=[], metavar="LOGIN",
+                    help="tailnet login (Tailscale-User-Login) allowed to POST; repeatable; default none = every POST is 403")
     ap.add_argument("--branch", default="main")
     ap.add_argument("--remote", default="origin")
     ap.add_argument("--no-push", action="store_true")
     a = ap.parse_args(argv)
     store = Store(a.records, a.branch, a.remote, push=not a.no_push)
-    srv = Server((a.bind, a.port), store)
-    sys.stderr.write(f"voice-api listening on {srv.server_address[0]}:{srv.server_address[1]}\n")
+    srv = Server((a.bind, a.port), store, a.allow_login)
+    sys.stderr.write(f"voice-api listening on {srv.server_address[0]}:{srv.server_address[1]} ({len(srv.allow)} login(s) allowed)\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

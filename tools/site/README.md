@@ -11,7 +11,7 @@ Ogg-only note into `DIR/<ns>/<stem>.m4a`, reused while not older than the origin
 with download links for both; without it the page offers the Ogg to download), the suggested reading from
 `<stem>.mac.transcript.md` (fallback: the batch transcript) in a text box, the raw whisper lines collapsed below, and
 two buttons, "Heard, no changes" and "Save corrections", that post a plain form (no script) to
-`<URL>/voice/<ns>/<stem>` on `tools/site/voice-api` (`--records DIR --bind ADDR --port N`, Python stdlib): "heard"
+`<URL>/voice/<ns>/<stem>` on `tools/site/voice-api` (`--records DIR --bind 127.0.0.1 --port N --allow-login LOGIN`, Python stdlib; POSTs need a `Tailscale-User-Login` header on the allow-list): "heard"
 appends the `data/telegram/listened.ndjson` line, "save" also writes `<stem>.groundtruth.md` beside the audio
 (Devanagari or Latin; `tools/stt-eval` scores it and the batch re-extracts the note from it), then commits as
 "saturn voice-review" and pushes. `by` comes from the `Tailscale-User-Login` header when `tailscale serve` fronts the

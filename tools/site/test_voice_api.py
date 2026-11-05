@@ -29,6 +29,8 @@ def git(cwd, *args):
 
 class Base(unittest.TestCase):
     push = True
+    allow = ("tester@example.com", "owner@example.com")  # --allow-login
+    login = "tester@example.com"  # the Tailscale-User-Login header `call` sends unless the test sets its own (None = none)
 
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="voice-api-"))
@@ -44,7 +46,7 @@ class Base(unittest.TestCase):
             git(self.rec, "remote", "add", "origin", str(self.bare))
             git(self.rec, "push", "--quiet", "-u", "origin", "main")
         store = API.Store(self.rec, push=self.push)
-        self.srv = API.Server(("127.0.0.1", 0), store)
+        self.srv = API.Server(("127.0.0.1", 0), store, self.allow)
         self.base = "http://%s:%d" % self.srv.server_address
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
@@ -59,6 +61,8 @@ class Base(unittest.TestCase):
         """-> (status, headers, text). JSON bodies unless form=True."""
         data = None
         hdrs = dict(headers or {})
+        if self.login and "Tailscale-User-Login" not in hdrs:
+            hdrs["Tailscale-User-Login"] = self.login
         if body is not None:
             if form:
                 data = urllib.parse.urlencode(body).encode()
@@ -102,10 +106,10 @@ class TestWithOrigin(Base):
         out = json.loads(body)
         self.assertTrue(out["ok"] and out["changed"])
         self.assertEqual((out["action"], out["ns"], out["stem"], out["update_id"], out["by"]),
-                         ("heard", "alice", "u-voice-ex1", 900000004, "tester"))
+                         ("heard", "alice", "u-voice-ex1", 900000004, "tester@example.com"))
         rows = self.listened()
         self.assertEqual(rows[-1]["update_id"], 900000004)
-        self.assertEqual(rows[-1]["by"], "tester")
+        self.assertEqual(rows[-1]["by"], "tester@example.com")
         self.assertRegex(rows[-1]["at"], r"^\d{4}-\d{2}-\d{2}$")
         self.assertEqual(rows[-1]["note"], "voice review: heard, no changes")
         self.assertEqual(list(rows[-1]), ["update_id", "by", "at", "note"])
@@ -136,7 +140,7 @@ class TestWithOrigin(Base):
         self.assertIn('message_id: "-1001234567890:21"', md)
         self.assertIn("update_id: 900000004\nduration_sec: 7\n", md)
         self.assertIn("speakers: [alice]\nlisten", md)
-        self.assertIn("transcribed_by: tester (voice review page)", md)
+        self.assertIn("transcribed_by: tester@example.com (voice review page)", md)
         self.assertIn("# Ground truth: voice note u-voice-ex1 (alice)", md)
         lines, terms = EVAL.parse_groundtruth(md)
         self.assertEqual(lines, [{"speaker": "alice", "text": "आज मौसम अच्छा है"},
@@ -185,6 +189,40 @@ class TestWithOrigin(Base):
         self.assertEqual(git(self.bare, "log", "--format=%s", "main").strip(), "fixture")  # nothing committed
 
 
+class TestAllowList(Base):
+    """The identity header must be present and allow-listed; a form/JSON `by` never counts; the check precedes the stem lookup."""
+    push = False
+    allow = ("owner@example.com",)
+    login = None
+
+    def test_identity_required_and_allow_listed(self):
+        st, _, body = self.call("/voice/alice/u-voice-ex1", {"action": "heard", "by": "owner@example.com"})
+        self.assertEqual((st, json.loads(body)["error"]), (403, "identity required"))
+        st, _, body = self.call("/voice/alice/u-voice-ex1", {"action": "heard"}, headers={"Tailscale-User-Login": "someone@example.com"})
+        self.assertEqual(st, 403); self.assertEqual(json.loads(body)["ok"], False)
+        # identity before the stem: the owner on an unknown stem gets 404, a stranger gets 403
+        self.assertEqual(self.call("/voice/alice/nope", {"action": "heard"}, headers={"Tailscale-User-Login": "Owner@Example.com"})[0], 404)
+        self.assertEqual(self.call("/voice/alice/nope", {"action": "heard"}, headers={"Tailscale-User-Login": "someone@example.com"})[0], 403)
+        self.assertEqual(git(self.rec, "log", "--format=%s", "HEAD").strip(), "fixture")  # nothing written
+        st, _, body = self.call("/voice/alice/u-voice-ex1", {"action": "heard"}, headers={"Tailscale-User-Login": "Owner@Example.com"})
+        self.assertEqual(st, 200, body); self.assertEqual(self.listened()[-1]["by"], "Owner@Example.com")
+        self.assertEqual(self.call("/health")[0], 200)  # GET needs no identity
+
+
+class TestDefaultDeny(Base):
+    """No --allow-login (the default): every POST is 403, even with a header."""
+    push = False
+    allow = ()
+    login = None
+
+    def test_no_allow_list_refuses_every_post(self):
+        st, _, body = self.call("/voice/alice/u-voice-ex1", {"action": "heard"})
+        self.assertEqual((st, json.loads(body)["error"]), (403, "identity required"))
+        self.assertEqual(self.call("/voice/alice/u-voice-ex1", {"action": "heard"}, headers={"Tailscale-User-Login": "anyone@example.com"})[0], 403)
+        self.assertEqual(git(self.rec, "log", "--format=%s", "HEAD").strip(), "fixture")
+        self.assertEqual(self.call("/health")[0], 200)
+
+
 class TestNoPush(Base):
     push = False
 
@@ -195,7 +233,7 @@ class TestNoPush(Base):
         self.assertEqual(git(self.rec, "rev-parse", "HEAD").strip(), out["commit"])
         self.assertEqual(git(self.rec, "log", "-1", "--format=%an", "HEAD").strip(), "saturn voice-review")
         self.assertEqual(git(self.rec, "status", "--porcelain").strip(), "")
-        self.assertEqual(self.listened()[-1]["by"], "voice-review")
+        self.assertEqual(self.listened()[-1]["by"], "tester@example.com")
         self.build_ok()
 
 
