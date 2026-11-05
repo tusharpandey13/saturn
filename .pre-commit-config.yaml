@@ -73,6 +73,12 @@ repos:
         entry: python3 -I tools/search/test_search.py
         pass_filenames: false
         files: ^(tools/search/|tools/kb/records_config.py|fixtures/records-example/)
+      - id: fitness
+        name: fitness ingest (synthetic FIT files, mock providers)
+        language: system
+        entry: python3 -I tools/fitness/test_fitness.py
+        pass_filenames: false
+        files: ^(tools/fitness/|tools/kb/|schema/|tools/site/build|tools/search/search)
       - id: stt
         name: Mac audio pipeline, answer proposals, STT eval (fake engines, synthetic audio)
         language: system

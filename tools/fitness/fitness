@@ -1,0 +1,78 @@
+#!/usr/bin/env -S python3 -I
+"""Fitness data ingest: Strava, Polar, Zwift and MyWhoosh into a records repo (ADR 015). Record only: nothing here advises.
+
+  fitness pull --records R --ns NS --state S --credentials FILE [--sources polar] [--strava-api] [--today D]
+  fitness import-fit --records R --ns NS --source zwift|mywhoosh PATH...
+  fitness import-export --records R --ns NS --source strava|polar FILE.zip
+  fitness normalise --records R --ns NS [--today D]
+  fitness status --records R --ns NS --state S [--prom]
+
+pull: Polar every time; Strava's API only with --strava-api (read ADR 015 first: the Strava API Policy forbids keeping
+that data or using it with AI). A missing credential or authorisation is a state, not a failure: exit 0.
+Output is one JSON document of counts and states; values, tokens and file names of activities are never printed.
+Exit codes: 0 ok, 1 local error (records, files), 2 usage.
+"""
+import argparse, json, pathlib, sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import providers  # noqa: E402
+import store  # noqa: E402
+import records_config  # noqa: E402
+
+
+def check_ns(root, ns):
+    if ns not in records_config.load(root)["persons"]:
+        raise store.StoreError(f"--ns {ns} is not a person namespace in records.yaml")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("pull", "import-fit", "import-export", "normalise", "status"):
+        p = sub.add_parser(name)
+        p.add_argument("--records", required=True)
+        p.add_argument("--ns", required=True)
+        if name == "pull":
+            p.add_argument("--state", required=True)
+            p.add_argument("--credentials", default=None)
+            p.add_argument("--sources", default="polar,strava")
+            p.add_argument("--strava-api", action="store_true", help="owner's decision, ADR 015; off by default")
+        if name in ("pull", "normalise"):
+            p.add_argument("--today", default=None)
+        if name in ("import-fit", "import-export"):
+            p.add_argument("--source", required=True)
+            p.add_argument("paths", nargs="+")
+        if name == "status":
+            p.add_argument("--state", required=True)
+            p.add_argument("--prom", action="store_true")
+    a = ap.parse_args(argv)
+    root = pathlib.Path(a.records).resolve()
+    try:
+        check_ns(root, a.ns)
+        if a.cmd == "pull":
+            sources = [s for s in a.sources.split(",") if s in ("polar", "strava")]
+            out = providers.pull(root, a.ns, a.state, providers.read_env_file(a.credentials), sources, a.strava_api, a.today)
+        elif a.cmd == "import-fit":
+            out = store.import_fit(root, a.ns, a.source, a.paths)
+        elif a.cmd == "import-export":
+            if len(a.paths) != 1:
+                ap.error("import-export takes one export file")
+            out = store.import_export(root, a.ns, a.source, a.paths[0])
+        elif a.cmd == "normalise":
+            out = store.normalise(root, a.ns, a.today)
+        else:
+            status = providers.State(a.state).load("status")
+            if a.prom:
+                sys.stdout.write(providers.prom(status))
+                return 0
+            out = {"sources": status, "counts": store.counts(root, a.ns)}
+    except (store.StoreError, records_config.RecordsError, OSError) as e:
+        print(f"fitness: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

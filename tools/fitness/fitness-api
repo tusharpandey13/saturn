@@ -1,0 +1,224 @@
+#!/usr/bin/env -S python3 -I
+"""Fitness connect and status endpoint (ADR 015), behind `tailscale serve` only.
+
+Usage: tools/fitness/fitness-api --records DIR --ns NS --state DIR --credentials FILE --bind ADDR --port N
+                                 --public-url URL --allow LOGIN [--allow LOGIN]... [--strava-api]
+
+Routes (every route but /health needs a `Tailscale-User-Login` header listed in --allow; no header = 403):
+  GET  /health                 {"ok": true}
+  GET  /status                 counts and states only (JSON)
+  GET  /                       phone page: one Connect button per source, the paste form, the counts
+  GET  /connect/<source>       302 to the provider's consent page; ?mode=paste uses the localhost redirect instead
+  GET  /callback/<source>      the provider returns here with ?code&state; the code is exchanged and the token stored
+  POST /paste/<source>         form: code = the whole localhost address from the browser (it carries code and state)
+Stdlib only; bodies capped at 16 KiB; nothing from a request or a provider is logged or echoed (no query strings: they
+carry codes). Tokens live in <state>/tokens.json, 0600, in the unit's 0700 home. Strava is offered only with --strava-api.
+"""
+import argparse, html, http.server, json, pathlib, re, secrets, sys, time, urllib.parse
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import providers  # noqa: E402
+import store  # noqa: E402
+
+MAX_BODY = 16 * 1024
+STATE_TTL = 600  # Polar's code lives 10 minutes; Strava's is short-lived
+PASTE_REDIRECT = "http://localhost/fitness-callback"
+HEADERS = (("Cache-Control", "no-store"), ("X-Robots-Tag", "noindex, nofollow"), ("Referrer-Policy", "no-referrer"),
+           ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"))
+ROUTE = re.compile(r"^/(connect|callback|paste)/(strava|polar)$")
+WORDS = {"ok": "connected, last pull fine", "awaiting-credentials": "client id and secret not on the box yet",
+         "awaiting-authorisation": "ready: tap Connect", "disabled-terms": "API off (Strava's terms, ADR 015); use the bulk export",
+         "rate-limited": "paused by the provider's limit; continues next run", "auth-failed": "authorisation lost: tap Connect again",
+         "provider-error": "provider error; next run retries", None: "no pull yet"}
+
+
+class Api:
+    def __init__(self, records, ns, state, credentials, public_url, allow, strava_api=False):
+        self.records, self.ns = pathlib.Path(records), ns
+        self.state = providers.State(state)
+        self.credentials = credentials
+        self.public = public_url.rstrip("/")
+        self.allow = tuple(a.lower() for a in allow)
+        self.strava_api = strava_api
+        self.pending = {}  # state -> (source, redirect_uri, expires): memory only; a restart just means tapping again
+
+    def sources(self):
+        return ("polar", "strava") if self.strava_api else ("polar",)
+
+    def client(self, source):
+        return providers.client(providers.read_env_file(self.credentials), source)
+
+    def status(self):
+        st = self.state.load("status")
+        tokens = self.state.load("tokens")
+        out = {"sources": {}, "counts": store.counts(self.records, self.ns)}
+        for s in ("polar", "strava"):
+            row = st.get(s) or {}
+            state = row.get("state")
+            if s == "strava" and not self.strava_api:
+                state = "disabled-terms"
+            elif not self.client(s):
+                state = "awaiting-credentials"
+            elif not tokens.get(s):
+                state = "awaiting-authorisation"
+            out["sources"][s] = {"state": state, "connected": bool(tokens.get(s)), "last_success": row.get("last_success"),
+                                 "new_last_run": row.get("new")}
+        return out
+
+    def new_state(self, source, redirect):
+        now = time.time()
+        self.pending = {k: v for k, v in self.pending.items() if v[2] > now}
+        tok = secrets.token_urlsafe(24)
+        self.pending[tok] = (source, redirect, now + STATE_TTL)
+        return tok
+
+    def callback_uri(self, source):
+        return f"{self.public}/callback/{source}"
+
+    def connect(self, source, paste):
+        c = self.client(source)
+        if source not in self.sources():
+            return None, "off"
+        if not c:
+            return None, "awaiting-credentials"
+        redirect = PASTE_REDIRECT if paste else self.callback_uri(source)
+        return providers.authorize_url(source, c[0], redirect, self.new_state(source, redirect)), None
+
+    def redeem(self, source, code, state):
+        """-> None on success, else a short message that carries nothing from the request."""
+        pending = self.pending.pop(state or "", None)
+        if not pending or pending[0] != source or pending[2] < time.time():
+            return "That link has expired. Tap Connect again."
+        c = self.client(source)
+        if not c or not code or not re.fullmatch(r"[A-Za-z0-9._~-]{4,512}", code):
+            return "That code does not look right. Tap Connect again."
+        try:
+            providers.exchange(source, c[0], c[1], code, pending[1], self.state)
+        except (providers.ProviderError, providers.AuthFailed, providers.RateLimited):
+            return "The provider refused that code (they work once and expire quickly). Tap Connect again."
+        return None
+
+
+def page(title, body):
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<meta name="robots" content="noindex, nofollow"><title>{html.escape(title)}</title><style>body{{font:17px/1.4 system-ui;margin:1em;max-width:40em}}'
+            "input{font:inherit;width:100%;box-sizing:border-box;margin:.3em 0}a.b,button{display:inline-block;font:inherit;padding:.5em .9em;margin:.3em 0}"
+            f"</style></head><body><h1>{html.escape(title)}</h1>{body}<p><small>Facts as written; not advice; doctors decide.</small></p></body></html>")
+
+
+def home(api):
+    st = api.status()
+    out = []
+    for s in ("polar", "strava"):
+        row = st["sources"][s]
+        out.append(f"<h2>{s.capitalize()}</h2><p>{html.escape(WORDS.get(row['state'], str(row['state'])))}</p>")
+        if s not in api.sources() or row["state"] == "awaiting-credentials":
+            continue
+        out.append(f'<p><a class="b" href="connect/{s}">Connect {s.capitalize()}</a></p>')
+        out.append(f'<details><summary>The provider rejected the callback? Paste the address instead</summary>'
+                   f'<p>Open <a href="connect/{s}?mode=paste">this link</a>, approve, and when the browser lands on a failed '
+                   f'localhost page, copy the whole address and paste it here within a few minutes.</p>'
+                   f'<form method="post" action="paste/{s}"><input name="code" autocomplete="off" placeholder="The whole address">'
+                   f'<button>Save</button></form></details>')
+    c = st["counts"]
+    out.append(f"<h2>Stored</h2><p>{c['canonical_activities']} activities ({c['activities']} recordings), {c['daily_rows']} day and night "
+               f"rows, {c['raw_files']} raw files.</p>")
+    return page("Fitness", "".join(out))
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "saturn-fitness-api"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass  # request lines carry OAuth codes
+
+    def _send(self, status, body, ctype="text/html; charset=utf-8", extra=()):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (*HEADERS, *extra):
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _json(self, status, obj):
+        self._send(status, json.dumps(obj), "application/json; charset=utf-8")
+
+    def _allowed(self):
+        login = (self.headers.get("Tailscale-User-Login") or "").strip().lower()
+        if login and login in self.server.api.allow:
+            return True
+        self._json(403, {"ok": False, "error": "this identity may not use the fitness endpoint"})
+        return False
+
+    def do_GET(self):
+        api = self.server.api
+        u = urllib.parse.urlsplit(self.path)
+        if u.path == "/health":
+            return self._json(200, {"ok": True})
+        if not self._allowed():
+            return None
+        if u.path == "/status":
+            return self._json(200, {"ok": True, **api.status()})
+        if u.path == "/":
+            return self._send(200, home(api))
+        m = ROUTE.match(u.path)
+        if not m or m[1] == "paste":
+            return self._json(404, {"ok": False, "error": "not found"})
+        q = urllib.parse.parse_qs(u.query)
+        if m[1] == "connect":
+            url, why = api.connect(m[2], q.get("mode") == ["paste"])
+            if not url:
+                return self._send(409, page("Not ready", f"<p>{html.escape(WORDS.get(why, 'This source is off (ADR 015).'))}</p>"))
+            return self._send(302, "", extra=(("Location", url),))
+        if q.get("error"):
+            return self._send(400, page("Not connected", "<p>The provider did not grant access.</p>"))
+        err = api.redeem(m[2], (q.get("code") or [""])[0], (q.get("state") or [""])[0])
+        return self._done(err)
+
+    def _done(self, err):
+        if err:
+            return self._send(400, page("Not connected", f"<p>{html.escape(err)}</p>"))
+        return self._send(200, page("Connected", '<p>Connected. The next pull runs within a few hours.</p><p><a href="../">Back</a></p>'))
+
+    def do_POST(self):
+        api = self.server.api
+        if not self._allowed():
+            return None
+        u = urllib.parse.urlsplit(self.path)
+        m = ROUTE.match(u.path)
+        if not m or m[1] != "paste":
+            return self._json(404, {"ok": False, "error": "not found"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > MAX_BODY:
+            return self._json(413, {"ok": False, "error": "too large"})
+        form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit((form.get("code") or [""])[0].strip()).query)
+        return self._done(api.redeem(m[2], (q.get("code") or [""])[0], (q.get("state") or [""])[0]))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    for flag in ("--records", "--ns", "--state", "--bind", "--public-url"):
+        ap.add_argument(flag, required=True)
+    ap.add_argument("--credentials", default=None)
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--allow", action="append", required=True)
+    ap.add_argument("--strava-api", action="store_true")
+    a = ap.parse_args(argv)
+    srv = http.server.ThreadingHTTPServer((a.bind, a.port), Handler)
+    srv.api = Api(a.records, a.ns, a.state, a.credentials, a.public_url, a.allow, a.strava_api)
+    srv.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
