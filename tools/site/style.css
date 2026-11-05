@@ -300,6 +300,10 @@ svg .mk.hollow { fill: var(--card); stroke: var(--plot-ink); stroke-width: 1.8; 
 svg .mk.flag.hollow { stroke: var(--flag-mark); }
 .inferred .infmeta { color: var(--inf-ink); font-weight: 600; margin-bottom: 2px; }
 .inferred .small { margin: 3px 0; color: var(--ink-2); }
+.inferred details.ev { margin: 3px 0; font-size: var(--t-xs); }
+.inferred details.ev > summary { cursor: pointer; min-height: 28px; display: inline-flex; align-items: center; color: var(--inf-ink); font-weight: 600; }
+.inferred details.ev ul { margin: 2px 0 4px; padding-left: 18px; }
+.inferred details.ev li { margin: 2px 0; }
 .inferred code { font-size: 12px; word-break: break-all; }
 
 /* Voice note review */

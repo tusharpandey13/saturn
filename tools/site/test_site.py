@@ -148,7 +148,7 @@ TG_EXTRA = [
      "confidence": 0.9, "confirmed": 0, "extracted_by": "fixture-extractor", "extracted_at": "2026-06-15T05:00:00.000Z"},
 ]
 BASE_INF = {"schema": "inference/1", "problem": "alice:dx:0001", "problem_title": "Potassium above the range",
-            "hypothesis": None, "kind": "trend", "p": 0.7, "bucket": ">50%", "reason": "two results in a row",
+            "hypothesis": None, "kind": "trend", "p": 0.7, "bucket": ">50%", "reason": "two results in a row (LR: U); capped at +2. No repeat yet.",
             "stakes": "quality-of-life",
             "evidence_for": ["alice:fact:2026-03-12-example-lab-lft-rft.potassium",
                              "alice:fact:2026-06-20-example-lab-rft.potassium"], "evidence_against": [],
@@ -307,13 +307,29 @@ class SiteTest(unittest.TestCase):
         self.assertIn('class="inferred"', st)
         self.assertIn("Agent-inferred · not from a document", st)
         self.assertIn("Two of the last two potassium results", st)
-        self.assertIn("alice:fact:2026-06-20-example-lab-rft.potassium", st)
+        self.assertIn('title="alice:fact:2026-06-20-example-lab-rft.potassium"', st)
         self.assertNotIn("later retired", st)  # last rev per id wins; retired rows are not shown
         self.assertIn("Potassium above the range", st)
         self.assertIn("example.org/guide", st)
         self.assertIn("../notes/", st)  # the run note is linked
         self.assertIn('class="inferred"', self.pages["alice/overview.html"])
         self.assertNotIn('class="inferred"', self.pages["alice/results.html"])
+
+    def test_status_evidence_is_collapsed_and_labelled(self):
+        """Phone review: evidence ids collapse into one summary line, each resolved to date · source · test value,
+        linked to the trend page; the raw id survives only as a title. Method jargon leaves the visible reason."""
+        st = self.pages["alice/status.html"]
+        self.assertIn("<summary>Evidence: 2 for · 0 against</summary>", st)
+        self.assertNotIn("<details class=\"ev\" open", st)
+        self.assertIn('<a href="trend/potassium.html" title="alice:fact:2026-06-20-example-lab-rft.potassium">'
+                      "20-Jun-2026 · Example Lab · Potassium 5.3 mmol/L</a>", st)
+        visible = re.sub(r'title="[^"]*"', "", st)
+        self.assertNotIn("alice:fact:", visible)
+        self.assertIn("Why this probability: two results in a row. No repeat yet.</div>", st)
+        self.assertNotIn("LR: U", visible.split("Method notes")[0])
+        self.assertIn("<summary>Method notes</summary><div class=\"small\">(LR: U); capped at +2</div>", st)
+        self.assertIn('<span title="must not be missed">can&#x27;t-miss</span>', st)
+        self.assertNotIn("<summary>Evidence", self.pages["alice/overview.html"])  # short form: unchanged
 
     def test_status_problem_order_matches_inference_gen(self):
         st = self.pages["alice/status.html"]

@@ -372,30 +372,91 @@ def load_inferences(root, ns):
     return rows
 
 
-def evidence_ref(b, kb, link_src):
-    """A KB id as code, or a sources/ path linked to the copied original."""
-    if isinstance(b, str) and b.startswith("sources/"):
+def humanise(seg):
+    """Last id segment as words: finding-acute-infarcts -> finding acute infarcts."""
+    return re.sub(r"[-_.]+", " ", seg).strip()
+
+
+def evidence_item(b, kb, link_src, link_fact=lambda fid: None):
+    """One evidence ref as a plain-language list item: `<date> · <source> · <what>`, linked to the site page that
+    shows it (trend page or the copied original). The raw KB id is kept only in the title attribute (phone review)."""
+    b = str(b)
+    href, bits = None, []
+    if b.startswith("sources/"):
         href = link_src(b.split("#")[0])
-        return f'<a href="{ESC(href)}"><code>{ESC(b)}</code></a>' if href else f"<code>{ESC(b)}</code>"
-    return f"<code>{ESC(str(b))}</code>"
+        bits = [humanise(pathlib.PurePosixPath(b.split("#")[0]).stem)]
+    else:
+        f = kb.facts.get(b) if kb else None
+        s = kb.sources.get(f["source_id"]) if f else (kb.sources.get(b) if kb else None)
+        if s:
+            org = (j(f["data"]).get("org_id") if f else None) or s["org_id"]
+            bits.append(kb.name(org) if org else KIND_NAMES.get(s["kind"], s["kind"]))
+        if f:
+            d = j(f["data"])
+            if d.get("label"):
+                what = d["label"]
+            elif f["kind"] == "observation" and d.get("code"):
+                what = " ".join(x for x in [kb.name(d["code"]), obs_display(d), d.get("unit") or ""] if x)
+            elif f["kind"] == "medication" and (d.get("brand") or d.get("drug_id")):
+                what = d.get("brand") or kb.name(d["drug_id"])
+            else:
+                what = humanise(b.rsplit(".", 1)[-1] if "." in b else b.split(":")[-1])
+            bits = [fdate(f["at"])] + bits + [what]
+            href = link_fact(b)
+        elif s:
+            bits = [fdate(s["issued_at"] or s["received_at"] or "")] + bits
+            href = link_src(s["path"]) if s["path"] else None
+        elif kb and b in kb.refs:
+            bits = [kb.name(b)]
+        else:
+            bits = [humanise(b.split(":")[-1].rsplit(".", 1)[-1])]
+    text = ESC(gv.short(" · ".join(x for x in bits if x), 110))  # long free-text findings stay readable on a phone
+    return (f'<li><a href="{ESC(href)}" title="{ESC(b)}">{text}</a></li>' if href
+            else f'<li><span title="{ESC(b)}">{text}</span></li>')
 
 
-def inferred_box(inf, kb=None, link_src=lambda x: None, run_href=None, short=False):
+METHOD_NOTE = re.compile(r"\((?:[^()]*\bLR\b[^()]*|capped at[^()]*)\)|\bcapped at [+\-±]?\d+(?:\.\d+)?|\bLR[+\-](?:\s*\d+(?:\.\d+)?)?")
+
+
+def split_method(text):
+    """(plain sentence, [method notes]): the likelihood-ratio bookkeeping of the reason moves out of the visible text
+    (display only; the inference row is untouched)."""
+    notes = [m.group(0) for m in METHOD_NOTE.finditer(text)]
+    if not notes:
+        return text, []
+    plain = METHOD_NOTE.sub("", text)
+    plain = re.sub(r"\s+([;,.:])", r"\1", plain)
+    plain = re.sub(r"[;,]\s*([;,.])", r"\1", plain)
+    plain = re.sub(r"\s{2,}", " ", plain).strip(" ;,")
+    return plain, notes
+
+
+def inferred_box(inf, kb=None, link_src=lambda x: None, run_href=None, short=False, link_fact=lambda fid: None):
     """The dashed purple block (design 6.1): never styled like a fact."""
     p = inf.get("p")
     pct = f"{round(p * 100)}%" if isinstance(p, (int, float)) else ""
-    head = " · ".join(x for x in [inf.get("kind", "").replace("-", " "), f"p {pct} ({inf.get('bucket')})" if pct else "",
-                                  inf.get("stakes")] if x)
+    stakes = inf.get("stakes") or ""
+    stakes_html = f'<span title="must not be missed">{ESC(stakes)}</span>' if stakes == "can't-miss" else ESC(stakes)
+    head = " · ".join(x for x in [ESC(inf.get("kind", "").replace("-", " ")),
+                                  ESC(f"p {pct} ({inf.get('bucket')})") if pct else "", stakes_html] if x)
     out = ['<div class="inferred" role="note"><div class="label">' + icon("status") +
            'Agent-inferred · not from a document</div>',
-           f'<div class="xs infmeta">{ESC(head)}</div>', f"<p>{ESC(inf.get('statement') or '')}</p>"]
+           f'<div class="xs infmeta">{head}</div>', f"<p>{ESC(inf.get('statement') or '')}</p>"]
     if not short:
-        if inf.get("reason"):
-            out.append(f'<div class="small">Why this probability: {ESC(inf["reason"])}</div>')
-        for key, word in (("evidence_for", "For"), ("evidence_against", "Against")):
-            ev = inf.get(key) or []
-            if ev:
-                out.append(f'<div class="small">{word}: ' + ", ".join(evidence_ref(b, kb, link_src) for b in ev) + "</div>")
+        plain, notes = split_method(inf.get("reason") or "")
+        if plain:
+            out.append(f'<div class="small">Why this probability: {ESC(plain)}</div>')
+        ev_for, ev_against = inf.get("evidence_for") or [], inf.get("evidence_against") or []
+        if ev_for or ev_against:
+            out.append(f'<details class="ev"><summary>Evidence: {len(ev_for)} for · {len(ev_against)} against</summary>')
+            for word, ev in (("For", ev_for), ("Against", ev_against)):
+                if ev:
+                    out.append(f'<div class="small">{word}:<ul>' +
+                               "".join(evidence_item(b, kb, link_src, link_fact) for b in ev) + "</ul></div>")
+            out.append("</details>")
+        if notes:
+            out.append('<details class="ev"><summary>Method notes</summary><div class="small">'
+                       + ESC("; ".join(notes)) + "</div></details>")
         cits = inf.get("citations") or []
         if cits:
             out.append('<div class="small">Literature: ' + "; ".join(
@@ -902,7 +963,16 @@ class Builder:
         def link_src(rel):
             orig = self.site.original(rel)
             return Site.rel(path, orig) if orig else None
-        return inferred_box(inf, self.kb, link_src, run_href, short)
+
+        def link_fact(fid):  # the trend page of the test, else the copied original of its source
+            f = self.kb.facts.get(fid)
+            d = j(f["data"]) if f else {}
+            tp = f"{f['ns']}/trend/{tslug(d['code'])}.html" if f and d.get("code") else None
+            if tp and tp in self.site.pages:
+                return Site.rel(path, tp)
+            s = self.kb.sources.get(f["source_id"]) if f else None
+            return link_src(s["path"]) if s and s["path"] else None
+        return inferred_box(inf, self.kb, link_src, run_href, short, link_fact)
 
     def analysis_notes(self, p, n=5):
         d = self.root / "docs" / "log" / "analysis"
