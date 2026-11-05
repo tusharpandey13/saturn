@@ -136,6 +136,8 @@ sequenceDiagram
 | 7 | T3 toggle (real claude, weekly) + a flake budget (one auto-retry for Telegram hops) | 0.5 | one green weekly run |
 Total: **~6.5 agent-runs**, of which steps 3 and 6 wait on agent-server phase 2 (`git_pr`).
 
+CI gap (05-Nov-2026, v0.16.0): `.github/workflows/ci.yml` does not yet run `python3 -I tools/site/test_dx_api.py` and `python3 -I tools/dx/test_dx.py` (the release token had no `workflow` scope); add both to the "KB tools" step the next time the workflow is edited. Until then run both locally before each release.
+
 **User actions:**
 1. Create the second CF Free account, complete R2 there, and mint the e2e token.
 2. Create an my.telegram.org app; the account it needs must be a real one.

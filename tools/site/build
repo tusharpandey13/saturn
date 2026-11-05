@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """Build the family health site (static HTML) from a records repo's KB. Design: docs/design/health-site.md.
 
-Usage: tools/site/build --records DIR --out DIR [--person NS] [--db PATH] [--today YYYY-MM-DD] [--voice-api URL]
+Usage: tools/site/build --records DIR --out DIR [--person NS] [--db PATH] [--today YYYY-MM-DD] [--voice-api URL] [--dx-api URL]
 
 Reads <records>/data/kb.sqlite (read-only; built by tools/kb/build: run that first, or the site builds the KB into a
 temp file when it is missing) through the existing views, plus docs/health/<ns>/questions.md, family/actions.md, the
@@ -10,7 +10,9 @@ cross-check pages and agent inference rows when present. Writes <out>/index.html
 Markdown pages (docs/health/<ns>/<page>.md -> <ns>/<page>.html, analysis notes -> notes/, with the person's nav),
 linked originals under <out>/files/, one style.css and build.json. No doctor/simple stubs (hidden until built). Voice notes (Telegram audio in
 data/telegram/<month>.ndjson): <out>/<ns>/voice.html and <out>/<ns>/voice/<stem>.html (player, transcript to correct;
-with --voice-api URL the page posts a plain form to tools/site/voice-api; without it the page is read-only).
+with --voice-api URL the page posts a plain form to tools/site/voice-api; without it the page is read-only). With
+--dx-api URL each overview carries a "Run the loop (delta)" button posting to tools/site/dx-api (queues one bounded
+agent run; the endpoint enforces the caps) and a link to the newest loop note; without it the overview is read-only.
 
 Rules: static HTML, relative links only (served under a path prefix), no JS, no external URL anywhere, colour only
 from the lab's printed flag, agent-inferred content visibly apart from facts. Refuses an --out inside the product repo
@@ -149,7 +151,7 @@ class Site:
 
 
 def head(title, path, form_action=None):
-    """form_action: an origin a page may post a form to (the voice review endpoint); every other page posts nowhere."""
+    """form_action: an origin a page may post a form to (the voice review or dx endpoint); every other page posts nowhere."""
     css = Site.rel(path, "style.css")
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
@@ -439,10 +441,11 @@ def transcode_m4a(src, dst):
 
 # -------------------------------------------------------------------------------------------------------- the build
 class Builder:
-    def __init__(self, root, out, kb, rc, today, voice_api=None, m4a_cache=None):
+    def __init__(self, root, out, kb, rc, today, voice_api=None, m4a_cache=None, dx_api=None):
         self.root, self.kb, self.rc, self.today = root, kb, rc, today
         self.voice_api = voice_api.rstrip("/") if voice_api else None
         self.m4a_cache = m4a_cache  # dir outside the records repo for ffmpeg transcodes of Ogg-only voice notes
+        self.dx_api = dx_api.rstrip("/") if dx_api else None
         self.voice_count = {}  # ns -> (notes, not yet heard), filled by voice()
         self.site = Site(out, root)
         self.data = Data(kb, root, rc)
@@ -748,13 +751,38 @@ class Builder:
         if self.infs:
             out.append(self.inf_html(path, self.infs[0], short=True)
                        + '<p class="small"><a href="status.html">All agent inferences</a></p>')
+        out.append(self.dx_html(p, path))
         n_voice, n_unheard = self.voice_count.get(p.ns, (0, 0))
         if n_voice:
             out.append('<h2>Voice notes</h2><div class="list">'
                        f'<a href="voice.html"><b>{n_voice} voice note{"s" if n_voice != 1 else ""}</b> · '
                        f'{n_unheard} to hear<div class="small muted">Play, read the transcript, correct it or mark it '
                        'heard.</div></a></div>')
-        self.site.pages[path] = shell(p, path, "Overview", "".join(out), tab="overview")
+        origin = re.match(r"^[a-z][a-z0-9+.-]*://[^/]+", self.dx_api).group(0) if self.dx_api else None
+        self.site.pages[path] = shell(p, path, "Overview", "".join(out), tab="overview", form_action=origin)
+
+    def dx_html(self, p, path):
+        """Agent run block: newest diagnostic-loop note (tools/dx/run, ADR 013) and, with --dx-api, the trigger form."""
+        notes = sorted((self.root / "docs" / "log" / "analysis").glob(f"*-{p.ns}-dx-loop-*.md"))
+        if notes:
+            f = notes[-1]
+            run = re.search(r"-dx-loop-(\d+)", f.stem)
+            href = Site.rel(path, self.md_href(f.relative_to(self.root).as_posix()))
+            line = (f'<p class="small"><a href="{href}">Last loop note: {ESC(fdate(f.stem[:10]) or f.stem[:10])}'
+                    + (f" · run {ESC(run.group(1))}" if run else "") + "</a></p>")
+        else:
+            line = '<p class="small muted">No loop run yet.</p>'
+        if self.dx_api:
+            action = f"{self.dx_api}/dx/{p.ns}/run"
+            form = (f'<form method="post" action="{ESC(action)}" accept-charset="utf-8" class="voice dx">'
+                    '<div class="modes"><button type="submit">Run the loop (delta)</button></div>'
+                    '<p class="xs muted">Starts one bounded agent run on the home server (delta run, about 1–3 h); '
+                    'limited to 1 run per 24 h and 8 per 30 days. The note appears here within about 10 minutes of '
+                    'finishing and the owner gets one DM. Never medicine advice.</p></form>'
+                    f'<p class="small"><a href="{ESC(self.dx_api)}/dx/{ESC(p.ns)}/status">Status of the last run</a></p>')
+        else:
+            form = '<p class="xs muted">Read-only build: no run endpoint.</p>'
+        return "<h2>Agent run</h2>" + line + form
 
     # ---- "This week" (U-07): the newest analysis note's "For <owner>" numbered steps, each with its tier
     def week_steps(self, p):
@@ -1562,10 +1590,13 @@ def main(argv=None):
                     "missing) where ffmpeg transcodes Ogg-only voice notes to DIR/<ns>/<stem>.m4a, reused while not older "
                     "than the original; the site copies them beside the originals. Without it, or without ffmpeg, "
                     "those notes stay Ogg-only")
+    ap.add_argument("--dx-api", default=None, help="base URL of tools/site/dx-api (e.g. https://host/dx-api); without "
+                    "it the overview has no 'Run the loop' button")
     a = ap.parse_args(argv)
-    if a.voice_api and not re.match(r"^https?://[^/\s]+(/[^\s]*)?$", a.voice_api):
-        print("error: --voice-api must be an absolute http(s) URL", file=sys.stderr)
-        return 2
+    for flag, url in (("--voice-api", a.voice_api), ("--dx-api", a.dx_api)):
+        if url and not re.match(r"^https?://[^/\s]+(/[^\s]*)?$", url):
+            print(f"error: {flag} must be an absolute http(s) URL", file=sys.stderr)
+            return 2
     root = pathlib.Path(a.records).resolve()
     out = pathlib.Path(a.out).resolve()
     cache = pathlib.Path(a.m4a_cache).resolve() if a.m4a_cache else None
@@ -1607,7 +1638,7 @@ def main(argv=None):
     out.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=".site-", dir=out.parent))
     try:
-        b = Builder(root, stage, kb, rc, datetime.date.fromisoformat(a.today), a.voice_api, cache)
+        b = Builder(root, stage, kb, rc, datetime.date.fromisoformat(a.today), a.voice_api, cache, a.dx_api)
         b.build(people)
         b.site.write()
         meta = {"records_commit": records_commit(root), "built_at": datetime.datetime.now(datetime.timezone.utc)

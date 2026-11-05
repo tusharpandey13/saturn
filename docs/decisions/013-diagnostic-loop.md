@@ -88,6 +88,8 @@ crossref), the [research cross-reference method](../methods/research-crossref.md
 7. **Runs.**
    - Now: the owner's Claude Code session (the "doctor" session) in the records repo.
    - Later: a `saturn.dx_loop` task on the egress-locked PHI user, after go-live, using the 012 split literature fetch.
+   - 05-Nov-2026: the "later" is implemented as the site trigger T-01 (`tools/dx`, `tools/site/dx-api`; see
+     [methods/diagnostic-loop-trigger.md](../methods/diagnostic-loop-trigger.md)); the status of this ADR is unchanged.
 8. **Budget.**
    - A full run costs about $4–8 and a delta run about $1–3 at API prices.
    - The proposed monthly cap is **$60**. It is the owner's decision and separate from the 012 L2 cap.

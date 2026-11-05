@@ -28,3 +28,12 @@ name, e.g. `questions`), analysis notes about a person carry that person's nav a
 and simple stubs are not built or linked until they exist. `test_site.py` measures the fixture pages at 390 px when
 `SITE_PLAYWRIGHT_MODULES=<node_modules dir with playwright>` is set (no overflow, six tabs visible, footer clear of the
 tab bar); without it the CSS rules are checked statically.
+
+`--dx-api URL` adds an "Agent run" block to each person's overview: a status line linking the newest loop note
+(`docs/log/analysis/<date>-<ns>-dx-loop-<NN>.md`, rendered under `notes/`; "No loop run yet." when none), the
+"Run the loop (delta)" button and a "Status of the last run" link. The button posts a plain form to `tools/site/dx-api`
+(`POST /dx/<ns>/run`, `GET /dx/<ns>/status`), which only queues a request; a host timer runs `tools/dx/run` (the
+diagnostic loop, ADR 013) in its own records clone and reports to the admin DM. The caps, 1 run per 24 h and 8 per
+30 days, are enforced by the endpoint, not the page. The overview's CSP `form-action` is widened to that origin only.
+Without the flag the overview is read-only (status line plus "Read-only build: no run endpoint."). Defaults, caps,
+tool restrictions and the verifier: [tools/dx/README.md](../dx/README.md). Tests: `python3 -I tools/site/test_dx_api.py`.
