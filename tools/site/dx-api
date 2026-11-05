@@ -1,0 +1,251 @@
+#!/usr/bin/env -S python3 -I
+"""Run-the-loop API (T-01): queues one bounded diagnostic-loop run per press; never runs the agent itself.
+
+Usage: tools/site/dx-api --records DIR --state DIR --bind ADDR --port N [--site URL] [--allow LOGIN]...
+                         [--cap-24h 1] [--cap-30d 8] [--cap-scope global|ns]
+
+Routes:
+  GET  /health            -> {"ok": true}
+  POST /dx/<ns>/run       form (application/x-www-form-urlencoded) or JSON; optional field `by`. The
+                          `Tailscale-User-Login` header overrides `by` (default "dx-trigger"). Writes one row to
+                          <state>/state.json and a spool file <state>/spool/<ns>.json that tools/dx/run (a host timer)
+                          picks up. 202 queued; 409 already queued/running or cap reached ("next allowed at ...");
+                          403 identity not in --allow; 404 unknown namespace; 503 awaiting key (the job's deploy key is
+                          not registered yet) or records clone not ready.
+  GET  /dx/<ns>/status    last run (state, times, note path, commit, pushed), caps, next_allowed_at; HTML when the
+                          client accepts text/html (a browser), else JSON.
+Caps (owner defaults, tools/dx/README.md): 1 accepted request per 24 h and 8 per 30 days, counted from the state file
+over every accepted request. The namespace list comes from the records clone's records.yaml (read per request, so the
+clone may appear after start). Stdlib only; bodies capped at 16 KiB; bodies are never logged (stderr: method, path,
+status). Record and flag only: nothing here diagnoses or advises; the job's prompt carries the records rules.
+"""
+import argparse, http.server, json, pathlib, re, sys, urllib.parse
+
+HERE = pathlib.Path(__file__).resolve().parent
+PRODUCT = HERE.parents[1]
+sys.path.insert(0, str(PRODUCT / "tools" / "kb"))
+sys.path.insert(0, str(PRODUCT / "tools" / "dx"))
+import records_config  # noqa: E402
+import dxstate  # noqa: E402
+
+ROUTE_RE = re.compile(r"^/dx/([a-z][a-z0-9-]*)/(run|status)$")
+MAX_BODY = 16 * 1024
+MAX_BY = 120
+DEFAULT_BY = "dx-trigger"
+FOOT = "Facts as written; not advice; doctors decide."
+HEADERS = (("Cache-Control", "no-store"), ("X-Robots-Tag", "noindex, nofollow"), ("Referrer-Policy", "no-referrer"),
+           ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'"))
+
+
+class ApiError(Exception):
+    def __init__(self, status, msg, extra=None):
+        super().__init__(msg)
+        self.status, self.msg, self.extra = status, msg, extra or {}
+
+
+def esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def clean_by(v):
+    v = re.sub(r"[^\x20-\x7e\u0080-￿]", "", str(v or "")).strip()
+    return v[:MAX_BY] or DEFAULT_BY
+
+
+class Api:
+    def __init__(self, records, state, site=None, allow=(), cap_24h=dxstate.CAP_24H, cap_30d=dxstate.CAP_30D, scope="global"):
+        self.records = pathlib.Path(records).resolve()
+        self.state = dxstate.State(state, cap_24h, cap_30d, scope)
+        self.site = site.rstrip("/") if site else None
+        self.allow = tuple(a.lower() for a in allow)
+
+    def persons(self):
+        if not (self.records / "records.yaml").is_file():
+            raise ApiError(503, "records clone not ready" + (" (awaiting key)" if self.state.awaiting_key() else ""))
+        try:
+            return records_config.load(self.records)["persons"]
+        except records_config.RecordsError as e:
+            raise ApiError(500, f"records.yaml: {e}")
+
+    def check_ns(self, ns):
+        if ns not in self.persons():
+            raise ApiError(404, "not found")
+
+    def run(self, ns, by, from_header):
+        self.check_ns(ns)
+        if self.allow and (not from_header or by.lower() not in self.allow):
+            raise ApiError(403, "this identity may not start a run")
+        row, err = self.state.enqueue(ns, by)
+        if err:
+            status, reason, nxt = err
+            raise ApiError(status, reason, {"next_allowed_at": nxt})
+        return 202, {"ok": True, "queued": True, "run": row, "site": self.site}
+
+    def status(self, ns):
+        self.check_ns(ns)
+        st = self.state.status(ns)
+        st["ok"] = True
+        if self.site:
+            st["overview"] = f"{self.site}/{ns}/overview.html"
+        return 200, st
+
+
+STATE_WORDS = {"never": "no run yet", "queued": "queued", "running": "running", "done": "done", "failed": "failed",
+               "awaiting-key": "done, committed locally; push awaits the deploy key"}
+
+
+def status_html(st):
+    last = st.get("last_run") or {}
+    rows = [("State", STATE_WORDS.get(st["state"], st["state"]))]
+    if last:
+        rows += [("Requested", f"{last['requested_at']} by {last['by']}"), ("Started", last.get("started_at") or "-"),
+                 ("Finished", last.get("finished_at") or "-"), ("Run note", last.get("note") or "-"),
+                 ("Commit", (last.get("commit") or "-")[:12] + (" (pushed)" if last.get("pushed") else "")),
+                 ("Cost", f"${last['cost_usd']:.2f}" if last.get("cost_usd") is not None else "-"),
+                 ("Error", last.get("error") or "-")]
+    if st.get("awaiting_key"):
+        rows.append(("Deploy key", "not registered yet: runs are refused until the owner registers it"))
+    rows.append(("Next run allowed", "now" if st["can_run"] else (st.get("next_allowed_at") or "when the current run ends")))
+    caps = st["caps"]
+    rows.append(("Caps", f"{caps['per_24h']} per 24 h, {caps['per_30d']} per 30 days ({caps['scope']})"))
+    body = "".join(f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>" for k, v in rows)
+    back = f'<p><a href="{esc(st["overview"])}">Back to the overview</a></p>' if st.get("overview") else ""
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<meta name="robots" content="noindex, nofollow"><title>Run the loop: status</title>'
+            "<style>body{font:17px/1.4 system-ui;margin:1em;max-width:40em}th{text-align:left;padding-right:1em;vertical-align:top}</style>"
+            f"</head><body><h1>Run the loop: {esc(st['ns'])}</h1><table>{body}</table>{back}<p><small>{FOOT}</small></p></body></html>")
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "saturn-dx-api"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, status, body, ctype):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in HEADERS:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, status, obj):
+        self._send(status, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+
+    def _done(self, status):
+        sys.stderr.write(f"{self.command} {self.path.split('?')[0]} {status}\n")
+        sys.stderr.flush()
+
+    def _wants_html(self):
+        return "text/html" in (self.headers.get("Accept") or "")
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/health":
+            self._json(200, {"ok": True}); self._done(200); return
+        m = ROUTE_RE.match(path)
+        try:
+            if not m or m.group(2) != "status":
+                raise ApiError(404, "not found")
+            status, out = self.server.api.status(m.group(1))
+        except ApiError as e:
+            self._json(e.status, {"ok": False, "error": e.msg, **e.extra}); self._done(e.status); return
+        if self._wants_html():
+            self._send(status, status_html(out), "text/html; charset=utf-8")
+        else:
+            self._json(status, out)
+        self._done(status)
+
+    def _fields(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ApiError(400, "bad content-length")
+        if n > MAX_BODY:
+            raise ApiError(413, "body too large")
+        raw = self.rfile.read(n) if n else b""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype == "application/x-www-form-urlencoded" or (not ctype and not raw):
+            q = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+            return {k: v[0] for k, v in q.items()}, True
+        if ctype == "application/json":
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ApiError(400, "bad JSON")
+            if not isinstance(obj, dict):
+                raise ApiError(400, "JSON body must be an object")
+            return obj, False
+        raise ApiError(415, "send application/json or application/x-www-form-urlencoded")
+
+    def do_POST(self):
+        is_form = False
+        try:
+            m = ROUTE_RE.match(self.path.split("?")[0])
+            if not m or m.group(2) != "run":
+                raise ApiError(404, "not found")
+            fields, is_form = self._fields()
+            hdr = (self.headers.get("Tailscale-User-Login") or "").strip()
+            by = clean_by(hdr or fields.get("by"))
+            status, out = self.server.api.run(m.group(1), by, bool(hdr))
+        except ApiError as e:
+            if is_form:
+                page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
+                        f"<title>Not queued</title></head><body><p>Not queued: {esc(e.msg)}.</p><p>Go back to the overview.</p></body></html>")
+                self._send(e.status, page, "text/html; charset=utf-8")
+            else:
+                self._json(e.status, {"ok": False, "error": e.msg, **e.extra})
+            self._done(e.status); return
+        if is_form:
+            row = out["run"]
+            page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
+                    f"<title>Queued</title></head><body><p>Queued: a delta run of the loop for {esc(row['ns'])}, requested by "
+                    f"{esc(row['by'])} at {esc(row['requested_at'])}. The home server starts it within a few minutes; a run takes about "
+                    "1 to 3 hours. The note appears on the overview within about ten minutes of finishing and the owner gets one DM. "
+                    f'<a href="status">Status</a>. Go back to the overview.</p><p><small>{FOOT}</small></p></body></html>')
+            self._send(status, page, "text/html; charset=utf-8")
+        else:
+            self._json(status, out)
+        self._done(status)
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, api):
+        super().__init__(addr, Handler)
+        self.api = api
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--records", required=True, help="records clone (records.yaml names the namespaces; may appear later)")
+    ap.add_argument("--state", required=True, help="state directory shared with tools/dx/run")
+    ap.add_argument("--bind", required=True)
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--site", default=None, help="health site base URL, for links back (e.g. https://host/health)")
+    ap.add_argument("--allow", action="append", default=[], help="tailnet login allowed to start a run (repeatable; default: anyone on the tailnet)")
+    ap.add_argument("--cap-24h", type=int, default=dxstate.CAP_24H)
+    ap.add_argument("--cap-30d", type=int, default=dxstate.CAP_30D)
+    ap.add_argument("--cap-scope", choices=("global", "ns"), default="global")
+    a = ap.parse_args(argv)
+    api = Api(a.records, a.state, a.site, a.allow, a.cap_24h, a.cap_30d, a.cap_scope)
+    srv = Server((a.bind, a.port), api)
+    sys.stderr.write(f"dx-api listening on {srv.server_address[0]}:{srv.server_address[1]} (caps {a.cap_24h}/24h, {a.cap_30d}/30d, {a.cap_scope})\n")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

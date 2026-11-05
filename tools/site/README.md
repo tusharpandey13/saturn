@@ -14,3 +14,12 @@ appends the `data/telegram/listened.ndjson` line, "save" also writes `<stem>.gro
 "saturn voice-review" and pushes. `by` comes from the `Tailscale-User-Login` header when `tailscale serve` fronts the
 endpoint, else from the form. Without `--voice-api` the pages are read-only. Tests: `python3 -I tools/site/test_site.py`
 and `python3 -I tools/site/test_voice_api.py` on `fixtures/records-example` (synthetic voice notes `u-voice-ex1/2`).
+
+`--dx-api URL` adds an "Agent run" block to each person's overview: a status line linking the newest loop note
+(`docs/log/analysis/<date>-<ns>-dx-loop-<NN>.md`, rendered under `notes/`; "No loop run yet." when none), the
+"Run the loop (delta)" button and a "Status of the last run" link. The button posts a plain form to `tools/site/dx-api`
+(`POST /dx/<ns>/run`, `GET /dx/<ns>/status`), which only queues a request; a host timer runs `tools/dx/run` (the
+diagnostic loop, ADR 013) in its own records clone and reports to the admin DM. The caps, 1 run per 24 h and 8 per
+30 days, are enforced by the endpoint, not the page. The overview's CSP `form-action` is widened to that origin only.
+Without the flag the overview is read-only (status line plus "Read-only build: no run endpoint."). Defaults, caps,
+tool restrictions and the verifier: [tools/dx/README.md](../dx/README.md). Tests: `python3 -I tools/site/test_dx_api.py`.

@@ -1,0 +1,538 @@
+#!/usr/bin/env -S python3 -I
+"""Run the loop (T-01): one bounded, unattended diagnostic-loop DELTA run, started from the site, run by a host timer.
+
+Usage: tools/dx/run --records DIR --product DIR --state DIR [--ns NS] [--dry-run] [--claude BIN] [--claude-env FILE]
+                    [--notify-env FILE] [--telegram-api URL] [--site URL] [--budget-usd 12] [--wall-clock-s 10800]
+                    [--model M] [--no-push] [--by WHO]
+
+Without --ns the oldest spool file in <state>/spool is taken (exit 0 and nothing else when the spool is empty); with
+--ns a run is made directly (a manual or dry run). One run:
+ 1. preflight: records clone clean, namespace known, the records AGENTS.md says interpretation is allowed, pull --rebase;
+ 2. evidence pack (docs/methods/diagnostic-loop-run-prompt.md step 1) written to <state>/runs/<id>/pack.md, never
+    committed; plus "changed since the last run note" from git;
+ 3. the run prompt (the fenced block of diagnostic-loop-run-prompt.md with RUN = delta, NS, PRODUCT filled in), the
+    headless adaptations below, and the records AGENTS.md and docs/health/family/context.md verbatim, to
+    <state>/runs/<id>/prompt.md; --dry-run stops here after the validators (nothing is called, nothing committed);
+ 4. `claude -p` from stdin with --restricted, --permission-mode dontAsk, --tools Read,Grep,Glob,Edit,Write,Bash,Agent,
+    WebFetch and --allowedTools limited to Read/Grep/Glob/Edit/Write/Agent, Bash(python3 -I *), Bash(git diff|status|
+    log *), Bash(gitleaks *) and WebFetch on the method's literature hosts only (LITERATURE_DOMAINS; WebSearch
+    disallowed), --max-budget-usd, --add-dir PRODUCT, a wall clock (killed after it), and an environment holding only
+    PATH, HOME, LANG and CLAUDE_CODE_OAUTH_TOKEN from --claude-env (no git credential, no bot token);
+ 5. verifier: changed paths within ALLOWED_PATHS; the run note exists with the footer line; no medicine-change advice
+    in the agent's voice on any added line (ADVICE_RE, outside question lines and quotes); tools/kb/build,
+    gen-views --check, test_gen.py, tools/inference gen --check, gitleaks on every changed file. Any failure: the
+    outputs are stashed (`git stash` named after the run), the state says failed, a short DM goes out;
+ 6. commit "docs: <ns> dx loop NN (delta, site trigger) [skip ci]" as "saturn dx-loop" (signing follows the clone's
+    git config, as tools/site/voice-api), push origin main (pull --rebase and retry once); a refused remote leaves the
+    commit local and the state "awaiting-key";
+ 7. a 10-line result to the admin's private DM (TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID from --notify-env; a
+    group chat id is refused), and the state row (note, commit, pushed, cost, turns).
+Exit: 0 done or nothing to do; 1 failed; 2 usage/preflight; 3 committed locally, push refused (awaiting key).
+Facts as written; not advice; doctors decide: the prompt forbids medicine advice and the verifier refuses it.
+"""
+import argparse, datetime, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[1] / "tools" / "kb"))
+import dxstate  # noqa: E402
+import records_config  # noqa: E402
+
+FOOT = "Facts as written; not advice; doctors decide."
+RUN_PROMPT = pathlib.Path("docs/methods/diagnostic-loop-run-prompt.md")
+MODE_RE = re.compile(r"interpretation (?:is )?allowed", re.I)
+NOTE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(?P<ns>[a-z][a-z0-9-]*)-dx-loop-(?P<n>\d+)\.md$")
+GIT_IDENT = ["-c", "user.name=saturn dx-loop", "-c", "user.email=dx-loop@saturn.invalid"]
+# Where a run may write (records-relative). docs/health/*/status.md: written by tools/inference gen for every namespace.
+ALLOWED_PATHS = (r"^docs/log/analysis/(dx/)?[^/]+$", r"^inferences/{ns}/[^/]+$",
+                 r"^docs/health/{ns}/(summary|questions)\.md$", r"^docs/health/[a-z][a-z0-9-]*/status\.md$",
+                 r"^docs/health/family/actions\.md$")
+# Literature hosts the method allows (docs/methods/research-crossref.md §4 and the diagnostic-loop verifier row):
+# PubMed and E-utilities, PMC, Europe PMC, DOI resolution, DailyMed and openFDA labels, arXiv (the MAI-DxO preprint).
+LITERATURE_DOMAINS = ("pubmed.ncbi.nlm.nih.gov", "eutils.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov", "www.ebi.ac.uk",
+                      "europepmc.org", "doi.org", "dailymed.nlm.nih.gov", "api.fda.gov", "arxiv.org")
+ALLOWED_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write", "Agent", "Bash(python3 -I *)", "Bash(git diff*)", "Bash(git status*)",
+                 "Bash(git log*)", "Bash(gitleaks *)") + tuple(f"WebFetch(domain:{d})" for d in LITERATURE_DOMAINS)
+TOOLS = "Read,Grep,Glob,Edit,Write,Bash,Agent,WebFetch"
+# Medicine-change advice and verdicts in the agent's voice (run prompt step 9; usability review §Triggers post-check).
+# Base and -ing forms only: "stopped X" records an event; "stop X" / "stopping X would" advises. QUESTION_RE exempts the
+# question lines the method allows, quotes, and the standing disclaimer ("never suggest ... stopping ...").
+ADVICE_RE = re.compile(
+    r"\byou should\b|\bsafe to\b|\brules? out\b|\bconfirms\b|\bcaused by\b|\bnothing to worry about\b"
+    r"|\b(?:stop(?:s|ping)?|start(?:s|ing)?|reduc(?:e|es|ing)|increas(?:e|es|ing)|doubl(?:e|es|ing)|halv(?:e|es|ing)|switch(?:es|ing)?"
+    r"|taper(?:s|ing)?|discontinu(?:e|es|ing)|hold(?:s|ing)?|skip(?:s|ping)?|restart(?:s|ing)?)\b"
+    r"(?:\s+\S+){0,4}?\s+(?:the\s+|her\s+|his\s+)?(?:dose|dosage|dosing|tablets?|medicines?|medications?|\d+(?:\.\d+)?\s*mg\b)", re.I)
+QUESTION_RE = re.compile(r"\?\s*$|\bask\b|\bquestion\b|\bnever\b|\bnot advice\b|\bno medicine (?:advice|instructions?)\b|\bfor (?:dr|the doctor|the (?:cardio|neuro|nephro|physician))|\bwould it help\b", re.I)
+PACK = (("1 age band and sex", ["docs/health/{ns}/profile.md"]),
+        ("2 doctor-written problems", ["docs/health/{ns}/problems.md"]),
+        ("3 medicines as recorded", ["docs/health/{ns}/medications.md"]),
+        ("4 timeline and symptom episodes", ["docs/health/{ns}/timeline.md"]),
+        ("5 lab and vital trends", ["docs/health/{ns}/labs.md"]),
+        ("6 imaging, ECG, echo (see the timeline and sources)", []),
+        ("7 family- and patient-reported items", ["docs/log/extraction/patient-reported/"]),
+        ("8 open hard reads and conflicts", ["docs/log/hard-reads/", "docs/health/{ns}/data-quality.md"]),
+        ("9 crossref flags and claims", ["docs/health/{ns}/flags.md", "docs/health/{ns}/claims.md"]),
+        ("10 earlier analyses (leads; re-verify)", ["docs/log/analysis/"]),
+        ("11 open questions", ["docs/health/{ns}/questions.md"]))
+PACK_MAX = 400_000  # bytes per file quoted in full; longer files are listed for the agent to read itself
+
+
+class Fail(Exception):
+    pass
+
+
+def log(msg):
+    sys.stderr.write(f"dx: {msg}\n"); sys.stderr.flush()
+
+
+def dotenv(path):
+    out = {}
+    if not path:
+        return out
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def git(root, *args, check=True, env=None):
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=check, env=env)
+
+
+def changed_paths(root):
+    out = git(root, "-c", "core.quotePath=false", "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+    return sorted({e[3:] for e in out.split("\0") if e})
+
+
+def allowed(path, ns):
+    return any(re.match(p.format(ns=ns), path) for p in ALLOWED_PATHS)
+
+
+def advice_hits(text):
+    """-> [(line_no, line)] of added lines (or plain lines) in the agent's voice matching ADVICE_RE."""
+    hits = []
+    for i, raw in enumerate(text.splitlines(), 1):
+        line = raw[1:] if raw.startswith("+") else raw
+        s = line.strip()
+        if not s or s.startswith(("+++", "---", ">", "|---")) or QUESTION_RE.search(s):
+            continue
+        if ADVICE_RE.search(s):
+            hits.append((i, s[:160]))
+    return hits
+
+
+def run_number(root, ns):
+    best, last = 0, None
+    for p in sorted((root / "docs" / "log" / "analysis").glob(f"*-{ns}-dx-loop-*.md")):
+        m = NOTE_RE.match(p.name)
+        if m and int(m.group("n")) >= best:
+            best, last = int(m.group("n")), p
+    return best + 1, last
+
+
+def extract_prompt(product):
+    text = (product / RUN_PROMPT).read_text(encoding="utf-8")
+    m = re.search(r"```text\n(.*?)\n```", text, re.S)
+    if not m:
+        raise Fail(f"no fenced prompt in {RUN_PROMPT}")
+    return m.group(1)
+
+
+def fill_prompt(template, ns, product, run_n, trigger):
+    out = []
+    for line in template.splitlines():
+        if line.startswith("RUN ="):
+            line = f"RUN = delta, trigger = {trigger}"
+        elif line.startswith("NS ="):
+            line = f"NS = {ns}"
+        elif line.startswith("PRODUCT ="):
+            line = f"PRODUCT = {product}"
+        out.append(line)
+    return "\n".join(out)
+
+
+def headless_block(ns, run_n, note_rel, pack_path, by, requested_at, budget, wall_s, rounds=2):
+    paths = "\n".join(f"  - {p.format(ns=ns)}" for p in ALLOWED_PATHS)
+    hosts = ", ".join(LITERATURE_DOMAINS)
+    return f"""
+HEADLESS RUN (tools/dx/run, T-01). Read this before step 1.
+- Nobody is watching. This run was started from the health site by {by} at {requested_at}. Never stop to ask a
+  question; make the conservative choice, write it down in section 9 of the run note, and continue.
+- This is run {run_n:02d} for {ns}. Write the run note at {note_rel} (step 8a). Hard cap {rounds} rounds, no ENSEMBLE.
+- Budget: about {budget:.0f} USD API-equivalent and {wall_s // 60} minutes of wall clock; the job kills the run after
+  that, so write the run note early (after step 6) and refine it, rather than at the end.
+- The evidence pack of step 1 is prepared at {pack_path} (sections 1-11 and "changed since the last run note");
+  read it first and re-read a cited source whenever an exact value matters. Do not rebuild it.
+- Write only under these paths (anything else fails the run and nothing is committed):
+{paths}
+  Do not write briefs (step 8e) in this run: list in section 6 which specialty would need a packet. Do not touch
+  data/ or sources/. Do not run git add, commit or push: the job verifies and commits.
+- Step 9, "show me": instead, end the run note with a section "## 10. Hand-back summary" holding, in this order and in
+  plain lines: red flags (or "none"), the ledger (one line per problem), the top 2-3 hypotheses per problem with
+  buckets, the belief diff in one line (moved / new / superseded / retired counts), the questions to the family, the
+  5 next steps, the caretaker actions, the paths written, rounds, ensemble no, cost. The job's checks (word list,
+  kb build, gen-views, inference gen --check, gitleaks) run after you finish and refuse the commit on any hit.
+- Tools: files only inside this repo and PRODUCT. Web only through WebFetch on {hosts}; WebSearch is off. Literature
+  queries carry generic terms only.
+- Medicine start, stop or dose change is never suggested, not even softly; such points become a question for the
+  named doctor, phrased as a question.
+"""
+
+
+def build_pack(root, product, ns, run_n, last_note, out_path):
+    parts = [f"# Evidence pack: {ns}, run {run_n:02d} (prepared by tools/dx/run, not committed)", "",
+             FOOT, "", "Documents are the source of truth; every earlier analysis below is a lead to re-verify.", ""]
+    for title, rels in PACK:
+        parts.append(f"## {title}")
+        for rel in rels:
+            p = root / rel.format(ns=ns)
+            if p.is_dir():
+                files = sorted(x for x in p.rglob("*") if x.is_file() and (ns in x.name or "family" in x.name or rel.endswith("hard-reads/")))
+                parts.append(f"Directory {rel.format(ns=ns)}: {len(files)} file(s) naming this namespace" + (":" if files else "."))
+                parts += [f"  - {x.relative_to(root).as_posix()}" for x in files[:200]]
+            elif p.is_file():
+                data = p.read_bytes()
+                if len(data) > PACK_MAX:
+                    parts.append(f"File {p.relative_to(root).as_posix()} ({len(data)} bytes): too long to quote; read it.")
+                else:
+                    parts += [f"### {p.relative_to(root).as_posix()}", "", data.decode("utf-8", "replace").rstrip(), ""]
+            else:
+                parts.append(f"(no {rel.format(ns=ns)})")
+        parts.append("")
+    r = subprocess.run([sys.executable, "-I", str(product / "tools" / "inference" / "inference"), "--records", str(root),
+                        "list", ns, "--active", "--json"], capture_output=True, text=True)
+    parts += ["## 10b active inference records (previous beliefs; keep ids stable)", "", r.stdout.strip() or "(none)", ""]
+    parts.append("## 12 changed since the last run note")
+    if last_note is None:
+        parts.append("No earlier run note for this namespace: treat this as the first delta after a manual loop-0, or as loop-0.")
+    else:
+        since = git(root, "log", "-1", "--format=%H %cI", "--", str(last_note.relative_to(root))).stdout.strip()
+        commit = since.split(" ")[0] if since else None
+        parts.append(f"Last run note: {last_note.relative_to(root).as_posix()} (committed {since or 'unknown'})")
+        if commit:
+            scope = ["--", f"data/{ns}", f"docs/health/{ns}", f"sources/{ns}", "data/telegram", f"inferences/{ns}",
+                     "docs/health/family", "docs/log/extraction", "docs/log/hard-reads"]
+            parts += ["", "```", git(root, "log", "--format=%h %cs %s", f"{commit}..HEAD", *scope, check=False).stdout.strip() or "(no commits)",
+                      "```", "", "```", git(root, "diff", "--stat=120", f"{commit}..HEAD", *scope, check=False).stdout.strip() or "(no file changes)", "```"]
+    parts.append("")
+    out_path.write_text("\n".join(parts), encoding="utf-8")
+    return out_path
+
+
+def claude_argv(bin_, budget, product, model=None):
+    argv = [bin_, "-p", "--output-format", "json", "--no-session-persistence", "--restricted", "--permission-mode", "dontAsk",
+            "--tools", TOOLS, "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", "WebSearch",
+            "--max-budget-usd", f"{budget:g}", "--add-dir", str(product), "--setting-sources", ""]
+    if model:
+        argv += ["--model", model]
+    return argv
+
+
+def child_env(claude_env):
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
+    env.update({"DISABLE_TELEMETRY": "1", "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "DISABLE_ERROR_REPORTING": "1"})
+    tok = dotenv(claude_env).get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if tok:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    return env
+
+
+def tele_send(notify_env, text, api="https://api.telegram.org"):
+    """-> True when the DM went out. Refuses group chats (negative ids). Never raises."""
+    cfg = dotenv(notify_env)
+    token, chat = cfg.get("TELEGRAM_BOT_TOKEN"), cfg.get("TELEGRAM_ADMIN_CHAT_ID")
+    if not token or not chat:
+        log("no DM: TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_CHAT_ID not set"); return False
+    if not re.fullmatch(r"\d+", chat):
+        log("no DM: TELEGRAM_ADMIN_CHAT_ID is not a private chat id"); return False
+    body = json.dumps({"chat_id": int(chat), "text": text, "disable_web_page_preview": True}).encode()
+    req = urllib.request.Request(f"{api}/bot{token}/sendMessage", data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except Exception as e:  # noqa: BLE001 (a failed DM must not fail the run)
+        log(f"DM failed: {type(e).__name__}"); return False
+
+
+def section(text, head_re):
+    m = re.search(rf"^## {head_re}[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    return m.group(1).strip() if m else ""
+
+
+def first_line(s, n=140):
+    for line in s.splitlines():
+        t = line.strip(" -*|#")
+        if t and not t.startswith("Facts as written"):
+            return (t[: n - 1] + "…") if len(t) > n else t
+    return "none stated"
+
+
+def summary_lines(ns, run_n, state, note_text, diff_text, row, site):
+    ids = lambda cls: len(set(re.findall(rf"\b{ns}:{cls}:\d{{4}}", diff_text)))  # noqa: E731
+    new_q = len(set(re.findall(rf"^\+.*\b({ns}:q:\d{{4}})", diff_text, re.M)))
+    new_act = len(set(re.findall(r"^\+.*\b(family:act:\d{4})", diff_text, re.M)))
+    moved = len(re.findall(r"^\|\s*" + ns + r":inf:\d{4}", section(note_text, r"7"), re.M))
+    link = f"{site}/{ns}/overview.html" if site else (row.get("note") or "")
+    pushed = "pushed" if row.get("pushed") else ("committed locally, push awaits the deploy key" if state == "awaiting-key" else "not pushed")
+    mins = None
+    if row.get("started_at") and row.get("finished_at"):
+        mins = int((dxstate.parse(row["finished_at"]) - dxstate.parse(row["started_at"])).total_seconds() // 60)
+    lines = [f"dx loop {run_n:02d} · {ns} · {state} (delta, site trigger by {row.get('by')})",
+             f"note: {link}",
+             f"red flags: {first_line(section(note_text, '0'))}",
+             f"beliefs: {moved} row(s) in the belief diff; {ids('inf')} inference id(s) named",
+             f"questions +{new_q} · family actions +{new_act}",
+             f"next step: {first_line(section(note_text, '6'))}",
+             f"family: {first_line(section(note_text, 'F'))}",
+             f"cost ${row.get('cost_usd') or 0:.2f} · {row.get('turns') or '?'} turns · {mins if mins is not None else '?'} min",
+             f"commit {(row.get('commit') or '-')[:10]} {pushed}" + (f" · error: {row['error']}" if row.get("error") else ""),
+             FOOT]
+    return "\n".join(lines[:10])
+
+
+class Job:
+    def __init__(self, a, row):
+        self.a, self.row = a, row
+        self.root = pathlib.Path(a.records).resolve()
+        self.product = pathlib.Path(a.product).resolve()
+        self.state = dxstate.State(a.state)
+        self.ns = row["ns"]
+        self.dir = self.state.root / "runs" / row["id"]
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.today = datetime.datetime.now(dxstate.IST).date()
+
+    def py(self, *args, timeout=1800):
+        return subprocess.run([sys.executable, "-I", *map(str, args)], capture_output=True, text=True, timeout=timeout)
+
+    def tool(self, rel):
+        return self.product / rel
+
+    def set(self, **f):
+        if not self.a.dry_run:
+            self.state.update(self.row["id"], **f)
+        self.row.update(f)
+
+    # ---- steps
+    def preflight(self):
+        rc = records_config.load(self.root)
+        if self.ns not in rc["persons"]:
+            raise Fail(f"namespace {self.ns} is not a person in records.yaml")
+        agents = self.root / "AGENTS.md"
+        if not agents.is_file() or not MODE_RE.search(agents.read_text(encoding="utf-8")):
+            raise Fail("the records AGENTS.md does not say interpretation is allowed (ADR 013 §3); the loop stays off")
+        if not (self.product / RUN_PROMPT).is_file():
+            raise Fail(f"no {RUN_PROMPT} in the product checkout")
+        if changed_paths(self.root):
+            raise Fail("records clone is not clean (a failed run left changes? see git stash list)")
+        if not self.a.no_push and not self.a.dry_run:
+            r = git(self.root, "pull", "--rebase", "--quiet", "origin", "main", check=False)
+            if r.returncode:
+                raise Fail("git pull --rebase failed: " + (r.stderr.strip().splitlines() or ["?"])[-1][:200])
+
+    def prepare(self):
+        run_n, last = run_number(self.root, self.ns)
+        self.run_n = run_n
+        self.note_rel = f"docs/log/analysis/{self.today.isoformat()}-{self.ns}-dx-loop-{run_n:02d}.md"
+        r = self.py(self.tool("tools/kb/build"), "--records", self.root)
+        if r.returncode:
+            raise Fail("kb build failed before the run: " + (r.stderr or r.stdout)[-300:])
+        pack = build_pack(self.root, self.product, self.ns, run_n, last, self.dir / "pack.md")
+        trigger = (f'"Run the loop" pressed on the site by {self.row["by"]} at {self.row["requested_at"]}; '
+                   f"new data since {last.name if last else 'the start of the records'}")
+        prompt = fill_prompt(extract_prompt(self.product), self.ns, self.product, run_n, trigger)
+        prompt += "\n" + headless_block(self.ns, run_n, self.note_rel, pack, self.row["by"], self.row["requested_at"],
+                                         self.a.budget_usd, self.a.wall_clock_s)
+        for title, rel in (("Rules of this records repo (AGENTS.md, verbatim)", "AGENTS.md"),
+                           ("Family context and constraints (docs/health/family/context.md, verbatim)", "docs/health/family/context.md")):
+            p = self.root / rel
+            prompt += f"\n\n## {title}\n\n" + (p.read_text(encoding="utf-8") if p.is_file() else f"(no {rel} in this records repo)")
+        (self.dir / "prompt.md").write_text(prompt, encoding="utf-8")
+        return prompt
+
+    def call_claude(self, prompt):
+        argv = claude_argv(self.a.claude, self.a.budget_usd, self.product, self.a.model)
+        (self.dir / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
+        env = child_env(self.a.claude_env)
+        t0 = time.monotonic()
+        with open(self.dir / "prompt.md", "rb") as fin, open(self.dir / "claude.json", "wb") as fout, open(self.dir / "claude.err", "wb") as ferr:
+            proc = subprocess.Popen(argv, cwd=str(self.root), stdin=fin, stdout=fout, stderr=ferr, env=env, start_new_session=True)
+            try:
+                proc.wait(timeout=self.a.wall_clock_s)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL); proc.wait()
+                self.timed_out = True
+        self.elapsed = int(time.monotonic() - t0)
+        out = {}
+        try:
+            out = json.loads((self.dir / "claude.json").read_text(encoding="utf-8") or "{}")
+        except json.JSONDecodeError:
+            pass
+        self.set(cost_usd=out.get("total_cost_usd"), turns=out.get("num_turns"))
+        if getattr(self, "timed_out", False):
+            raise Fail(f"wall clock of {self.a.wall_clock_s} s exceeded; outputs checked anyway")
+        if proc.returncode or out.get("is_error"):
+            raise Fail(f"claude exited {proc.returncode} ({str(out.get('subtype') or out.get('result') or '')[:120]})")
+
+    def verify(self, after_run=True):
+        """Raises Fail on the first blocking problem; returns the diff text of the changed files."""
+        changed = changed_paths(self.root)
+        bad = [p for p in changed if not allowed(p, self.ns)]
+        if bad:
+            raise Fail("changes outside the allowed paths: " + ", ".join(bad[:5]))
+        note = self.root / self.note_rel
+        if after_run:
+            if not note.is_file():
+                raise Fail(f"run note {self.note_rel} was not written")
+            text = note.read_text(encoding="utf-8")
+            if FOOT not in text:
+                raise Fail("run note lacks the footer line")
+        git(self.root, "add", "-A")
+        diff = git(self.root, "diff", "--cached", "--unified=0", "--no-color").stdout
+        hits = advice_hits("\n".join(l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")))
+        if hits:
+            raise Fail("medicine advice or a verdict in the agent's voice: " + "; ".join(f"{l}" for _, l in hits[:3]))
+        checks = (("kb build", [self.tool("tools/kb/build"), "--records", self.root]),
+                  ("gen-views --check", [self.tool("tools/kb/gen-views"), "--records", self.root, "--check"]),
+                  ("test_gen", [self.tool("tools/kb/test_gen.py"), "--records", self.root]),
+                  ("inference gen --check", [self.tool("tools/inference/inference"), "--records", self.root, "gen", "--check"]))
+        for name, argv in checks:
+            r = self.py(*argv)
+            if r.returncode:
+                raise Fail(f"{name} failed: " + (r.stderr or r.stdout).strip()[-300:])
+        gl = shutil.which("gitleaks")
+        if not gl:
+            raise Fail("gitleaks is not installed")
+        cfg = self.root / ".gitleaks.toml"
+        for p in changed:
+            if not (self.root / p).is_file():
+                continue
+            argv = [gl, "dir", str(self.root / p), "--no-banner", "--redact", "--exit-code", "1"] + (["-c", str(cfg)] if cfg.is_file() else [])
+            r = subprocess.run(argv, capture_output=True, text=True, cwd=str(self.root))
+            if r.returncode:
+                raise Fail(f"gitleaks: {p}")
+        return diff
+
+    def commit_push(self):
+        msg = f"docs: {self.ns} dx loop {self.run_n:02d} (delta, site trigger) [skip ci]"
+        git(self.root, *GIT_IDENT, "commit", "--quiet", "-m", msg)
+        commit = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        self.set(commit=commit, note=self.note_rel)
+        if self.a.no_push:
+            return "done"
+        r = git(self.root, "ls-remote", "--exit-code", "--heads", "origin", "main", check=False)
+        if r.returncode:
+            return "awaiting-key"
+        r = git(self.root, "push", "--quiet", "origin", "HEAD:main", check=False)
+        if r.returncode:
+            git(self.root, "pull", "--rebase", "--quiet", "origin", "main", check=False)
+            r = git(self.root, "push", "--quiet", "origin", "HEAD:main", check=False)
+        if r.returncode:
+            self.set(commit=git(self.root, "rev-parse", "HEAD").stdout.strip(), error="push failed; commit kept locally")
+            return "awaiting-key"
+        self.set(pushed=True, commit=git(self.root, "rev-parse", "HEAD").stdout.strip())
+        return "done"
+
+    def stash(self, why):
+        if changed_paths(self.root):
+            git(self.root, "stash", "push", "--include-untracked", "--quiet", "-m", f"dx {self.row['id']} failed: {why[:80]}", check=False)
+
+    def notify(self, state, diff=""):
+        note = self.root / getattr(self, "note_rel", "")
+        text = ""
+        if note.is_file():
+            text = note.read_text(encoding="utf-8")
+        elif self.row.get("commit"):
+            text = git(self.root, "show", f"{self.row['commit']}:{self.note_rel}", check=False).stdout
+        msg = summary_lines(self.ns, getattr(self, "run_n", 0), state, text, diff, self.row, self.a.site)
+        (self.dir / "dm.txt").write_text(msg + "\n", encoding="utf-8")
+        if self.a.notify_env:
+            tele_send(self.a.notify_env, msg, self.a.telegram_api)
+        return msg
+
+    def execute(self):
+        try:
+            self.preflight()
+            prompt = self.prepare()
+        except (Fail, records_config.RecordsError) as e:
+            log(f"preflight: {e}")
+            self.set(state="failed", finished_at=dxstate.iso(dxstate.utcnow()), error=f"preflight: {e}"[:300])
+            if not self.a.dry_run:
+                self.notify("failed")
+            return 2
+        if self.a.dry_run:
+            try:
+                self.verify(after_run=False)
+                git(self.root, "reset", "--quiet")
+            except Fail as e:
+                log(f"dry run: validators failed: {e}"); return 1
+            print(f"dry run ok: {self.ns} run {self.run_n:02d}; prompt {len(prompt)} chars -> {self.dir / 'prompt.md'}; "
+                  f"pack {os.path.getsize(self.dir / 'pack.md')} bytes; note would be {self.note_rel}; validators pass")
+            print("claude argv: " + " ".join(claude_argv(self.a.claude, self.a.budget_usd, self.product, self.a.model)))
+            return 0
+        state, diff = "done", ""
+        try:
+            self.call_claude(prompt)
+            diff = self.verify()
+        except Fail as e:
+            try:
+                diff = git(self.root, "diff", "--cached", "--unified=0").stdout
+            except subprocess.CalledProcessError:
+                pass
+            git(self.root, "reset", "--quiet", check=False)
+            self.stash(str(e))
+            self.set(state="failed", finished_at=dxstate.iso(dxstate.utcnow()), error=str(e)[:300])
+            log(f"failed: {e}")
+            self.notify("failed", diff)
+            return 1
+        state = self.commit_push()
+        self.set(state=state, finished_at=dxstate.iso(dxstate.utcnow()))
+        self.notify(state, diff)
+        log(f"{state}: {self.note_rel} commit {self.row.get('commit')}")
+        return 0 if state == "done" else 3
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--records", required=True)
+    ap.add_argument("--product", required=True)
+    ap.add_argument("--state", required=True)
+    ap.add_argument("--ns", help="run for this namespace now (no spool); required with --dry-run")
+    ap.add_argument("--by", default="cli", help="who asked (with --ns)")
+    ap.add_argument("--dry-run", action="store_true", help="build the pack and prompt, run the validators, call nothing")
+    ap.add_argument("--claude", default=os.environ.get("CLAUDE_BIN", "claude"))
+    ap.add_argument("--claude-env", default=None, help="dotenv with CLAUDE_CODE_OAUTH_TOKEN (else the environment's)")
+    ap.add_argument("--notify-env", default=None, help="dotenv with TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID")
+    ap.add_argument("--telegram-api", default="https://api.telegram.org")
+    ap.add_argument("--site", default=None, help="health site base URL for the DM link")
+    ap.add_argument("--budget-usd", type=float, default=12.0)
+    ap.add_argument("--wall-clock-s", type=int, default=3 * 3600)
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--no-push", action="store_true")
+    a = ap.parse_args(argv)
+    state = dxstate.State(a.state)
+    if a.ns:
+        now = dxstate.utcnow()
+        row = {"id": dxstate.run_id(a.ns, now), "ns": a.ns, "by": a.by, "requested_at": dxstate.iso(now), "state": "running",
+               "started_at": dxstate.iso(now), "finished_at": None, "note": None, "commit": None, "pushed": False, "error": None,
+               "cost_usd": None, "turns": None, "rounds": None}
+        if not a.dry_run:
+            with state.locked():
+                data = state.load(); data["runs"].append(row); state.save(data)
+    else:
+        if a.dry_run:
+            ap.error("--dry-run needs --ns")
+        row = state.take()
+        if row is None:
+            return 0
+    return Job(a, row).execute()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

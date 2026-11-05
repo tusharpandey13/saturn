@@ -351,6 +351,46 @@ class SiteTest(unittest.TestCase):
             r = run(self.rec, out, "--voice-api", "not-a-url")
             self.assertEqual(r.returncode, 2)
 
+    def test_dx_api_overview(self):
+        ov = self.pages["alice/overview.html"]
+        self.assertIn("<h2>Agent run</h2>", ov)
+        self.assertIn("No loop run yet.", ov)
+        self.assertIn("Read-only build: no run endpoint.", ov)
+        self.assertNotIn("/dx/", ov)
+        self.assertIn("form-action 'none'", ov)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "site"
+            r = run(self.rec, out, "--dx-api", "http://dx.example:8092/")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            ov = (out / "alice/overview.html").read_text(encoding="utf-8")
+            self.assertIn('<form method="post" action="http://dx.example:8092/dx/alice/run" accept-charset="utf-8"', ov)
+            self.assertIn('<button type="submit">Run the loop (delta)</button>', ov)
+            self.assertIn('<a href="http://dx.example:8092/dx/alice/status">Status of the last run</a>', ov)
+            self.assertIn("1 run per 24 h and 8 per 30 days", ov)
+            self.assertIn("form-action http://dx.example:8092\"", ov)
+            self.assertNotIn("Read-only build", ov)
+            self.assertNotIn("<script", ov.lower())
+            bob = (out / "bob/overview.html").read_text(encoding="utf-8")
+            self.assertIn("/dx/bob/run", bob)
+            # the newest loop note for this person becomes the status line and is rendered
+            note = self.rec / "docs/log/analysis/2026-06-22-alice-dx-loop-01.md"
+            note.write_text("---\ntitle: Alice: dx loop run 01\n---\n\n# Alice: dx loop run 01\n\nSynthetic run note.\n\n"
+                            "Nothing new since the last run.\n\nFacts as written; not advice; doctors decide.\n",
+                            encoding="utf-8")
+            try:
+                r = run(self.rec, out, "--dx-api", "http://dx.example:8092")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                ov = (out / "alice/overview.html").read_text(encoding="utf-8")
+                self.assertRegex(ov, r'<a href="\.\./notes/[^"]+dx-loop-01\.html">Last loop note: 22-Jun-2026 · run 01</a>')
+                self.assertNotIn("No loop run yet", ov)
+                self.assertTrue(list((out / "notes").glob("*dx-loop-01.html")))
+                self.assertIn("No loop run yet.", (out / "bob/overview.html").read_text(encoding="utf-8"))
+            finally:
+                note.unlink()
+            r = run(self.rec, out, "--dx-api", "not-a-url")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("--dx-api must be an absolute http(s) URL", r.stderr)
+
     def test_output_guard(self):
         r = run(self.rec, PRODUCT / "tools" / "site" / "out-test")
         self.assertEqual(r.returncode, 2)

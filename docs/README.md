@@ -13,6 +13,7 @@ This repo is the **product**: code, schema, templates, generic runbooks and synt
 | Why it is built this way | [decisions/](decisions/README.md) |
 | How agents cross-reference records with the literature | [methods/research-crossref.md](methods/research-crossref.md) |
 | How agents reason on open, unexplained problems (diagnostic loop, proposed) | [methods/diagnostic-loop.md](methods/diagnostic-loop.md) |
+| How a loop run is started from the site without a session (T-01) | [methods/diagnostic-loop-trigger.md](methods/diagnostic-loop-trigger.md), [tools/dx/README.md](../tools/dx/README.md) |
 | The research behind the decisions | [research/](research/README.md) |
 | Page templates and doc governance | [meta/](meta/README.md) |
 | What runs where in an environment (service catalog format, llms.txt, Gatus checks) | [catalog.md](catalog.md) |
