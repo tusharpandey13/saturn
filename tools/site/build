@@ -35,6 +35,8 @@ _spec = importlib.util.spec_from_loader("gen_views", _loader)
 gv = importlib.util.module_from_spec(_spec)
 _loader.exec_module(gv)  # reuse the KB helpers and queries of the Markdown views (design 10 risk c)
 
+# Device fitness sources (ADR 015) would bury the documents list; their page is docs/health/<ns>/fitness.md.
+NOT_FITNESS = "NOT EXISTS (SELECT 1 FROM json_each(tags) WHERE value = 'fitness')"
 RESERVED_PAGES = {"overview", "status", "medicines", "results", "history", "wiki", "questions", "todos", "documents",
                   "voice", "index", "trend", "doctor", "simple"}
 TABS = [("overview", "Overview"), ("status", "Status"), ("medicines", "Medicines"), ("results", "Results"),
@@ -1294,7 +1296,7 @@ class Builder:
         qs = self.questions[p.ns][0]
         open_q = [q for q in qs if q["open"]]
         todos = [t for t in self.todos if t["open"] and (t["id"].startswith(f"{p.ns}:") or t["id"].startswith("family:"))]
-        n_src = self.kb.q("SELECT count(*) FROM source WHERE ns = ? AND status = 'active'", p.ns)[0][0]
+        n_src = self.kb.q("SELECT count(*) FROM source WHERE ns = ? AND status = 'active' AND " + NOT_FITNESS, p.ns)[0][0]
         out = ['<h1>Wiki</h1><p class="muted small">Everything else, as written: problems, care team, documents, '
                'questions and every records page.</p><div class="list">',
                f'<a href="questions.html"><b>Questions for the doctors</b><div class="small muted">{len(open_q)} open · '
@@ -1570,8 +1572,8 @@ class Builder:
 
     def documents(self, p):
         path = f"{p.ns}/documents.html"
-        rows = self.kb.q("SELECT * FROM source WHERE ns = ? AND status = 'active' "
-                         "ORDER BY coalesce(issued_at, received_at, created_at) DESC, id", p.ns)
+        rows = self.kb.q("SELECT * FROM source WHERE ns = ? AND status = 'active' AND " + NOT_FITNESS +
+                         " ORDER BY coalesce(issued_at, received_at, created_at) DESC, id", p.ns)
         out = ['<p><a class="back" href="wiki.html">‹ Wiki</a></p><h1>Documents</h1>'
                f'<p class="muted small">{len(rows)} sources, newest first. Tap to open the original.</p><div class="list">']
         for s in rows:

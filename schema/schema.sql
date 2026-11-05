@@ -96,6 +96,7 @@ SELECT f.ns, coalesce(rc.current_id, json_extract(f.data, '$.code')) AS code, f.
 FROM fact f JOIN source s ON s.id = f.source_id
 LEFT JOIN v_ref_current rc ON rc.id = json_extract(f.data, '$.code')
 WHERE f.kind = 'observation' AND f.status = 'active'
+  AND json_extract(f.data, '$.category') IS NOT 'fitness'  -- device-reported training data: v_fitness only (ADR 015)
 ORDER BY f.ns, code, f.at;
 
 -- Latest value per ns and code (best source rank wins a same-time tie).
@@ -188,6 +189,17 @@ SELECT ns, at, at_precision, kind, what, label, id, source_id, verification, unc
   WHERE flag IN ('H','L')
      OR code IN ('ref:code:weight','ref:code:bp','ref:code:pulse','ref:code:spo2','ref:code:potassium','ref:code:sodium','ref:code:creatinine'))
 ORDER BY ns, at, kind, id;
+
+-- Device-reported fitness observations (ADR 015; tools/fitness), kept out of the clinical views. canonical = 0: the same
+-- activity recorded by another source (raw kept, source.duplicate_of says which). Metrics: json_extract(components, '$.np_w').
+CREATE VIEW v_fitness AS
+SELECT f.ns, json_extract(f.data, '$.code') AS code, f.at, f.at_precision, json_extract(f.data, '$.value_num') AS value_num,
+       json_extract(f.data, '$.unit') AS unit, json_extract(f.data, '$.value_text') AS value_text,
+       json_extract(f.data, '$.device') AS device, json_extract(f.data, '$.components') AS components,
+       CASE WHEN s.duplicate_of IS NULL THEN 1 ELSE 0 END AS canonical, f.source_id, s.path, f.id, f.tags
+FROM fact f JOIN source s ON s.id = f.source_id
+WHERE f.kind = 'observation' AND f.status = 'active' AND json_extract(f.data, '$.category') = 'fitness'
+ORDER BY f.ns, f.at, f.id;
 
 -- Life-context bands (ADR 010): active context events that a view may show. Shadow rows (context_mode shadow) and
 -- low-confidence rows are never shown. Association only: a view puts them alongside readings, never as a cause.

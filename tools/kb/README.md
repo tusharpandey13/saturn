@@ -89,6 +89,8 @@ were written with; `v_ref_current` maps every ref id to its active successor, an
 `v_conflicts`, `v_timeline`) reports the resolved code (`code_as_written` keeps the original). Suspected but unconfirmed
 identities are not merged: both rows get the tag `possible_same_as:<other id>` and a note.
 
+**Fitness rows (ADR 015).** Written only by `tools/fitness`: `category: fitness`, built-in `ref:code:fitness-*` codes, read through `v_fitness`, never `v_trend`. Page: `docs/health/<ns>/fitness.md`, block `gen:fitness`.
+
 ## Layout (records repo, unless marked product)
 | Path | Holds |
 |---|---|

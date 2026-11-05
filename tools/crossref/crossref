@@ -217,10 +217,12 @@ class KB:
         return self._names.get(ref_id) or ref_id.split(":")[-1]
 
     def fingerprint(self):
-        rows = self.q("SELECT id, created_at FROM fact WHERE status = 'active' ORDER BY id")
+        rows = self.q("SELECT id, created_at FROM fact WHERE status = 'active' AND "
+                      "json_extract(data, '$.category') IS NOT 'fitness' ORDER BY id")  # device data never re-triggers checks
         h = hashlib.sha256("".join(f"{r['id']}|{r['created_at']}\n" for r in rows).encode()).hexdigest()
         asof = self.q("SELECT max(substr(at, 1, 10)) AS m FROM fact WHERE status = 'active' "
-                      "AND json_extract(data, '$.type') IS NOT 'context'")[0]["m"]
+                      "AND json_extract(data, '$.type') IS NOT 'context' "
+                      "AND json_extract(data, '$.category') IS NOT 'fitness'")[0]["m"]
         return h, len(rows), asof
 
 

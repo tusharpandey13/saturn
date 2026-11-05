@@ -18,7 +18,8 @@
     "imaging",
     "ecg",
     "symptom",
-    "exam"
+    "exam",
+    "fitness"
    ]
   },
   "value_num": {

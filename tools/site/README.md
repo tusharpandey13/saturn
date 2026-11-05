@@ -18,6 +18,8 @@ appends the `data/telegram/listened.ndjson` line, "save" also writes `<stem>.gro
 endpoint, else from the form. Without `--voice-api` the pages are read-only. Tests: `python3 -I tools/site/test_site.py`
 and `python3 -I tools/site/test_voice_api.py` on `fixtures/records-example` (synthetic voice notes `u-voice-ex1/2`).
 
+Fitness (ADR 015): `docs/health/<ns>/fitness.md` renders like any page at `<ns>/fitness.html`, linked from the wiki; device sources stay out of the documents list and the results page.
+
 Usability review 05-Nov-2026 (site half): the overview opens with **This week** (the `now` to-dos of that person and the
 first five numbered steps, each with its Tier, of the newest analysis note that has a `## For <someone>:` section, linked
 to that section); statements read from a voice note nobody has marked heard (`listened.ndjson`) render muted as

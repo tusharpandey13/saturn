@@ -9,7 +9,8 @@ Every <records>/docs/health/<ns>/*.md (ns = the namespaces in <records>/records.
 and only the text between the markers is replaced. Text outside the markers is never touched. Blocks:
   timeline (timeline.md), meds-current + meds-history (medications.md), labs (labs.md), quality (data-quality.md),
   glance + asof (summary.md), care-team (care-team.md: credentials, first/last seen, instructions),
-  context (timeline.md: life-context bands, ADR 010; admin-only by convention; shadow rows never shown).
+  context (timeline.md: life-context bands, ADR 010; admin-only by convention; shadow rows never shown),
+  fitness (fitness.md: device-reported training and wearable numbers, ADR 015).
 A block whose content is unchanged apart from its "Generated ... on <date>" line is left as it is, so a second run (or
 a run on a later day with the same data) gives no diff. --check writes nothing and exits 1 if any page would change.
 Python stdlib + sqlite3 only. Record and flag only: the blocks show rows as stored, never a judgement.
@@ -28,7 +29,7 @@ MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 GLANCE_DAYS = 180
 # Life-context events (ADR 010) render only in gen:context; every other block and the header count leave them out, so
 # a shadow row changes no page.
-NOT_CONTEXT = "json_extract(data, '$.type') IS NOT 'context'"
+NOT_CONTEXT = "json_extract(data, '$.type') IS NOT 'context' AND json_extract(data, '$.category') IS NOT 'fitness'"  # fitness: gen:fitness only (ADR 015)
 CONTEXT_HEAD = ("Life-context bands (ADR 010), **admin-only by convention**. Shown alongside, not as a cause. Facts as "
                 "written; not advice; doctors decide.")
 # Association only: generated context text never uses causal phrasing (also checked at extraction).
@@ -627,7 +628,107 @@ def b_care_team(kb, ns):
     return out
 
 
-RENDER = {"care-team": b_care_team, "timeline": b_timeline, "context": b_context, "meds-current": b_meds_current, "meds-history": b_meds_history, "labs": b_labs,
+# ------------------------------------------------------------------------------------------------- fitness (ADR 015)
+FITNESS_WEEKS = 12
+FITNESS_CAVEAT = ("Device-reported, not clinical readings; numbers shown as recorded, derived columns computed from them. Not training or "
+                  "medical advice. **Indoor ERG caveat:** in ERG mode the trainer holds the power target, so NP sits close to average power and "
+                  "TSS, IF and EF describe the prescribed workout rather than free pacing; decoupling then shows heart-rate drift against a fixed "
+                  "target. NP needs at least a minute of samples; TSS needs an FTP (the device's, else `fitness_ftp_w` in `data/meta/gen-views.json`).")
+
+
+def _fit_tss(c, ftp):
+    if isinstance(c.get("tss"), (int, float)):
+        return c["tss"]
+    use = c.get("ftp_w") or ftp
+    if use and c.get("np_w") and c.get("elapsed_s"):
+        return c["elapsed_s"] / 3600 * (c["np_w"] / use) ** 2 * 100
+    return None
+
+
+def _duration(s):
+    return f"{int(s // 3600)}:{int(s % 3600 // 60):02d}"
+
+
+def b_fitness(kb, ns):
+    rows = [(r[0], r[1], json.loads(r[2] or "{}"), r[3], r[4], r[5]) for r in kb.q(
+        "SELECT code, at, components, canonical, id, tags FROM v_fitness WHERE ns = ? ORDER BY at, id", ns)]
+    acts = [r for r in rows if r[0] == "ref:code:fitness-activity"]
+    canon = [r for r in acts if r[3]]
+    if not rows:
+        return ["No fitness rows yet."]
+    origins = {}
+    for r in acts:
+        for t in json.loads(r[5]):
+            if t.startswith("fitness:"):
+                origins[t[8:]] = origins.get(t[8:], 0) + 1
+    out = [f"{len(canon)} activities from {len(acts)} recordings ("
+           + ", ".join(f"{k} {origins[k]}" for k in sorted(origins)) + f"); {len(rows) - len(acts)} day and night rows. "
+           "One activity recorded by several sources counts once; the other copies stay as sources (`duplicate_of`). "
+           "All rows: `SELECT * FROM v_fitness`.", "", FITNESS_CAVEAT, ""]
+    ftp = (CONFIG.get("fitness_ftp_w") or {}).get(ns)
+    weeks = {}
+    for r in canon:
+        d = datetime.date.fromisoformat(r[1][:10])
+        w = weeks.setdefault((d - datetime.timedelta(days=d.weekday())).isoformat(), {"s": 0, "n": 0, "m": 0, "tss": 0, "tssn": 0, "pl": 0, "sports": set()})
+        c = r[2]
+        w["s"] += c.get("elapsed_s") or 0
+        w["m"] += c.get("distance_m") or 0
+        w["n"] += 1
+        w["pl"] += c.get("polar_training_load") or 0
+        w["sports"].add(str(c.get("sport") or "other"))
+        t = _fit_tss(c, ftp)
+        if t is not None:
+            w["tss"] += t
+            w["tssn"] += 1
+    if weeks:
+        out += ["### Weekly volume and load", ""]
+        out += table(["Week from", "Time", "Activities", "Sports", "km", "TSS (rides with it)", "Polar load"],
+                     [[fdate(k), _duration(w["s"]), w["n"], ", ".join(sorted(w["sports"])), f"{w['m'] / 1000:.1f}",
+                       f"{w['tss']:.0f} ({w['tssn']})" if w["tssn"] else "", f"{w['pl']:.0f}" if w["pl"] else ""]
+                      for k, w in sorted(weeks.items(), reverse=True)[:FITNESS_WEEKS]])
+        out.append("")
+    latest = canon[-1][1][:10] if canon else None
+    best, recent = {}, {}
+    cutoff = (datetime.date.fromisoformat(latest) - datetime.timedelta(days=90)).isoformat() if latest else ""
+    for r in canon:
+        for w, v in (r[2].get("power_curve_w") or {}).items():
+            if isinstance(v, (int, float)):
+                if v > best.get(w, (0,))[0]:
+                    best[w] = (v, r[1][:10])
+                if r[1][:10] >= cutoff and v > recent.get(w, (0,))[0]:
+                    recent[w] = (v, r[1][:10])
+    if best:
+        label = lambda w: f"{int(w)} s" if int(w) < 60 else f"{int(w) // 60} min"
+        out += ["### Best-effort power curve", ""]
+        out += table(["Window", "Best (W)", "On", "Last 90 days (W)", "On"],
+                     [[label(w), f"{best[w][0]:.0f}", fdate(best[w][1]), f"{recent[w][0]:.0f}" if w in recent else "",
+                       fdate(recent[w][1]) if w in recent else ""] for w in sorted(best, key=int)])
+        out.append("")
+    eff = [r for r in canon if r[2].get("ef") and (r[2].get("elapsed_s") or 0) >= 1200][-10:]
+    if eff:
+        out += ["### Efficiency factor and decoupling (last 10 with power and heart rate)", ""]
+        out += table(["Date", "Sport", "Time", "Indoor", "NP (W)", "Avg HR", "EF", "Decoupling %", "Fact"],
+                     [[fdate(r[1]), r[2].get("sport"), _duration(r[2]["elapsed_s"]), "yes" if r[2].get("indoor") else "",
+                       r[2].get("np_w"), r[2].get("avg_hr_bpm"), r[2].get("ef"), r[2].get("decoupling_pct", ""), code(r[4])]
+                      for r in reversed(eff)])
+        out.append("")
+    nights = {}
+    for r in rows:
+        if r[0] in ("ref:code:fitness-sleep", "ref:code:fitness-recharge"):
+            nights.setdefault(r[1][:10], {})[r[0]] = r
+    if nights:
+        out += ["### Nights (last 14)", "", "Lowest sleep HR is the lowest stored sample during sleep, shown as a resting heart rate proxy.", ""]
+        body = []
+        for d in sorted(nights, reverse=True)[:14]:
+            sl, re_ = nights[d].get("ref:code:fitness-sleep"), nights[d].get("ref:code:fitness-recharge")
+            s, c = (sl[2] if sl else {}), (re_[2] if re_ else {})
+            body.append([fdate(d), f"{s['sleep_s'] / 3600:.1f}" if s.get("sleep_s") else "", s.get("score", ""), s.get("sleep_hr_min_bpm", ""),
+                         c.get("status", ""), c.get("hrv_avg_ms", ""), c.get("hr_avg_bpm", ""), code((sl or re_)[4])])
+        out += table(["Night", "Sleep h", "Score", "Lowest sleep HR", "Recharge", "HRV ms", "Avg HR", "Fact"], body)
+    return out
+
+
+RENDER = {"fitness": b_fitness, "care-team": b_care_team, "timeline": b_timeline, "context": b_context, "meds-current": b_meds_current, "meds-history": b_meds_history, "labs": b_labs,
           "quality": b_quality, "glance": b_glance, "asof": b_asof}
 
 

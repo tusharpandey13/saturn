@@ -27,6 +27,8 @@ Endpoint: `--endpoint`, else `$SATURN_EMBED_URL`, else `http://127.0.0.1:8095`. 
 | `hard-read` | `docs/log/hard-reads/**/*.md` | as above |
 | `questions` | `docs/health/<ns>/questions.md` | as above; `id` = the first `<ns>:q|ans|act:NNNN` in the chunk |
 
+Fitness rows (`data/<ns>/docs/*-fitness-*.ndjson`, ADR 015) are ordinary `fact` chunks; their raw `.gz` files match no rule.
+
 `ns` comes from the path (`data/<ns>/`, `sources/<ns>/`, `docs/health/<ns>/`, else a namespace token in the file
 name) or the fact row; `--ns X` returns chunks of X plus chunks without a namespace. Curated pages and generated views
 are not indexed: they repeat the KB.
