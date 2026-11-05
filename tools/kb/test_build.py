@@ -379,6 +379,50 @@ class DeviceScreenTest(unittest.TestCase):
                           nh["alice:fact:2026-10-31-tg.-100.21.r0"]), ("needs-human", "needs-human", "alert-input"))
 
 
+class AnswersTest(unittest.TestCase):
+    """data/telegram/answers.ndjson: an admin's replies to numbered digest items; shape and target checked, no facts."""
+    T = "2026-10-30T07:00:00.000Z"
+
+    def run_build(self, answers):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tg = pathlib.Path(tmp.name) / "telegram"
+        tg.mkdir()
+        msg = lambda i, kind, **kw: {"rt": "d1.messages", "id": f"-100:{i}", "external_id": f"tg:90{i}", "person_id": "alice",
+                                     "sender_person_id": "alice", "chat_id": "-100", "kind": kind, "media_ref": None, "raw_text": None,
+                                     "received_at": f"2026-10-30T05:0{i}:00.000Z", "extraction_status": "ok", "extracted_at": self.T, **kw}
+        rows = [msg(1, "document"), msg(2, "audio", duration_sec=7), msg(3, "text", extraction_status="answer", raw_text="1 handled")]
+        (tg / "2026-10.ndjson").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        (tg / "answers.ndjson").write_text("".join(json.dumps(r) + "\n" for r in answers))
+        db = pathlib.Path(tmp.name) / "kb.sqlite"
+        out = build("--records", str(RECORDS), "--telegram", str(tg), "--db", str(db))
+        return out, (sqlite3.connect(db) if db.exists() else None)
+
+    def a(self, ref, **kw):
+        return {"question_ref": ref, "text": "handled", "by": "carol", "at": "2026-10-31T16:00:00.000Z", "message_key": "-100:3", **kw}
+
+    def test_ok(self):
+        out, con = self.run_build([self.a("unread:-100:1"), self.a("voice:-100:2"), self.a("q:-100:1#0")])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.addCleanup(con.close)
+        # The answer message is evidence (a source), never a fact; answers.ndjson itself adds no rows.
+        self.assertEqual(con.execute("SELECT count(*) FROM source WHERE id LIKE 'alice:src:%-tg.-100.%'").fetchone()[0], 3)
+        self.assertEqual(con.execute("SELECT count(*) FROM fact WHERE id LIKE 'alice:fact:%-tg.-100.%'").fetchone()[0], 0)
+
+    def test_errors(self):
+        cases = [([self.a("unread:-100:9")], "does not name a recorded Telegram message"),
+                 ([self.a("q:-100:7#0")], "does not name a recorded Telegram message"),
+                 ([self.a("nope:-100:1")], "answer row needs exactly"),
+                 ([self.a("unread:-100:1", at="2026-10-31")], "answer row needs exactly"),
+                 ([self.a("unread:-100:1", extra=1)], "answer row needs exactly"),
+                 ([{"question_ref": "unread:-100:1", "text": "x", "by": "carol", "at": "2026-10-31T16:00:00Z"}], "answer row needs exactly")]
+        for answers, msg in cases:
+            with self.subTest(msg=msg):
+                out, _ = self.run_build(answers)
+                self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn(msg, out.stdout + out.stderr)
+
+
 class HandledManuallyTest(unittest.TestCase):
     """data/telegram/handled-manually.ndjson: replaced_by / duplicate_of messages keep their source, lose their facts."""
     T = "2026-10-30T07:00:00.000Z"

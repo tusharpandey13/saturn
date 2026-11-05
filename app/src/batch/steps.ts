@@ -19,14 +19,14 @@ import type { Store } from "../store.js";
 import { SARVAM_REST_MAX_SEC, SttJobFailedError } from "../../../adapters/stt/sarvam.js";
 import { HEALTH_MEDIA_KINDS, IMAGE_CLASS, type Media, type PartialReading, type Person, type Reading, type SpeechToText, type Symptom, type Transcript } from "../types.js";
 import { parseVitals } from "../vitals.js";
-import { buildDigest, type DigestEntry, PRIVATE_NOTE, STT_PENDING_NOTE } from "./digest.js";
+import { type DigestEntry, type DigestItem, PRIVATE_NOTE, renderDigest, STT_PENDING_NOTE } from "./digest.js";
 import { durationEn, parseStatements, type ParsedStatement } from "../extract/voice.js";
 import { renderTranscript } from "./transcript.js";
 import { CONTEXT_DAILY_CAP, contextEligible, type ContextMode, type ContextSignal, isPrivate, parseContext } from "../extract/context.js";
 
 /** Ops line (admin DM only): extraction or STT failed for some messages (auth, usage limit, outage). */
 export const DELAYED_OPS = (n: number) => `extraction delayed for ${n} message(s) (auth, usage limit or outage); all kept, retried next run. Check the batch log.`;
-import { dayOf, MIME_OF_EXT, type RawRow, Repo, type Row, type SubjectOverride } from "./repo.js";
+import { type Answer, dayOf, MIME_OF_EXT, type RawRow, Repo, type Row, type SubjectOverride } from "./repo.js";
 import { type Alias, displayOf, splitSubject } from "../subject.js";
 
 export const LOW_CONFIDENCE = 0.8; // same bar as v_needs_human in data/schema.sql
@@ -35,6 +35,21 @@ export const VOICE_LOW_CONFIDENCE = 0.5;
 /** A voice note longer than this with nothing recorded from it is listed for a listener. */
 export const NOTHING_HEARD_SEC = 10;
 const DAY = 86_400_000;
+/** Ops line: raw rows waited but this run processed none of them (and no delay explains it). */
+export const NOTHING_PROCESSED_OPS = (n: number) => `${n} message(s) waited but none was processed this run (media not copied, or a step crashed); check the batch log.`;
+/** Ops line written by batch/run.ts when a step throws, so the finish step's DM names the step (U-09). */
+export const FAILED_STEP_OPS = (step: string, name: string) => `batch failed at ${step} (${name}); raw data is committed, messages wait for the next run. See the batch log.`;
+
+/** An admin's reply to a numbered digest item, typed in the private chat: "3 yes, left hand", "3: yes", "done 3",
+ *  "heard 2", "3" (= acknowledged). A number followed by "/" or a unit ("120/80 72", "70 kg") is not a reply. */
+export function parseAnswer(text: string | undefined): { n: number; text: string; verb: string | null } | null {
+  const m = /^\s*(?:(done|heard|handled|ok)\s+)?#?(\d{1,3})(?:\s*[:.)]\s*|\s+|$)([\s\S]*)$/i.exec(text ?? "");
+  if (!m) return null;
+  const verb = m[1]?.toLowerCase() ?? null;
+  const rest = m[3].trim();
+  if (!verb && /^(kg|mg|mmol|mmhg|bpm|%)/i.test(rest)) return null;
+  return { n: Number(m[2]), text: rest || verb || "ok", verb };
+}
 
 // ---------------------------------------------------------------- pull
 
@@ -167,6 +182,8 @@ export interface ExtractResult {
   queued: number;
   changed: string[];
   digest: string;
+  /** The digest's numbered items; finish logs them with the sent digest so "<n> ..." replies can be resolved. */
+  items: DigestItem[];
   /** Short, actionable ops lines for a separate admin DM (warnings, delays). Empty = nothing to say. */
   ops: string[];
   /** Life context: messages read, signals kept, signals dropped by minimisation, messages skipped by the daily cap. */
@@ -263,6 +280,7 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
   const deep: Record<string, unknown>[] = [];
   const entries: DigestEntry[] = [];
   const items: Item[] = [];
+  const answers: Answer[] = [];
   let pending = 0;
   let delayed = 0;
   let sttPending = 0;
@@ -325,6 +343,25 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     if (raw.media_key && !raw.media_path) {
       pending++; // media not copied yet: the next pull retries it
       continue;
+    }
+    // Answer-by-reply (U-01): an admin's text in their private chat that names a numbered item of a delivered digest.
+    // Logged to data/telegram/answers.ndjson, never sent to the model. Group messages and members' chats never match.
+    const reply = raw.role === "admin" && msg.kind === "text" && msg.chatId === raw.sender_id ? parseAnswer(msg.text) : null;
+    if (reply) {
+      const sent = d.repo.digestsSent();
+      const target = (msg.replyToMessageId ? sent.find((g) => g.message_ids.includes(msg.replyToMessageId!)) : undefined)
+        ?? sent.filter((g) => g.sent_at <= msg.ts).sort((a, b) => a.sent_at.localeCompare(b.sent_at)).pop();
+      const item = target?.items?.find((i) => i.n === reply.n);
+      if (item) {
+        answers.push({ question_ref: item.ref, text: reply.text, by: d.repo.personDir(raw.person_id), at: msg.ts, message_key: msg.key });
+        out.push({ ...base, extraction_status: "answer", note: `answer to digest item ${reply.n} (${item.ref})` });
+        replaced.add(msg.key);
+        entries.push({ ...entry, answered: [{ n: reply.n, ref: item.ref, label: item.label, text: reply.text }] });
+        continue;
+      }
+      // Not a known item: read as an ordinary message; say so only when it clearly was meant as a reply.
+      if (reply.verb || (msg.replyToMessageId && sent.some((g) => g.message_ids.includes(msg.replyToMessageId!))))
+        entry.pending!.push(`reply "${reply.n} …" matched no numbered item of the last digest; kept as a message`);
     }
 
     const item: Item = { raw, msg, subject, entry, base };
@@ -482,9 +519,16 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     base.subject_hint = hint;
     out.push(base, ...recordRows(msg.key, subject.id, ex, extractedBy!, d.now), ...statementRows(msg.key, subject.id, raw.person_id, statements ?? [], ex.confidence, extractedBy!, d.now),
       ...contextRows(msg.key, raw.person_id, context ?? [], mode, extractedBy!, d.now));
-    if (statements) entry.notes = [...(entry.notes ?? []), base.transcript_engine === "groundtruth"
-      ? `voice note (${durationEn(base.duration_sec ?? 0)}): listened transcript (ground truth), ${statements.length} item(s) recorded`
-      : `voice note (${durationEn(base.duration_sec ?? 0)}): machine transcript, ${statements.length} item(s) recorded (unchecked)`];
+    if (statements) {
+      const checked = base.transcript_engine === "groundtruth";
+      entry.notes = [...(entry.notes ?? []), checked
+        ? `voice note (${durationEn(base.duration_sec ?? 0)}): listened transcript (ground truth), ${statements.length} item(s) recorded`
+        : `voice note (${durationEn(base.duration_sec ?? 0)}): machine transcript, ${statements.length} item(s) recorded (unchecked)`];
+      // What was said, as fixed lines. The summary keeps its own negation ("no dizziness today"); nothing is ever
+      // rendered with a leading "NOT:" (U-06).
+      entry.said = statements.map((st) => `says: ${st.summary}${st.whenText ? ` (${st.whenText})` : ""}`);
+      if (!checked) entry.unchecked = true;
+    }
     replaced.add(msg.key);
     ctx.signals += context?.length ?? 0;
     if (mode === "shadow" && context?.length)
@@ -555,10 +599,11 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
       .filter((r) => Date.parse(r.measuredAt) >= Date.parse(msg.ts) - 8 * DAY);
     // Device averages / memory recalls / unclear indicators are not one measurement: no red-flag thresholds on them.
     entry.annotations = evaluate({ readings: [...ex.readings.filter((r) => !isDeviceSummary(r)), ...(ex.reportReadings ?? [])], symptoms: ex.symptoms, weightHistory: weights, thresholds: d.thresholds, timeZone: tz });
-    if (entry.readings.length || ex.symptoms.length || entry.questions.length || entry.deep || entry.context?.length || entry.notes?.length) entries.push(entry);
+    if (entry.readings.length || ex.symptoms.length || entry.questions.length || entry.deep || entry.context?.length || entry.notes?.length || entry.pending?.length) entries.push(entry);
   }
 
   const changed = out.length ? d.repo.writeKb(out, replaced) : [];
+  if (answers.length && d.repo.appendAnswers(answers)) changed.push("answers.ndjson");
   const queued = d.repo.enqueueDeep(deep);
   // Log this run's entries (and an empty one for each processed message with nothing to show), then build the digest
   // from everything recorded since the last delivered digest: a skipped or failed run's items are not lost.
@@ -567,10 +612,38 @@ export async function extract(d: ExtractDeps): Promise<ExtractResult> {
     ...entries.map((e) => ({ key: e.key!, recorded_at: d.now, entry: e })),
     ...[...replaced].filter((k) => !seenKeys.has(k)).map((k) => ({ key: k, recorded_at: d.now, entry: null })),
   ]);
-  const digest = buildDigest({ entries: d.repo.undeliveredDigestEntries(), pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status,
-    contextSkipped: mode === "shadow" ? ctx.skippedCap : 0, listen: unlistened(d.repo, nameOf) });
-  const ops = [...(d.warnings ?? []), ...(delayed ? [DELAYED_OPS(delayed)] : [])];
-  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, ops, context: ctx, voice };
+  const after = d.repo.kbRows();
+  const { text: digest, items: digestItems } = renderDigest({ entries: d.repo.undeliveredDigestEntries(), pending: pending - delayed, now: d.now, timeZone: tz, thresholdsStatus: d.thresholds.status,
+    contextSkipped: mode === "shadow" ? ctx.skippedCap : 0, listen: unlistened(d.repo, nameOf, after), unread: unreadDocuments(d.repo, nameOf, after), lastReadingAt: lastReadingAt(after) });
+  const ops = [...(d.warnings ?? []), ...(delayed ? [DELAYED_OPS(delayed)] : []), ...(todo.length && !replaced.size && !delayed ? [NOTHING_PROCESSED_OPS(todo.length)] : [])];
+  return { extracted: replaced.size, pending, delayed, sttPending, queued, changed, digest, items: digestItems, ops, context: ctx, voice };
+}
+
+/** When the newest reading in the records was measured (retracted ones excluded); null when there is none. */
+export function lastReadingAt(rows: Row[]): string | null {
+  let last: string | null = null;
+  for (const r of rows)
+    if (r.rt === "d1.readings" && r.confirmed !== -1 && typeof r.measured_at === "string" && Date.parse(r.measured_at) && (!last || Date.parse(r.measured_at) > Date.parse(last))) last = r.measured_at;
+  return last;
+}
+
+const DOC_CLASS_EN: Record<string, string> = { prescription: "prescription", "medicine-strip": "medicine strip photo", "lab-report": "lab report", "other-health": "health document", "device-reading": "device photo (as a document)" };
+
+/** Documents, prescriptions, strip photos and report files from which nothing was recorded (no readings, report
+ *  values or symptoms), oldest first: a standing digest list until a person handles the item (an answer
+ *  `unread:<key>` from a digest reply, or a data/telegram/handled-manually.ndjson row). Duplicates, /private and
+ *  non-health files are never listed. */
+export function unreadDocuments(repo: Repo, nameOf: (id: string) => string, rows: Row[] = repo.kbRows()): { key: string; person: string; ts: string; what: string; via?: string }[] {
+  const handled = repo.handledUpdateIds();
+  const acked = new Set(repo.answers().filter((a) => a.question_ref.startsWith("unread:")).map((a) => a.question_ref.slice("unread:".length)));
+  const withFacts = new Set(rows.filter((r) => ["d1.readings", "d1.report_items", "d1.symptoms"].includes(r.rt)).map((r) => String(r.source_message_id)));
+  const docClass = (r: Row) => (r.kind === "document" ? DOC_CLASS_EN[String(r.image_class)] ?? (r.image_class === "non-health" ? null : "document") : r.kind === "image" ? ({ prescription: 1, "medicine-strip": 1, "lab-report": 1 } as Record<string, number>)[String(r.image_class)] ? DOC_CLASS_EN[String(r.image_class)] : null : null);
+  return rows
+    .filter((r) => r.rt === "d1.messages" && !["duplicate", "private", "skipped", "answer"].includes(String(r.extraction_status)))
+    .map((r) => ({ r, what: docClass(r) }))
+    .filter(({ r, what }) => what && !withFacts.has(String(r.id)) && !acked.has(String(r.id)) && !handled.has(Number(String(r.external_id ?? "").replace(/^tg:/, ""))))
+    .map(({ r, what }) => ({ key: String(r.id), person: nameOf(String(r.person_id)), ts: String(r.received_at), what: what!, ...(r.sender_person_id && r.sender_person_id !== r.person_id ? { via: nameOf(String(r.sender_person_id)) } : {}) }))
+    .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
 }
 
 /** "[mm:ss] text" per segment: what the extraction model reads for a voice note. */
@@ -581,14 +654,14 @@ function timedLines(t: Transcript): string {
 
 /** Voice notes a person should check, oldest first: not transcribed, read below VOICE_LOW_CONFIDENCE, or nothing recorded
  *  from more than NOTHING_HEARD_SEC of audio. A note with a `listened` marker (data/telegram/listened.ndjson) is never listed. */
-export function unlistened(repo: Repo, nameOf: (id: string) => string): { person: string; ts: string; durationSec: number; why: string }[] {
+export function unlistened(repo: Repo, nameOf: (id: string) => string, rows: Row[] = repo.kbRows()): { key: string; person: string; ts: string; durationSec: number; why: string }[] {
   const heard = repo.listenedUpdateIds();
+  const acked = new Set(repo.answers().filter((a) => a.question_ref.startsWith("voice:")).map((a) => a.question_ref.slice("voice:".length)));
   const dur = new Map<string, number>();
   for (const raw of repo.rawRows()) {
     const ev = parseUpdate(raw.update);
     if (ev?.type === "message" && ev.msg.kind === "audio") dur.set(ev.msg.key, ev.msg.durationSec ?? 0);
   }
-  const rows = repo.kbRows();
   const items = new Map<string, number>();
   for (const r of rows) if (r.rt === "d1.statements") items.set(String(r.source_message_id), (items.get(String(r.source_message_id)) ?? 0) + 1);
   const why = (r: Row, durationSec: number): string | null => {
@@ -598,10 +671,10 @@ export function unlistened(repo: Repo, nameOf: (id: string) => string): { person
     return null;
   };
   return rows
-    .filter((r) => r.rt === "d1.messages" && r.kind === "audio" && !["private", "duplicate"].includes(String(r.extraction_status)) && !heard.has(Number(String(r.external_id ?? "").replace(/^tg:/, ""))))
+    .filter((r) => r.rt === "d1.messages" && r.kind === "audio" && !["private", "duplicate"].includes(String(r.extraction_status)) && !acked.has(String(r.id)) && !heard.has(Number(String(r.external_id ?? "").replace(/^tg:/, ""))))
     .map((r) => {
       const durationSec = Number(r.duration_sec ?? dur.get(String(r.id)) ?? 0);
-      return { person: nameOf(String(r.person_id)), ts: String(r.received_at), durationSec, why: why(r, durationSec) };
+      return { key: String(r.id), person: nameOf(String(r.person_id)), ts: String(r.received_at), durationSec, why: why(r, durationSec) };
     })
     .filter((v): v is typeof v & { why: string } => v.why !== null)
     .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
@@ -706,6 +779,8 @@ export interface FinishDeps {
   force?: boolean;
   /** Operator alerts (e.g. the webhook assertion) and extract ops lines: the separate short admin ops DM, ⚠ lines. */
   alerts?: string[];
+  /** The digest's numbered items (extract result), logged with the sent digest for answer-by-reply. */
+  items?: DigestItem[];
 }
 
 export const DIGEST_FAILED = `${PRODUCT_NAME}: today's run did not complete. All messages are kept; the next run retries. See the batch workflow log.`;
@@ -758,7 +833,7 @@ export async function finish(d: FinishDeps): Promise<{ done: number; pruned: num
       const r = await dm(d.digest);
       sentTo = r.n;
       // Logged even after a partial send, so a re-run does not send a second digest the same day.
-      if (r.n || r.ids.length) d.repo.logDigest({ date: day, message_ids: r.ids, sent_at: d.now, forced: !!d.force, through: d.now });
+      if (r.n || r.ids.length) d.repo.logDigest({ date: day, message_ids: r.ids, sent_at: d.now, forced: !!d.force, through: d.now, ...(d.items?.length && { items: d.items }) });
       else console.log("::warning::no admin reachable by DM; the digest was not delivered");
     }
   }

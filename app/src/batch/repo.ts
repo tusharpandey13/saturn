@@ -3,7 +3,9 @@
 //   data/telegram/YYYY-MM.ndjson      extracted rows ("rt": "d1.messages|d1.readings|d1.report_items|d1.symptoms|d1.context"), read by
 //                                     tools/kb/build (d1.context: life-context signals, ADR 010; not a D1 table)
 //   data/telegram/directory.ndjson    persons and chats ("rt": "d1.persons|d1.chats")
-//   data/telegram/handled-manually.ndjson  owner-written: messages whose facts tools/kb/build drops (not read here)
+//   data/telegram/handled-manually.ndjson  owner-written: messages whose facts tools/kb/build drops (read here only
+//                                     to drop them from the digest's unread-documents list)
+//   data/telegram/answers.ndjson      an admin's replies to numbered digest items (append-only; written by extract)
 //   data/queue/needs_deep.jsonl       work for the offline Opus agent (append-only)
 //   data/telegram/digests.jsonl       admin digests sent (IST date, message ids): one digest per day (append-only)
 //   sources/<person>/media/telegram/<file_unique_id>.<ext>   photos, PDFs, voice notes (ADR 003)
@@ -11,7 +13,7 @@
 // Months are Asia/Kolkata calendar months of the message's send time. Output is sorted and stable: re-running on
 // the same input writes identical bytes.
 
-import type { DigestEntry } from "./digest.js";
+import type { DigestEntry, DigestItem } from "./digest.js";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -79,6 +81,18 @@ export interface DigestSent {
   forced: boolean;
   /** Watermark: every digest entry recorded at or before this instant was delivered (older rows: sent_at). */
   through?: string;
+  /** The digest's numbered items (questions, unread documents, voice notes to check): "<n> <text>" replies resolve here. */
+  items?: DigestItem[];
+}
+
+/** data/telegram/answers.ndjson: one row per admin reply to a numbered digest item. question_ref is the item's ref
+ *  (`q:<message key>#<i>`, `unread:<message key>`, `voice:<message key>`); message_key is the reply message. */
+export interface Answer {
+  question_ref: string;
+  text: string;
+  by: string;
+  at: string;
+  message_key: string;
 }
 
 /** data/telegram/digest-entries.jsonl: what each extract run recorded for the digest (append-only). The next delivered
@@ -119,6 +133,9 @@ function writeIfChanged(path: string, text: string): boolean {
 export const TRANSCRIPT_MARK = "---\ngenerator: saturn-batch";
 /** Listened markers: one line per voice note a person has listened to ({"update_id", "by", "at", "note"?}). */
 export const LISTENED_FILE = "listened.ndjson";
+export const HANDLED_FILE = "handled-manually.ndjson";
+export const ANSWERS_FILE = "answers.ndjson";
+const NOT_KB_FILES = ["directory.ndjson", "subject-overrides.ndjson", HANDLED_FILE, LISTENED_FILE, ANSWERS_FILE];
 
 export class Repo {
   constructor(readonly root: string, private readonly personMap: PersonMap = {}) {}
@@ -246,10 +263,32 @@ export class Repo {
     return new Set(readLines<{ update_id?: unknown }>(this.p("data/telegram", LISTENED_FILE)).map((r) => Number(r.update_id)).filter(Number.isInteger));
   }
 
+  /** update_ids the owner marked handled by hand (data/telegram/handled-manually.ndjson, validated by tools/kb/build). */
+  handledUpdateIds(): Set<number> {
+    return new Set(readLines<{ update_id?: unknown }>(this.p("data/telegram", HANDLED_FILE)).map((r) => Number(r.update_id)).filter(Number.isInteger));
+  }
+
+  // ---------- answers (replies to numbered digest items) ----------
+
+  answers(): Answer[] {
+    return readLines<Answer>(this.p("data/telegram", ANSWERS_FILE));
+  }
+
+  /** Append answers whose message_key is not recorded yet (append-only; idempotent). Returns how many were added. */
+  appendAnswers(rows: Answer[]): number {
+    const seen = new Set(this.answers().map((a) => a.message_key));
+    const add = rows.filter((a) => !seen.has(a.message_key) && seen.add(a.message_key));
+    if (!add.length) return 0;
+    const path = this.p("data/telegram", ANSWERS_FILE);
+    const prev = existsSync(path) ? readFileSync(path, "utf8") : "";
+    writeIfChanged(path, prev + add.map((a) => line(a as unknown as Record<string, unknown>) + "\n").join(""));
+    return add.length;
+  }
+
   // ---------- extracted rows ----------
 
   kbRows(): Row[] {
-    return this.files("data/telegram", ".ndjson").filter((f) => !f.endsWith("directory.ndjson") && !f.endsWith("subject-overrides.ndjson") && !f.endsWith("handled-manually.ndjson") && !f.endsWith(LISTENED_FILE)).flatMap((f) => readLines<Row>(f));
+    return this.files("data/telegram", ".ndjson").filter((f) => !NOT_KB_FILES.some((n) => f.endsWith(n))).flatMap((f) => readLines<Row>(f));
   }
 
   /**

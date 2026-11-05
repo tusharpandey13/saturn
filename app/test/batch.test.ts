@@ -7,17 +7,18 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildDigest, ANNOTATION_NOTE, EMPTY_LINE, LISTEN_HEAD, QUESTIONS_HEAD, STT_PENDING_NOTE } from "../src/batch/digest.js";
+import { ANSWERED_HEAD, buildDigest, ANNOTATION_NOTE, EMPTY_LINE, lastReadingEn, LISTEN_HEAD, QUESTIONS_HEAD, renderDigest, STT_PENDING_NOTE, UNREAD_HEAD, VOICE_HEAD } from "../src/batch/digest.js";
 import { DISABLED_THRESHOLDS } from "../src/config/thresholds.js";
 import { Repo } from "../src/batch/repo.js";
-import { DELAYED_OPS, DIGEST_FAILED, extract, finish, isTransient, pull, splitMessage, unlistened } from "../src/batch/steps.js";
+import { DELAYED_OPS, DIGEST_FAILED, extract, FAILED_STEP_OPS, finish, isTransient, lastReadingAt, NOTHING_PROCESSED_OPS, parseAnswer, pull, splitMessage, unlistened, unreadDocuments } from "../src/batch/steps.js";
+import { readingEn } from "../src/replies.js";
 import { loadThresholds } from "../src/batch/records.js";
 import { ClaudeCliError, type ExtractInput, type Extractor, ExtractorStopError, oneByOne } from "../../adapters/llm/claude-cli.js";
 import { StubSpeechToText } from "../../adapters/stt/sarvam.js";
 import type { Person } from "../src/types.js";
 import worker from "../src/worker.js";
 import { FakeExtractor } from "../src/dev/fake-extractor.js";
-import { fakeTelegram, fixture, GROUP, memR2, SECRET, seededStore, textUpdate, webhook } from "./helpers.js";
+import { dmUpdate, fakeTelegram, fixture, GROUP, memR2, SECRET, seededStore, textUpdate, webhook } from "./helpers.js";
 
 const NOW = "2026-10-25T15:30:00.000Z"; // 21:00 IST
 // Example thresholds from the synthetic records (example values for tests; not clinical guidance).
@@ -730,7 +731,7 @@ describe("voice notes: local transcript, verbatim statements, needs a listener",
     const { repo, updateId } = await setup();
     const r = await extract({ repo, extractor: new VoiceExtractor(0.4), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
     expect(r.digest).toContain("read with low confidence; check the values above.");
-    expect(r.digest).toContain(`${LISTEN_HEAD}\n• Alice 24 Oct 09:30, 7 s (low confidence)`);
+    expect(r.digest).toContain(`${LISTEN_HEAD}\n1. Alice 24 Oct 09:30, 7 s (low confidence)`); // numbered: "1 heard" marks it
     writeFileSync(join(root, "data/telegram/listened.ndjson"), JSON.stringify({ update_id: updateId, by: "owner", at: "2026-10-26" }) + "\n");
     const r2nd = await extract({ repo, extractor: new VoiceExtractor(0.4), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: "2026-10-26T15:30:00.000Z" });
     expect(r2nd.digest).not.toContain(LISTEN_HEAD);
@@ -788,5 +789,187 @@ describe("voice notes: local transcript, verbatim statements, needs a listener",
     expect(stt.calls).toBe(0);
     expect(r.sttPending).toBe(1);
     expect(r.digest).toContain("transcription waits for the next run");
+  });
+});
+
+// ---------------------------------------------------------------- owner's-eye review, 05-Nov-2026 (batch wave 1)
+describe("answer-by-reply, unread documents, unchecked voice, averages, ops (05-Nov-2026 review)", () => {
+  const LATER = 1792950000; // 2026-10-25 17:40 UTC: after the day-1 digest (NOW = 15:30 UTC)
+  const DAY2 = "2026-10-26T15:30:00.000Z";
+  const noNot = (text: string) => expect(text).not.toMatch(/(^|\n)[^\n]*\bNOT:/);
+
+  it("U-01: items are numbered; an admin's \"<n> <text>\" in the private chat is logged to answers.ndjson, acknowledged, and closes the item; other chats are ignored", async () => {
+    // Day 1: blurry BP photo (one question), voice note without STT (to check), prescription PDF (unread document).
+    const photo = fixture("photo"), voice = fixture("voice"), pdf = fixture("document-pdf");
+    const { store, r2, t, repo } = await ingestAll([photo, voice, pdf], { large: JPEG_BLURRY, voice1: new TextEncoder().encode("OggS"), doc1: new Uint8Array([0x25, 0x50]) });
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new MockExtractor();
+    const r1 = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r1.items).toEqual([
+      { n: 1, ref: `unread:${GROUP}:14`, label: expect.stringMatching(/^Alice 24 Oct \d\d:\d\d prescription$/) },
+      { n: 2, ref: `voice:${GROUP}:13`, label: "Alice 24 Oct 09:30 voice note" },
+      { n: 3, ref: `q:${GROUP}:12#0`, label: expect.stringMatching(/^Alice 24 Oct \d\d:\d\d photo$/) },
+    ]);
+    expect(r1.digest).toMatch(new RegExp(`${UNREAD_HEAD.replace(/[()"]/g, "\\$&")}\n1\. Alice 24 Oct \\d\\d:\\d\\d prescription, 1 day \\[${GROUP}:14\\]`));
+    expect(r1.digest).toContain(`${LISTEN_HEAD}\n2. Alice 24 Oct 09:30, 7 s (not transcribed)`);
+    expect(r1.digest).toMatch(/\n3\. Alice \d\d:\d\d "subah ka BP": device reading photo could not be read/);
+    // Delivered: the numbering is logged with the digest.
+    await finish({ store, tg: t.tg, repo, now: NOW, digest: r1.digest, items: r1.items, retentionDays: 14 });
+    expect(repo.digestsSent().at(-1)?.items?.map((i) => i.ref)).toEqual([`unread:${GROUP}:14`, `voice:${GROUP}:13`, `q:${GROUP}:12#0`]);
+
+    // Day 2: the admin (Carol, 222) replies in her private chat; Alice writes "3 yes" in the group; Carol also logs a weight.
+    const day2 = await ingestAll([
+      dmUpdate("3: the screen said 118 over 76", 222, {}, LATER), dmUpdate("2 heard", 222, {}, LATER + 1), dmUpdate("done 1", 222, {}, LATER + 2),
+      textUpdate("3 yes", 111, {}, LATER + 3), dmUpdate("wajan 70", 222, {}, LATER + 4),
+    ]);
+    await pull({ store: day2.store, r2: day2.r2, tg: day2.t.tg, repo });
+    const r2nd = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: DAY2 });
+    expect(repo.answers()).toEqual([
+      { question_ref: `q:${GROUP}:12#0`, text: "the screen said 118 over 76", by: "carol-tg", at: "2026-10-25T17:40:00.000Z", message_key: expect.stringMatching(/^222:\d+$/) },
+      { question_ref: `voice:${GROUP}:13`, text: "heard", by: "carol-tg", at: expect.any(String), message_key: expect.stringMatching(/^222:\d+$/) },
+      { question_ref: `unread:${GROUP}:14`, text: "done", by: "carol-tg", at: expect.any(String), message_key: expect.stringMatching(/^222:\d+$/) },
+    ]);
+    expect(r2nd.changed).toContain("answers.ndjson");
+    // Replies never reach the model; the group message and the weight take the normal path.
+    expect(llm.calls.map((c) => c.text)).not.toEqual(expect.arrayContaining([expect.stringMatching(/screen said|heard|done 1/)]));
+    expect(llm.calls.map((c) => c.text)).toContain("3 yes");
+    expect(ndjson(repo).filter((x) => x.rt === "d1.messages" && x.extraction_status === "answer")).toHaveLength(3);
+    expect(ndjson(repo).find((x) => x.rt === "d1.readings" && x.person_id === "carol-tg")).toMatchObject({ type: "weight", value: 70 });
+    // The next digest acknowledges, and the answered items are gone from the standing lists.
+    expect(r2nd.digest).toContain(ANSWERED_HEAD);
+    expect(r2nd.digest).toMatch(/• answered: 3 \(Alice 24 Oct \d\d:\d\d photo\): the screen said 118 over 76\n• answered: 2 \(Alice 24 Oct 09:30 voice note\): heard\n• answered: 1 \(Alice 24 Oct \d\d:\d\d prescription\): done/);
+    expect(r2nd.digest).not.toContain(UNREAD_HEAD);
+    expect(r2nd.digest).not.toContain(LISTEN_HEAD);
+    expect(kbBuild()).toMatch(/^ok:/); // answers.ndjson validated by the KB build
+    // Idempotent: a re-run adds no second answer row.
+    await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: DAY2 });
+    expect(repo.answers()).toHaveLength(3);
+  });
+
+  it("U-01: a numbered reply from a non-admin chat, or before any digest, is not an answer", async () => {
+    const { store, r2, t, repo } = await ingestAll([textUpdate("1 yes", 111), dmUpdate("1 yes", 222)]); // group; admin DM but no digest yet
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new MockExtractor();
+    const r = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(repo.answers()).toEqual([]);
+    expect(llm.calls.map((c) => c.text)).toEqual(["1 yes", "1 yes"]);
+    expect(r.digest).not.toContain(ANSWERED_HEAD);
+  });
+
+  it("U-01: reply grammar", () => {
+    expect(parseAnswer("3 yes")).toEqual({ n: 3, text: "yes", verb: null });
+    expect(parseAnswer("3: yes, left hand")).toEqual({ n: 3, text: "yes, left hand", verb: null });
+    expect(parseAnswer("#2. heard")).toEqual({ n: 2, text: "heard", verb: null });
+    expect(parseAnswer("done 1")).toEqual({ n: 1, text: "done", verb: "done" });
+    expect(parseAnswer("3")).toEqual({ n: 3, text: "ok", verb: null });
+    for (const t of ["120/80 72", "70 kg", "wajan 70", "hello", "", undefined]) expect(parseAnswer(t)).toBeNull();
+  });
+
+  it("U-03: unread documents are listed oldest first, capped at 10, until handled (facts, handled-manually, answer); photos of devices and non-health files never", () => {
+    const repo = new Repo(root);
+    const msg = (n: number, extra: Record<string, unknown>) => ({ rt: "d1.messages", id: `g:${n}`, person_id: "alice", sender_person_id: "alice", external_id: `tg:${n}`,
+      received_at: `2026-10-${String(n).padStart(2, "0")}T10:00:00.000Z`, extraction_status: "ok", ...extra });
+    repo.writeKb([
+      msg(1, { kind: "document", image_class: "prescription" }),
+      msg(2, { kind: "image", image_class: "medicine-strip", sender_person_id: "bob" }),
+      msg(3, { kind: "document", image_class: "lab-report" }), { rt: "d1.report_items", id: "g:3:i0", source_message_id: "g:3", person_id: "alice" }, // has facts
+      msg(4, { kind: "image", image_class: "device-reading" }), // a device photo is not a document
+      msg(5, { kind: "document", image_class: "non-health" }),
+      msg(6, { kind: "document", image_class: "prescription" }), // handled-manually below
+      msg(7, { kind: "document", image_class: "prescription", extraction_status: "duplicate", duplicate_of: "g:1" }),
+      msg(8, { kind: "document", image_class: null, extraction_status: "failed" }), // unreadable PDF: still a document
+      ...Array.from({ length: 12 }, (_, i) => msg(10 + i, { kind: "image", image_class: "prescription" })),
+    ], new Set());
+    writeFileSync(join(root, "data/telegram/handled-manually.ndjson"), JSON.stringify({ update_id: 6, reason: "ingested by hand", at: "2026-10-30", by: "owner", replaced_by: "alice:src:x" }) + "\n");
+    const names = (id: string) => ({ alice: "Alice", bob: "Bob" })[id] ?? id;
+    const u = unreadDocuments(repo, names);
+    expect(u.slice(0, 4)).toEqual([
+      { key: "g:1", person: "Alice", ts: "2026-10-01T10:00:00.000Z", what: "prescription" },
+      { key: "g:2", person: "Alice", ts: "2026-10-02T10:00:00.000Z", what: "medicine strip photo", via: "Bob" },
+      { key: "g:8", person: "Alice", ts: "2026-10-08T10:00:00.000Z", what: "document" },
+      { key: "g:10", person: "Alice", ts: "2026-10-10T10:00:00.000Z", what: "prescription" },
+    ]);
+    expect(u).toHaveLength(15);
+    const { text, items } = renderDigest({ entries: [], pending: 0, now: "2026-11-01T15:30:00.000Z", timeZone: "Asia/Kolkata", thresholdsStatus: "disabled", unread: u });
+    expect(text).toContain(`${UNREAD_HEAD}\n1. Alice 1 Oct 15:30 prescription, 31 days [g:1]\n2. Alice 2 Oct 15:30 medicine strip photo, 30 days (sent by Bob, logged for Alice) [g:2]\n3. Alice 8 Oct 15:30 document, 24 days [g:8]`);
+    expect(text).toContain("\n10. Alice 16 Oct 15:30 prescription, 16 days [g:16]\n• … and 5 more (oldest shown first)");
+    expect(items).toHaveLength(10);
+    // An answer "1 handled" closes it; the list moves on.
+    repo.appendAnswers([{ question_ref: "unread:g:1", text: "handled", by: "carol", at: "2026-11-01T16:00:00.000Z", message_key: "222:9" }]);
+    expect(unreadDocuments(repo, names)[0].key).toBe("g:2");
+  });
+
+  it("U-03: a prescription with no facts stays in every digest until handled (end to end)", async () => {
+    const { store, r2, t, repo } = await ingestAll([fixture("document-pdf")], { doc1: new Uint8Array([0x25, 0x50]) });
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new MockExtractor();
+    const r1 = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r1.digest).toMatch(/Unread documents[^\n]*\n1\. Alice 24 Oct \d\d:\d\d prescription, 1 day/);
+    await finish({ store, tg: t.tg, repo, now: NOW, digest: r1.digest, items: r1.items, retentionDays: 14 });
+    const r2nd = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: "2026-10-28T15:30:00.000Z" });
+    expect(r2nd.digest).toMatch(/Unread documents[^\n]*\n1\. Alice 24 Oct \d\d:\d\d prescription, 4 days/); // still there, older
+    expect(r2nd.digest).toContain(EMPTY_LINE); // nothing new, but the standing list stays
+    writeFileSync(join(root, "data/telegram/handled-manually.ndjson"), JSON.stringify({ update_id: (fixture("document-pdf") as any).update_id, reason: "ingested by hand", at: "2026-10-29", by: "owner", replaced_by: "alice:src:x" }) + "\n");
+    const r3 = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: "2026-10-29T15:30:00.000Z" });
+    expect(r3.digest).not.toContain(UNREAD_HEAD);
+  });
+
+  it("U-06: an unchecked machine transcript is listed under its own heading, never among the recorded facts, never as \"NOT:\"; a listened transcript is a normal entry", async () => {
+    const voice = fixture("voice");
+    const { store, r2, t, repo } = await ingestAll([voice], { voice1: new TextEncoder().encode("OggS-synthetic") });
+    await pull({ store, r2, tg: t.tg, repo });
+    const r = await extract({ repo, extractor: new VoiceExtractor(), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    const d = r.digest;
+    expect(d).toContain(`${VOICE_HEAD}\n• Alice 09:30 voice note (7 s): machine transcript, 2 item(s) recorded (unchecked)\n• Alice 09:30 says: dizziness last night (kal raat)\n• Alice 09:30 says: no dizziness today (aaj)\n• Alice 09:30 dizziness`);
+    expect(d).not.toContain("\nAlice\n"); // no person block: nothing checked was recorded
+    noNot(d);
+    // The same statements from a person's corrected transcript: a normal entry, no voice heading.
+    writeFileSync(join(root, "sources/alice/media/telegram/u-voice1.groundtruth.md"), "---\nx: 1\n---\n[Alice] कल रात चक्कर आया था\n[Alice] आज चक्कर नहीं आया\n");
+    const r2nd = await extract({ repo, extractor: new VoiceExtractor(), stt: new LocalStt(), thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r2nd.digest).not.toContain(VOICE_HEAD);
+    expect(r2nd.digest).toContain("\nAlice\n• 09:30 voice note (7 s): listened transcript (ground truth), 2 item(s) recorded\n• 09:30 says: dizziness last night (kal raat)");
+    noNot(r2nd.digest);
+  });
+
+  it("U-14: a device average says so in every line, on its own, before the screen details", () => {
+    const avg = { type: "bp", value: 128, value2: 82, value3: 76, unit: "mmHg", measuredAt: NOW, kind: "average" } as any;
+    expect(readingEn(avg)).toBe("BP 128/82, pulse 76 (device average)");
+    expect(readingEn({ ...avg, indicator: "AVG AM", window: "7 days", uncertain: ["time"] })).toBe('BP 128/82, pulse 76 (device average) (screen "AVG AM", 7 days; uncertain: time)');
+    expect(readingEn({ ...avg, kind: "memory-recall", indicator: "M 12" })).toBe('BP 128/82, pulse 76 (device memory recall) (screen "M 12")');
+    expect(readingEn({ ...avg, kind: "single" })).toBe("BP 128/82, pulse 76");
+    const e = (kind: string) => ({ person: "Alice", ts: NOW, kind: "image", snippet: "", readings: [{ ...avg, kind }], symptoms: [], questions: [], annotations: [], deep: null });
+    const text = buildDigest({ entries: [e("average"), e("single"), e("average")], pending: 0, now: NOW, timeZone: "Asia/Kolkata", thresholdsStatus: "disabled" });
+    expect(text.split("\n").filter((l) => l.includes("BP 128/82")).map((l) => l.includes("(device average)"))).toEqual([true, false, true]);
+  });
+
+  it("U-09: an empty run says how old the last reading is; raw rows that none of a run processed are an ops line; a crashed step is named", async () => {
+    expect(lastReadingEn(null, NOW)).toBe("No readings recorded yet.");
+    expect(lastReadingEn("2026-10-24T10:00:00+05:30", NOW)).toBe("Last reading 1 day ago.");
+    expect(lastReadingEn("2026-10-25T10:00:00+05:30", NOW)).toBe("Last reading today.");
+    expect(lastReadingEn("2026-10-01T10:00:00+05:30", NOW)).toBe("Last reading 24 days ago.");
+    expect(lastReadingAt([{ rt: "d1.readings", measured_at: "2026-10-20T10:00:00+05:30", confirmed: 0 }, { rt: "d1.readings", measured_at: "2026-10-24T10:00:00+05:30", confirmed: -1 }, { rt: "d1.messages" }])).toBe("2026-10-20T10:00:00+05:30");
+    expect(buildDigest({ entries: [], pending: 0, now: NOW, timeZone: "Asia/Kolkata", thresholdsStatus: "disabled", lastReadingAt: "2026-10-24T10:00:00+05:30" })).toContain(`${EMPTY_LINE} Last reading 1 day ago.`);
+    // End to end: a reading yesterday, nothing today.
+    const { store, r2, t, repo } = await ingestAll([textUpdate("120/80 72", 111, {}, 1792814000)]);
+    await pull({ store, r2, tg: t.tg, repo });
+    const llm = new MockExtractor();
+    const r0 = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    await finish({ store, tg: t.tg, repo, now: NOW, digest: r0.digest, items: r0.items, retentionDays: 14 }); // delivered
+    const r = await extract({ repo, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: "2026-10-26T15:30:00.000Z" });
+    expect(r.digest).toContain(`${EMPTY_LINE} Last reading 2 days ago.`);
+    expect(r.ops).toEqual([]);
+    // A photo whose file could not be copied: the only waiting row, nothing processed -> ops line (the digest keeps its pending line).
+    const p = await ingestAll([fixture("photo")]);
+    const tgDown = fakeTelegram({}, { failFile: true });
+    const repo2 = new Repo(mkdtempSync(join(tmpdir(), "hl-batch-ops-")));
+    expect((await pull({ store: p.store, r2: memR2(), tg: tgDown.tg, repo: repo2 })).mediaMissing).toBe(1);
+    const r2nd = await extract({ repo: repo2, extractor: llm, stt: null, thresholds: THRESHOLDS, persons: PERSONS, now: NOW });
+    expect(r2nd).toMatchObject({ extracted: 0, pending: 1, delayed: 0, ops: [NOTHING_PROCESSED_OPS(1)] });
+    expect(r2nd.digest).toContain("1 message(s) waiting for their file; retried next run");
+    rmSync(repo2.root, { recursive: true, force: true });
+    // The finish DM names the step (batch/run.ts writes this line when a step throws).
+    const f = await finish({ store, tg: t.tg, repo, now: NOW, digest: null, alerts: [FAILED_STEP_OPS("extract", "TypeError")], retentionDays: 14 });
+    expect(f).toMatchObject({ sentTo: 0, opsTo: 1 });
+    expect(t.sent().at(-1)?.body.text).toBe(`⚠ ${DIGEST_FAILED}\n\n⚠ batch failed at extract (TypeError); raw data is committed, messages wait for the next run. See the batch log.`);
   });
 });

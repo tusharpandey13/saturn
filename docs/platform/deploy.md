@@ -43,7 +43,7 @@ Nothing secret goes into any git repo in plain text. Local copies of secrets, if
 | LLM adapter credential (e.g. `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) | model requests only | batch |
 | `SARVAM_API_KEY` | optional STT (`sarvam` adapter; `whisper-cpp` needs no key) | batch |
 | `BATCH_SIGNING_KEY` | SSH key that signs batch commits to the records repo; batch paths only (the env's records-integrity check pins its public half) | batch commit steps only |
-| `HEALTHCHECK_URL` | optional heartbeat | batch |
+| `HEALTHCHECK_URL` | optional heartbeat (finish: GET after a digest, `/fail` after a failed or delayed run) | batch |
 
 Which LLM credential to use (a subscription token or an API key) is an env choice, made in `env.yaml`. The reasoning behind each scope is in [security.md](../security.md).
 
@@ -102,6 +102,9 @@ Rule: **create new → update the SOPS file → redeploy or re-run → verify �
 - The LLM CLI version is pinned in the batch workflow; bump it deliberately and run once by hand.
 - Thresholds: edit the records repo's `config/thresholds.yaml`, bump `version`, set `setBy`/`effectiveFrom`, commit to the records repo; the next batch run validates and uses it (no product release; they only change digest annotations). See [records guide](../records-guide.md).
 - Deep reads: the `needs_deep` queue in the records repo; runbook in ADR 005.
+- Answer by reply: digest questions, unread documents and voice notes to check are numbered; the admin replies `3 yes, left hand`, `done 1` or `2 heard` in the private chat and the next batch logs it to the records' `data/telegram/answers.ndjson` (`question_ref`, `text`, `by`, `at`, `message_key`), drops the item from the standing lists and acknowledges it under "Answered". Numbers refer to the latest delivered digest (`digests.jsonl` `items`); replies from a group or a member's chat are never read as answers.
+- Unread documents: every document, prescription, strip photo or report file with no recorded facts stays in the digest (oldest first, 10 shown) until a reply `<n> handled` or a `handled-manually.ndjson` row.
+- Failure DMs: a step that throws leaves a `batch failed at <step>` ops line that finish DMs; an empty run says "No new messages. Last reading N days ago". Dead-man: set `HEALTHCHECK_URL` (finish pings it after a digest, `/fail` after a failed or delayed run); the heartbeat service, not the batch, alerts when no run completes by its deadline (e.g. 03:30 IST).
 - Telegram stops redelivering after 24 h: if the Worker is down, fix it the same day.
 
 ## Roll back
