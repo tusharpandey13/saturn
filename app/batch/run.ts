@@ -1,7 +1,8 @@
 // Daily batch entrypoint (ADR 005), run by deploy/batch.sh (called from the env repo's thin workflow) under Node:
 //   npx tsx batch/run.ts pull                      D1 inbox + media -> data/telegram/raw/, sources/
 //   npx tsx batch/run.ts extract [--retry-failed]  raw -> STT / Haiku (claude -p) -> data/telegram/*.ndjson, queue, digest file
-//                                                  (+ <digest>.ops: actionable ops lines, e.g. token expiry, delays)
+//                                                  (+ <digest>.ops: actionable ops lines, e.g. token expiry, delays;
+//                                                  <digest>.items: the digest's numbered items, logged by finish)
 //                                                  exit 3 when extraction was delayed (auth, usage limit, outage);
 //                                                  the digest file is written only when nothing was delayed
 //   npx tsx batch/run.ts finish [--no-digest] [--force-digest]
@@ -23,13 +24,16 @@
 //      CONTEXT_MODE (off default | shadow | on; ADR 010 life-context signals),
 //      EXTRACT_MODEL_TEXT (default claude-haiku-5-5), EXTRACT_MODEL_MEDIA (photos/PDFs; default claude-sonnet-5-5),
 //      EXTRACT_MAX_MEDIA_CALLS (usage guard per run, default 30);
-//      finish INBOX_RETENTION_DAYS (default 14), GO_LIVE (true after the GO-LIVE GATE), WORKER_URL (webhook assertion). Local e2e only: CLOUDFLARE_API_BASE, TELEGRAM_API_BASE.
+//      finish INBOX_RETENTION_DAYS (default 14), GO_LIVE (true after the GO-LIVE GATE), WORKER_URL (webhook assertion),
+//      HEALTHCHECK_URL (optional dead-man ping: GET <url> after a digest went out, <url>/fail after a failed or delayed
+//      run; the heartbeat service alerts when no success arrives by its deadline). Local e2e only: CLOUDFLARE_API_BASE, TELEGRAM_API_BASE.
 // Output is counts only: no message content reaches the Actions log.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { CloudflareTransientError, cloudflareFromEnv, d1Http, r2Http } from "../src/batch/cloudflare.js";
 import { Repo } from "../src/batch/repo.js";
-import { extract, finish, pull } from "../src/batch/steps.js";
+import { extract, FAILED_STEP_OPS, finish, pull } from "../src/batch/steps.js";
+import type { DigestItem } from "../src/batch/digest.js";
 import { checkWebhook } from "../src/batch/webhook.js";
 import { TelegramAdapter } from "../src/channel/telegram.js";
 import { ClaudeCliExtractor, tokenExpiryWarning } from "../../adapters/llm/claude-cli.js";
@@ -52,6 +56,7 @@ const root = resolve(recordsArg);
 const records = loadRecords(root);
 const digestPath = opt("--digest") ?? process.env.DIGEST_FILE ?? join(process.env.RUNNER_TEMP ?? join(import.meta.dirname, "..", ".batch"), "digest.txt");
 const opsPath = `${digestPath}.ops`;
+const itemsPath = `${digestPath}.items`;
 const now = opt("--now") ?? new Date().toISOString();
 const repo = new Repo(root, records.d1PersonMap);
 const aliases = aliasesFromRecords(records.aliases, records.display, records.d1PersonMap);
@@ -107,8 +112,10 @@ async function main(cmd: string | undefined) {
     // A delayed run writes no digest: finish then sends the ops DM only; the next full run sends the digest.
     rmSync(digestPath, { force: true });
     rmSync(opsPath, { force: true });
+    rmSync(itemsPath, { force: true });
     mkdirSync(dirname(digestPath), { recursive: true });
     if (!r.delayed) writeFileSync(digestPath, r.digest);
+    if (!r.delayed && r.items.length) writeFileSync(itemsPath, JSON.stringify(r.items));
     if (r.ops.length) writeFileSync(opsPath, r.ops.join("\n"));
     console.log(`extract: ${r.extracted} messages; pending ${r.pending} (delayed ${r.delayed}); stt_pending ${r.sttPending}; queued for deep read ${r.queued}; changed ${r.changed.join(", ") || "nothing"}`);
     for (const [m, u] of Object.entries(extractor.usage))
@@ -131,12 +138,16 @@ async function main(cmd: string | undefined) {
     const live = process.env.GO_LIVE === "true";
     const alerts = await checkWebhook(tg, { live, workerUrl: process.env.WORKER_URL || undefined, now });
     const ops = existsSync(opsPath) ? readFileSync(opsPath, "utf8").split("\n").filter(Boolean) : [];
+    const items: DigestItem[] = digest !== null && existsSync(itemsPath) ? JSON.parse(readFileSync(itemsPath, "utf8")) : [];
     const r = await finish({
-      store: new Store(d1Http(cf)), tg, repo, now, digest, send, alerts: [...ops, ...alerts], force: args.includes("--force-digest"),
+      store: new Store(d1Http(cf)), tg, repo, now, digest, send, alerts: [...ops, ...alerts], force: args.includes("--force-digest"), items,
       retentionDays: Number(process.env.INBOX_RETENTION_DAYS || 14),
     });
     if (digest !== null) rmSync(digestPath); // contains PHI
     rmSync(opsPath, { force: true });
+    rmSync(itemsPath, { force: true });
+    // Dead-man heartbeat (U-09): a success ping only after a digest went out; a failed/delayed run pings /fail.
+    await heartbeat(digest !== null && !alerts.length && !ops.length ? "" : "/fail");
     const what = !send ? "not sent (--no-digest)" : digest === null ? "MISSING (failed or delayed run: ops DM to the admins only)"
       : r.skipped ? "skipped (today's digest was already sent; dispatch with force_digest to resend)" : "sent";
     console.log(`finish: marked done ${r.done}; digest ${what}; digest DM(s) ${r.sentTo}; ops DM(s) ${r.opsTo}; group posts 0; pruned ${r.pruned}`);
@@ -149,6 +160,29 @@ async function main(cmd: string | undefined) {
   }
 }
 
+/** GET $HEALTHCHECK_URL<suffix> (healthchecks.io style); never throws, never logs the URL. */
+async function heartbeat(suffix: string): Promise<void> {
+  const url = process.env.HEALTHCHECK_URL;
+  if (!url) return;
+  try {
+    const res = await fetch(`${url.replace(/\/$/, "")}${suffix}`, { method: "GET", signal: AbortSignal.timeout(10_000) });
+    console.log(`heartbeat: ${suffix || "/"} ${res.ok ? "ok" : `HTTP ${res.status}`}`);
+  } catch (err) {
+    console.log(`::warning::heartbeat ping failed: ${(err as Error).name}`);
+  }
+}
+
+/** A step that threw leaves one ops line, so finish's DM names the step (U-09); the digest file is already gone. */
+function noteFailure(step: string, err: Error): void {
+  try {
+    mkdirSync(dirname(opsPath), { recursive: true });
+    const prev = existsSync(opsPath) ? readFileSync(opsPath, "utf8").trimEnd() + "\n" : "";
+    writeFileSync(opsPath, prev + FAILED_STEP_OPS(step, err.name) + "\n");
+  } catch {
+    /* the log line below still names the step */
+  }
+}
+
 main(args[0]).catch((err) => {
   if (err instanceof CloudflareTransientError) {
     // Rate limit (429), 5xx or network after the retries: nothing was marked; inbox rows stay new for the next run.
@@ -157,5 +191,6 @@ main(args[0]).catch((err) => {
     return;
   }
   console.error(`batch ${args[0]} failed: ${(err as Error).name}: ${(err as Error).message}`);
+  if (args[0] !== "finish") noteFailure(args[0] ?? "?", err as Error);
   process.exitCode = 1;
 });

@@ -29,14 +29,16 @@ const SYMPTOM_EN: Partial<Record<SymptomType, string>> = {
 
 const KIND_EN = { average: "device average", "memory-recall": "device memory recall", unknown: "screen indicator, type unclear" } as const;
 
-/** Device-summary and legibility qualifiers: "(device average "AVG AM", 7 days)", "(uncertain: pulse)". */
+/** Device-summary and legibility qualifiers. A device summary is named first, on its own, in every line:
+ *  "(device average) (screen "AVG AM", 7 days)", "(device memory recall) (screen "M 12")", "(uncertain: pulse)". */
 function qualifiers(r: Reading | PartialReading): string {
   const q: string[] = [];
-  if (r.kind && r.kind !== "single") q.push(`${KIND_EN[r.kind]}${r.indicator ? ` "${r.indicator}"` : ""}${r.window ? `, ${r.window}` : ""}`);
+  const summary = r.kind && r.kind !== "single" ? ` (${KIND_EN[r.kind]})` : "";
+  if (summary && (r.indicator || r.window)) q.push(`screen${r.indicator ? ` "${r.indicator}"` : ""}${r.window ? `, ${r.window}` : ""}`);
   const missing = Object.keys(r.missing ?? {});
   if (missing.length) q.push(`not legible: ${missing.join(", ")}`);
   if (r.uncertain?.length) q.push(`uncertain: ${r.uncertain.join(", ")}`);
-  return q.length ? ` (${q.join("; ")})` : "";
+  return summary + (q.length ? ` (${q.join("; ")})` : "");
 }
 
 export function readingEn(r: Reading | PartialReading): string {

@@ -9,6 +9,7 @@ Usage: tools/kb/build --records DIR [--env FILE] [--db PATH] [--data DIR] [--tel
 Each NDJSON line is one record; "rt" names its table (person | ref | source | fact). Errors cite file:line.
 data/telegram/*.ndjson holds the Telegram rows ("rt": "d1.<table>", the bot's D1 row shape) written by the daily batch
 (app/batch, ADR 005); they are mapped here into source + fact. data/meta/ (id maps) and *.jsonl files are not read.
+data/telegram/answers.ndjson (an admin's replies to numbered digest items) is validated here and read by the batch only.
 data/telegram/handled-manually.ndjson marks messages the owner ingested by hand (replaced_by a source) or that repeat
 another message (duplicate_of an update_id): their source stays, pointing there, and they produce no facts.
 --data: build from another data dir (tests); --telegram: read Telegram months from a fixture dir instead.
@@ -568,7 +569,26 @@ def main(argv):
     overrides = tg_dir / "subject-overrides.ndjson"  # read by the batch (app/src/batch/repo.ts), only checked here
     handled_file = tg_dir / "handled-manually.ndjson"  # owner-marked messages whose automatic facts are dropped
     listened_file = tg_dir / "listened.ndjson"  # voice notes a person has listened to (the batch digest reads it)
-    files += sorted(f for f in tg_dir.glob("*.ndjson") if f not in (overrides, handled_file, listened_file))
+    answers_file = tg_dir / "answers.ndjson"  # an admin's replies to numbered digest items (the batch writes and reads it)
+    files += sorted(f for f in tg_dir.glob("*.ndjson") if f not in (overrides, handled_file, listened_file, answers_file))
+    answers = []  # (where, question_ref): the ref's message key is checked against the recorded messages below
+    if answers_file.is_file():
+        for n, line in enumerate(answers_file.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            where = f"{show(answers_file)}:{n}"
+            try:
+                h = json.loads(line)
+            except json.JSONDecodeError as e:
+                errors.append(f"{where}: bad JSON ({e})"); continue
+            keys = ("question_ref", "text", "by", "at", "message_key")
+            if set(h) != set(keys) or not all(isinstance(h[k], str) and h[k] for k in keys) \
+                    or not re.fullmatch(r"(q:.+#\d+|unread:.+|voice:.+)", h["question_ref"]) \
+                    or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})", h["at"]):
+                errors.append(f"{where}: answer row needs exactly question_ref (q:<message key>#<n> | unread:<message key> | "
+                              f"voice:<message key>), text, by, at (ISO date-time), message_key; all non-empty strings")
+            else:
+                answers.append((where, h["question_ref"]))
     listened = []  # (where, update_id): checked against the recorded messages below
     if listened_file.is_file():
         for n, line in enumerate(listened_file.read_text().splitlines(), 1):
@@ -647,6 +667,9 @@ def main(argv):
     mapped, tg_errors = telegram_records(tg_rows, root, code_index(r for _, _, r in records["ref"]), handled)
     audio_uids = {_update_id(r) for _, t, r in tg_rows if t == "messages" and r.get("kind") == "audio"}
     tg_errors += [f"{where}: listened update_id {uid} is not a recorded voice note" for where, uid in listened if uid not in audio_uids]
+    msg_ids = {r.get("id") for _, t, r in tg_rows if t == "messages"}
+    tg_errors += [f"{where}: answer {ref!r} does not name a recorded Telegram message" for where, ref in answers
+                  if re.sub(r"^(q:|unread:|voice:)", "", re.sub(r"#\d+$", "", ref) if ref.startswith("q:") else ref) not in msg_ids]
     known_src = {r.get("id") for _, _, r in records["source"]}
     for where, h in handled.values():
         if h.get("replaced_by") and h["replaced_by"] not in known_src:

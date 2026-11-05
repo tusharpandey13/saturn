@@ -34,7 +34,7 @@ describe("parseExtraction: device screen type", () => {
     const ex = parseExtraction(out(bp({ reading_kind: "average", indicator: "AVG AM", window: "7 days" }), bp({ reading_kind: "memory-recall", indicator: "M 3/30" })), NOW);
     expect(ex.readings.map((r) => [r.kind, r.indicator, r.window])).toEqual([["average", "AVG AM", "7 days"], ["memory-recall", "M 3/30", undefined]]);
     expect(ex.readings.every(isDeviceSummary)).toBe(true);
-    expect(readingEn(ex.readings[0])).toBe('BP 128/82, pulse 76 (device average "AVG AM", 7 days)');
+    expect(readingEn(ex.readings[0])).toBe('BP 128/82, pulse 76 (device average) (screen "AVG AM", 7 days)');
   });
 
   it("unknown with an indicator stays unknown; unknown with nothing seen (or a missing field) is a single reading", () => {
