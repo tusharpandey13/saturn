@@ -14,6 +14,14 @@ generated: false
 
 Work the owner has parked. Not scheduled. Pick up only when the owner un-parks an item. Newest first.
 
+## Fitness follow-ups (parked 05-Nov-2026, ADR 015)
+
+- Strava API: off. Re-open only on written guidance from Strava or the owner's recorded decision. Strava's MCP is the sanctioned path for AI questions on Strava data.
+- Export readers: check counts against the first real Strava and Polar Flow exports; add rows for Polar export daily and sleep files once their shape is seen.
+- Rows for Polar biosensing (raw only today) need their own decision: readings that look clinical.
+- MyWhoosh local watcher, if the Strava link is not enough (tools/fitness/README.md).
+- Strava moves its API base URL on 01-Jun-2027 (`providers.STRAVA_API`), relevant only if the API is turned on.
+
 ## Transcription follow-ups (parked 31-Oct-2026)
 
 - Retire Sarvam fully (adapter, token inventory, secret name) now that STT is local whisper.cpp.

@@ -54,7 +54,14 @@ Format: `<ns>:<class>:<local>`. `ns` is one of the `namespaces` in `records.yaml
 | Extraction notes, hard-reads, chat triage, analyses | `docs/log/…` (dated, append-only) |
 | Cross-check flags and claims register (ADR 012) | `crossref/` (checks, owner feedback, derived flag and claim state, run log) and the generated `docs/health/<ns>/flags.md`, `claims.md`; written by `tools/crossref` ([README](../tools/crossref/README.md)); give feedback with its `feedback` command |
 | Agent-inferred records (inferences; diagnostic loop, ADR 013) | `inferences/<ns>/inferences.ndjson` (append-only snapshots, last row per id wins) and the generated `docs/health/<ns>/status.md`; written only by `tools/inference` ([README](../tools/inference/README.md)); never KB facts |
+| Fitness data (ADR 015; PHI) | raw `sources/<ns>/media/{strava,polar,zwift,mywhoosh}/` (gzip, never edited), rows `data/<ns>/docs/<date>-fitness-…ndjson`, page `docs/health/<ns>/fitness.md`; written only by `tools/fitness` ([README](../tools/fitness/README.md)); query `v_fitness` |
 | Records-local config | `records.yaml`, `config/thresholds.yaml` (optional red-flag thresholds, below), `meta/stt-vocab.txt` (optional STT vocabulary), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
+
+### Fitness data (device-reported)
+
+Rows come only from `tools/fitness`: one observation per activity, night or day, `category: fitness`, `verification: unverified`, tag `device-reported`. They stay out of clinical views (`v_trend`, lab pages, cross-checks) and out of the fan-out in section 8: an ingest updates its own page only. Fact rows are immutable as usual; the source row's `duplicate_of`, `rank` and `fitness-canonical`/`fitness-duplicate` tags are maintained by `normalise` (same activity across sources, by time overlap). A device number is not a clinical reading, and an analysis that uses one says so.
+
+**Strava:** use the owner's bulk export. Data from Strava's API may not be retained over seven days, indexed, combined with other data or used with an AI application (Strava API Policy §5.3, §5.4, §5.5, §6.2; ADR 015), so the API pull is off unless the records owner records the decision to accept that. Rows from it carry the tag `fitness:strava-api`.
 
 ### `config/thresholds.yaml` (red-flag thresholds)
 
