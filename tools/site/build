@@ -125,8 +125,12 @@ class Site:
             return None
         if relp.parts[:1] != ("sources",) or not p.is_file():
             return None
-        dest = "files/" + relp.as_posix()
-        self.files[dest] = p
+        return self.add_file("files/" + relp.as_posix(), p)
+
+    def add_file(self, dest, path):
+        """Register an absolute file for copying to out-relative `dest` (originals, and build-time transcodes that
+        live outside the records repo); returns `dest`."""
+        self.files[dest] = pathlib.Path(path)
         return dest
 
     def write(self):
@@ -408,11 +412,37 @@ def inferred_box(inf, kb=None, link_src=lambda x: None, run_href=None, short=Fal
     return "".join(out)
 
 
+def transcode_m4a(src, dst):
+    """`dst` (in the m4a cache) transcoded from `src` with ffmpeg; reused when it is not older than `src`. Returns
+    None, after one stderr line and no partial file, when ffmpeg is missing or fails: the build never fails on it."""
+    try:
+        if dst.is_file() and dst.stat().st_mtime >= src.stat().st_mtime:
+            return dst
+    except OSError:
+        pass
+    tmp = dst.with_name(f"{dst.stem}.tmp.m4a")  # keeps the suffix: ffmpeg picks the muxer from it
+    try:
+        if not shutil.which("ffmpeg"):
+            raise OSError("ffmpeg not on PATH")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(src), "-vn", "-c:a", "aac",
+                            "-b:a", "64k", "-ac", "1", str(tmp)], capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            raise OSError((r.stderr.strip().splitlines() or [f"ffmpeg exit {r.returncode}"])[-1])
+        tmp.replace(dst)
+        return dst
+    except (OSError, subprocess.SubprocessError) as e:
+        tmp.unlink(missing_ok=True)
+        print(f"m4a: skipped {src.stem}: {e}", file=sys.stderr)
+        return None
+
+
 # -------------------------------------------------------------------------------------------------------- the build
 class Builder:
-    def __init__(self, root, out, kb, rc, today, voice_api=None):
+    def __init__(self, root, out, kb, rc, today, voice_api=None, m4a_cache=None):
         self.root, self.kb, self.rc, self.today = root, kb, rc, today
         self.voice_api = voice_api.rstrip("/") if voice_api else None
+        self.m4a_cache = m4a_cache  # dir outside the records repo for ffmpeg transcodes of Ogg-only voice notes
         self.voice_count = {}  # ns -> (notes, not yet heard), filled by voice()
         self.site = Site(out, root)
         self.data = Data(kb, root, rc)
@@ -1321,12 +1351,14 @@ class Builder:
                 if not audio:
                     continue
                 m4a = next((a for a in sibs if a.suffix.lower() == ".m4a" and a != audio), None)  # transcode beside the original
+                if not m4a and self.m4a_cache and audio.suffix.lower() != ".m4a":
+                    m4a = transcode_m4a(audio, self.m4a_cache / p.ns / f"{stem}.m4a")  # None: the page stays Ogg-only
                 def side(suffix):
                     f = audio.with_name(f"{stem}{suffix}")
                     return f if f.is_file() else None
                 sender = pmap.get(r.get("sender_person_id"), r.get("sender_person_id")) or p.ns
                 notes.append({"stem": stem, "row": r, "update_id": uid, "audio": audio.relative_to(self.root).as_posix(),
-                              "m4a": m4a.relative_to(self.root).as_posix() if m4a else None,
+                              "m4a": m4a,  # absolute path (records sibling or cache file) or None
                               "heard": heard.get(uid), "sender": self.rc.get("display", {}).get(sender, sender),
                               "mac": side(".mac.transcript.md"), "batch": side(".batch.transcript.md") or side(".transcript.md"),
                               "groundtruth": side(".groundtruth.md"), "duration": r.get("duration_sec")})
@@ -1398,7 +1430,7 @@ class Builder:
         if audio_href:
             href = Site.rel(path, audio_href)
             mime = {"ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg", "mp3": "audio/mpeg", "m4a": "audio/mp4", "wav": "audio/wav"}[audio_href.rsplit(".", 1)[-1].lower()]
-            m4a_href = self.site.original(n["m4a"]) if n.get("m4a") else None
+            m4a_href = self.site.add_file(f"files/sources/{p.ns}/media/telegram/{n['stem']}.m4a", n["m4a"]) if n["m4a"] else None
             if m4a_href and mime != "audio/mp4":  # the m4a first: iOS Safari plays it in the page; the original stays
                 m4a_rel = Site.rel(path, m4a_href)
                 out.append(f'<audio controls preload="none"><source src="{ESC(m4a_rel)}" type="audio/mp4">'
@@ -1478,20 +1510,23 @@ def git_toplevel(path):
         return None
 
 
+def check_outside(path, records, what):
+    """Refuse `path` (resolved) inside the product repo, or inside the records repo unless git ignores it there."""
+    if path == PRODUCT or PRODUCT in path.parents:
+        raise GuardError(f"refusing to write {what} inside the product repo ({PRODUCT}): it holds real records")
+    rec = records.resolve()
+    if path == rec or rec in path.parents:
+        r = subprocess.run(["git", "-C", str(rec), "check-ignore", "-q", str(path)], capture_output=True)
+        if r.returncode != 0:
+            raise GuardError(f"refusing to write {what} inside the records repo's tracked tree ({path}); use a "
+                             "gitignored path such as <records>/site/ or a directory outside the repo")
+
+
 def check_out(out, records):
-    """Refuse an output inside the product repo, or inside the records repo unless git ignores it there."""
     out = out.resolve()
     if out == pathlib.Path(out.anchor) or out == pathlib.Path.home().resolve():
         raise GuardError(f"refusing to write the site to {out}")
-    if out == PRODUCT or PRODUCT in out.parents:
-        raise GuardError(f"refusing to write inside the product repo ({PRODUCT}): the site holds real records")
-    rec = records.resolve()
-    if out == rec or rec in out.parents:
-        probe = out
-        r = subprocess.run(["git", "-C", str(rec), "check-ignore", "-q", str(probe)], capture_output=True)
-        if r.returncode != 0:
-            raise GuardError(f"refusing to write inside the records repo's tracked tree ({out}); use a gitignored "
-                             "path such as <records>/site/ or a directory outside the repo")
+    check_outside(out, records, "the site")
     if out.exists() and any(out.iterdir()) and not (out / "build.json").is_file():
         raise GuardError(f"{out} exists, is not empty and is not a previous site build (no build.json)")
 
@@ -1523,16 +1558,24 @@ def main(argv=None):
     ap.add_argument("--today", default=datetime.date.today().isoformat(), help="date for 'last 14 days' (tests)")
     ap.add_argument("--voice-api", default=None, help="base URL of tools/site/voice-api (e.g. https://host/voice-api); "
                     "without it the voice pages are read-only")
+    ap.add_argument("--m4a-cache", default=None, metavar="DIR", help="directory outside the records repo (created if "
+                    "missing) where ffmpeg transcodes Ogg-only voice notes to DIR/<ns>/<stem>.m4a, reused while not older "
+                    "than the original; the site copies them beside the originals. Without it, or without ffmpeg, "
+                    "those notes stay Ogg-only")
     a = ap.parse_args(argv)
     if a.voice_api and not re.match(r"^https?://[^/\s]+(/[^\s]*)?$", a.voice_api):
         print("error: --voice-api must be an absolute http(s) URL", file=sys.stderr)
         return 2
     root = pathlib.Path(a.records).resolve()
     out = pathlib.Path(a.out).resolve()
+    cache = pathlib.Path(a.m4a_cache).resolve() if a.m4a_cache else None
     try:
         rc = records_config.load(root)
         check_out(out, root)
-    except (records_config.RecordsError, GuardError) as e:
+        if cache:
+            check_outside(cache, root, "the m4a cache")
+            cache.mkdir(parents=True, exist_ok=True)
+    except (records_config.RecordsError, GuardError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     tmp_kb = None
@@ -1564,7 +1607,7 @@ def main(argv=None):
     out.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=".site-", dir=out.parent))
     try:
-        b = Builder(root, stage, kb, rc, datetime.date.fromisoformat(a.today), a.voice_api)
+        b = Builder(root, stage, kb, rc, datetime.date.fromisoformat(a.today), a.voice_api, cache)
         b.build(people)
         b.site.write()
         meta = {"records_commit": records_commit(root), "built_at": datetime.datetime.now(datetime.timezone.utc)

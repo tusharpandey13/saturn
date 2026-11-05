@@ -1,11 +1,13 @@
 # tools/site: the family health site
 
-`tools/site/build --records DIR --out DIR [--voice-api URL]` renders a records repo's KB into static HTML (design:
+`tools/site/build --records DIR --out DIR [--voice-api URL] [--m4a-cache DIR]` renders a records repo's KB into static HTML (design:
 `docs/design/health-site.md`; no JS, relative links, CSP `script-src 'none'`); the env repo serves it on the tailnet.
 Voice notes (Telegram audio recorded in `data/telegram/<month>.ndjson`) get `<ns>/voice.html` (newest first: date,
 length, sender, heard or not) and `<ns>/voice/<stem>.html`: an `<audio>` player over the copied original under
 `files/` (served as `audio/ogg`; iOS Safari does not play Ogg/Opus in the page: when a `<stem>.m4a` sits beside the
-original (the ops transcode; the build only renders), the player lists it first as `audio/mp4` and the original second,
+original (the ops transcode, or `--m4a-cache DIR`: a dir outside the records repo where the build runs `ffmpeg` once per
+Ogg-only note into `DIR/<ns>/<stem>.m4a`, reused while not older than the original; no ffmpeg or a failure logs one
+`m4a: skipped` line and leaves that note Ogg-only; the m4a is copied beside the original in the output only), the player lists it first as `audio/mp4` and the original second,
 with download links for both; without it the page offers the Ogg to download), the suggested reading from
 `<stem>.mac.transcript.md` (fallback: the batch transcript) in a text box, the raw whisper lines collapsed below, and
 two buttons, "Heard, no changes" and "Save corrections", that post a plain form (no script) to

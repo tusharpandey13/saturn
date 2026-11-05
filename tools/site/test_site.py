@@ -203,9 +203,9 @@ def make_records(tmp, inference=True):
     return rec
 
 
-def run(rec, out, *extra):
+def run(rec, out, *extra, env=None):
     return subprocess.run([sys.executable, "-I", str(BUILD), "--records", str(rec), "--out", str(out),
-                           "--today", "2026-06-25", *extra], capture_output=True, text=True)
+                           "--today", "2026-06-25", *extra], capture_output=True, text=True, env=env)
 
 
 class Links(html.parser.HTMLParser):
@@ -580,6 +580,67 @@ console.log(JSON.stringify(out));
         r = run(self.rec, busy)
         self.assertEqual(r.returncode, 2)
         self.assertTrue((busy / "keep.txt").exists())
+
+    def test_m4a_cache(self):
+        """--m4a-cache DIR: ffmpeg (faked here) transcodes Ogg-only notes into DIR/<ns>/<stem>.m4a once; the site copies
+        the result beside the original, never into the records repo; a failing or missing ffmpeg leaves the Ogg-only page."""
+        tmp = pathlib.Path(self.tmp.name)
+        fake, log = tmp / "fakebin", tmp / "ffmpeg.log"
+        fake.mkdir(exist_ok=True)
+
+        def ffmpeg(code):  # logs argv; on success writes a stub to the last argument (the output path)
+            (fake / "ffmpeg").write_text(f'#!/bin/sh\necho "$@" >> "{log}"\nfor a; do last=$a; done\n'
+                                         f'[ {code} -eq 0 ] && printf stub > "$last"\nexit {code}\n')
+            os.chmod(fake / "ffmpeg", 0o755)
+        env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
+        out, cache = tmp / "out-m4a", tmp / "m4a-cache"
+        ffmpeg(0)
+        r = run(self.rec, out, "--m4a-cache", str(cache), env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = log.read_text().splitlines()
+        self.assertEqual(len(lines), 1)  # ex1 has its m4a in records; only ex2 (Ogg-only) is transcoded
+        ogg = self.rec / "sources/alice/media/telegram/u-voice-ex2.ogg"
+        self.assertEqual(lines[0], f"-nostdin -loglevel error -y -i {ogg.resolve()} -vn -c:a aac -b:a 64k -ac 1 "
+                                   f"{cache.resolve()}/alice/u-voice-ex2.tmp.m4a")
+        self.assertTrue((cache / "alice/u-voice-ex2.m4a").is_file())
+        self.assertEqual([f.name for f in cache.rglob("*.m4a")], ["u-voice-ex2.m4a"])  # no .tmp left behind
+        two = (out / "alice/voice/u-voice-ex2.html").read_text(encoding="utf-8")
+        self.assertIn('<audio controls preload="none"><source src="../../files/sources/alice/media/telegram/u-voice-ex2.m4a" '
+                      'type="audio/mp4"><source src="../../files/sources/alice/media/telegram/u-voice-ex2.ogg" type="audio/ogg">'
+                      '</audio>', two)
+        self.assertTrue((out / "files/sources/alice/media/telegram/u-voice-ex2.m4a").is_file())
+        self.assertTrue((out / "files/sources/alice/media/telegram/u-voice-ex1.m4a").is_file())  # records sibling still copied
+        self.assertFalse(ogg.with_suffix(".m4a").exists())  # nothing written into the records repo
+        # idempotent: a second build with the same cache reuses the file (no ffmpeg call)
+        r = run(self.rec, out, "--m4a-cache", str(cache), env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertTrue((out / "files/sources/alice/media/telegram/u-voice-ex2.m4a").is_file())
+        # ffmpeg fails: the build still succeeds, one stderr line, Ogg-only block, no partial file
+        ffmpeg(1)
+        cache2 = tmp / "m4a-cache-fail"
+        r = run(self.rec, out, "--m4a-cache", str(cache2), env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("m4a: skipped u-voice-ex2: ", r.stderr)
+        two = (out / "alice/voice/u-voice-ex2.html").read_text(encoding="utf-8")
+        self.assertIn('<audio controls preload="none"><source src="../../files/sources/alice/media/telegram/u-voice-ex2.ogg" '
+                      'type="audio/ogg"></audio>', two)
+        self.assertEqual(list(cache2.rglob("*.m4a")), [])
+        self.assertFalse((out / "files/sources/alice/media/telegram/u-voice-ex2.m4a").exists())
+        # no ffmpeg on PATH at all: same outcome
+        (tmp / "emptybin").mkdir(exist_ok=True)
+        r = run(self.rec, out, "--m4a-cache", str(cache2), env=dict(os.environ, PATH=str(tmp / "emptybin")))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("m4a: skipped u-voice-ex2: ffmpeg not on PATH", r.stderr)
+        # the cache is refused inside the records repo's tracked tree (gitignored paths and outside are fine)
+        r = run(self.rec, out, "--m4a-cache", str(self.rec / "docs" / "m4a"), env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("m4a cache inside the records repo's tracked tree", r.stderr)
+        self.assertFalse((self.rec / "docs" / "m4a").exists())
+        r = run(self.rec, out, "--m4a-cache", str(PRODUCT / "tools" / "site" / "m4a-test"), env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("product repo", r.stderr)
+        self.assertFalse((PRODUCT / "tools" / "site" / "m4a-test").exists())
 
     def test_rebuild_replaces_output(self):
         r = run(self.rec, self.out)
