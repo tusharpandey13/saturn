@@ -22,6 +22,9 @@ SPORTS = {0: "generic", 1: "run", 2: "ride", 3: "transition", 4: "fitness-equipm
           17: "hike", 19: "paddle", 21: "ebike"}
 INDOOR_SUB = {6, 13, 14, 58}  # treadmill, indoor cycling, spin, virtual activity (FIT sub_sport)
 MAKERS = {1: "garmin", 123: "polar", 260: "zwift", 265: "strava"}
+# Session field -> largest believable value in its raw FIT scale (time in ms, distance in cm, TSS x 10).
+BOUNDS = {7: 2e9, 8: 2e9, 9: 2e9, 11: 1e5, 22: 1e5, 35: 1e6, 45: 5000, 20: 5000, 21: 5000, 34: 5000, 16: 260, 17: 260, 18: 400, 19: 400}
+SECONDS_BOUND = 2 ** 32  # a FIT timestamp is a uint32
 
 
 class FitError(ValueError):
@@ -121,6 +124,8 @@ def parse(data):
                         row[num] = v
                 p += sz
         i += size_all
+        if 253 in row and (not isinstance(row[253], int) or not 0 < row[253] < SECONDS_BOUND):
+            del row[253]  # a zero or mistyped timestamp is no timestamp; a record without one is dropped below
         if 253 in row:
             last_ts = row[253]
         elif offset is not None and last_ts is not None:
@@ -228,15 +233,18 @@ def series_metrics(power, hr, cadence):
 def summarise(parsed):
     """Parsed FIT -> activity dict (numbers and short labels only) or raises FitError when no time information exists."""
     recs, sessions = parsed["records"], parsed["sessions"]
-    s = sessions[0] if sessions else {}
+    s = dict(sessions[0]) if sessions else {}
+    for f, top in BOUNDS.items():  # the file's own summary is untrusted too: only bounded numbers go on
+        if f in s and (not isinstance(s[f], (int, float)) or not 0 <= s[f] <= top):
+            del s[f]
     start = s.get(2) or (recs[0][253] if recs else None)
-    if not start:
+    if not isinstance(start, int) or not 0 < start < SECONDS_BOUND:
         raise FitError("no start time")
     a = {"start_unix": unix(start), "sport": SPORTS.get(s.get(5), "other"), "indoor": s.get(6) in INDOOR_SUB}
     fid = parsed["file_id"]
     a["device"] = fid.get(8) if isinstance(fid.get(8), str) and fid.get(8) else MAKERS.get(fid.get(1), f"maker-{fid.get(1)}")
     t0 = recs[0][253] if recs else start
-    pts = lambda f: [(r[253] - t0, r.get(f)) for r in recs]
+    pts = lambda f: [(r[253] - t0, r.get(f) if isinstance(r.get(f), (int, float)) else None) for r in recs]
     power, hr, cad = to_second_series(pts(7)), to_second_series(pts(3)), to_second_series(pts(4))
     a.update(series_metrics(power, hr, cad))
     if recs:

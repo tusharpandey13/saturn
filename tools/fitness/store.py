@@ -2,9 +2,9 @@
 
 Raw files are immutable: sources/<ns>/media/<channel>/<date>-fitness-<channel>-<kind>[-<key>]-<sha12>.<ext>.gz, gzip of
 the provider's bytes, content-addressed so a re-fetch is a no-op. One row-bearing raw file gives one
-data/<ns>/docs/<stem>.ndjson with one source row and one observation fact. Fact rows are immutable (a changed payload for
-the same <date, kind, key> is a new fact that supersedes the old one); dedupe only maintains the source row's rank,
-duplicate_of and canonical tag (ADR 015). Every provider value is untrusted: only bounded numbers and slugged labels
+data/<ns>/docs/<stem>.ndjson with one source row and one observation fact. A fact's values never change: a changed payload for
+the same <date, kind, key> is a new fact with `supersedes`, and the old row's status becomes superseded (ADR 007; the
+build checks that pair). Dedupe only maintains the source row's rank, duplicate_of and canonical tag (ADR 015). Every provider value is untrusted: only bounded numbers and slugged labels
 reach the KB, free text (activity names, notes) stays in the raw file.
 """
 import csv, datetime, gzip, hashlib, io, json, math, os, pathlib, re, sys, zipfile, zlib
@@ -332,12 +332,12 @@ def docs_dir(root, ns):
 
 
 def _detail(d, date, channel, key, kind="detail"):
-    """The newest stored detail for an activity: parsed FIT numbers, or the stream JSON."""
+    """A stored detail for an activity: parsed FIT numbers, or the stream JSON."""
     for p in sorted(d.glob(f"{date}-fitness-{channel}-{kind}-{key}-*.gz")):
         if p.name.endswith(".fit.gz"):
             try:
                 return from_fit(read_raw(p))
-            except fit.FitError:
+            except (fit.FitError, OSError, EOFError, zlib.error):
                 return None
         if p.name.endswith(".json.gz"):
             return read_json(p)
@@ -350,7 +350,7 @@ def _extract(p, m):
     if kind == "activity" and p.name.endswith(".fit.gz"):
         try:
             a = from_fit(read_raw(p))
-        except fit.FitError as e:
+        except (fit.FitError, OSError, EOFError, zlib.error) as e:
             return None, f"unreadable FIT: {e}"
         origin = channel
     elif kind in ("activity", "export-activity"):

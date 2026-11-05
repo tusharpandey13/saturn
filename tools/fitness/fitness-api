@@ -14,7 +14,7 @@ Routes (every route but /health needs a `Tailscale-User-Login` header listed in 
 Stdlib only; bodies capped at 16 KiB; nothing from a request or a provider is logged or echoed (no query strings: they
 carry codes). Tokens live in <state>/tokens.json, 0600, in the unit's 0700 home. Strava is offered only with --strava-api.
 """
-import argparse, html, http.server, json, pathlib, re, secrets, sys, time, urllib.parse
+import argparse, html, http.server, json, pathlib, re, secrets, sys, threading, time, urllib.parse
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -41,6 +41,7 @@ class Api:
         self.public = public_url.rstrip("/")
         self.allow = tuple(a.lower() for a in allow)
         self.strava_api = strava_api
+        self.lock = threading.Lock()
         self.pending = {}  # state -> (source, redirect_uri, expires): memory only; a restart just means tapping again
 
     def sources(self):
@@ -67,10 +68,10 @@ class Api:
         return out
 
     def new_state(self, source, redirect):
-        now = time.time()
-        self.pending = {k: v for k, v in self.pending.items() if v[2] > now}
-        tok = secrets.token_urlsafe(24)
-        self.pending[tok] = (source, redirect, now + STATE_TTL)
+        now, tok = time.time(), secrets.token_urlsafe(24)
+        with self.lock:
+            self.pending = {k: v for k, v in self.pending.items() if v[2] > now}
+            self.pending[tok] = (source, redirect, now + STATE_TTL)
         return tok
 
     def callback_uri(self, source):
@@ -87,7 +88,8 @@ class Api:
 
     def redeem(self, source, code, state):
         """-> None on success, else a short message that carries nothing from the request."""
-        pending = self.pending.pop(state or "", None)
+        with self.lock:
+            pending = self.pending.pop(state or "", None)
         if not pending or pending[0] != source or pending[2] < time.time():
             return "That link has expired. Tap Connect again."
         c = self.client(source)

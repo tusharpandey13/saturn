@@ -120,6 +120,23 @@ class TestFit(unittest.TestCase):
         with self.assertRaises(fit.FitError):
             fit.parse(body)
 
+    def test_hostile_field_types_and_ranges(self):
+        # A session whose start time is a string, and absurd summary values, as a crafted file could carry.
+        def craft(fields, values, msg=18):
+            b = bytearray(bytes([0x40, 0, 0]) + struct.pack("<HB", msg, len(fields)) + b"".join(bytes(f) for f in fields) + bytes([0x00]) + values)
+            head = bytes([14, 32]) + struct.pack("<HI", 2100, len(b)) + b".FIT"
+            head += struct.pack("<H", crc(head))
+            return head + bytes(b) + struct.pack("<H", crc(head + bytes(b)))
+        with self.assertRaises(fit.FitError):
+            fit.summarise(fit.parse(craft([(2, 4, 0x07)], b"abcd")))
+        with self.assertRaises(fit.FitError):
+            fit.summarise(fit.parse(craft([(253, 4, 0x07)], b"abcd", msg=20)))
+        ts = T0 - fit.FIT_EPOCH
+        a = fit.summarise(fit.parse(craft([(2, 4, 0x86), (7, 4, 0x86), (20, 4, 0x86), (16, 4, 0x07)], struct.pack("<III", ts, 600000, 4000000000) + b"abcd")))
+        self.assertEqual(a["elapsed_s"], 600)
+        self.assertNotIn("avg_power_w", a)
+        self.assertNotIn("avg_hr_bpm", a)
+
     def test_invalid_sentinels_dropped(self):
         a = fit.summarise(fit.parse(fit_file(power=0xFFFF, hr=0xFF, seconds=120)))
         self.assertNotIn("avg_power_w", a)
@@ -287,6 +304,12 @@ class TestStore(Records):
         con = self.kb()
         c = json.loads(con.execute("SELECT components FROM v_fitness").fetchone()[0])
         self.assertEqual((c["sport"], c["elapsed_s"]), ("run", 3600))
+
+    def test_corrupt_stored_detail_does_not_stop_normalise(self):
+        polar = {"id": "Q", "start_time": store.ist_at(T0).replace("+05:30", ""), "start_time_utc_offset": 330, "duration": "PT60M", "sport": "CYCLING"}
+        store.store_raw(self.r, NS, "polar", "detail", store.ist_date(T0), "Q", "fit", b"garbage")
+        store.store_raw(self.r, NS, "polar", "activity", store.ist_date(T0), "Q", "json", json.dumps(polar).encode())
+        self.assertEqual(store.normalise(self.r, NS, "2026-06-01")["new_rows"], 1)
 
     def test_gunzip_cap(self):
         bomb = gzip.compress(b"\0" * (2 * 1024 * 1024))
