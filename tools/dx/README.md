@@ -11,7 +11,7 @@ admin's private DM. Implements ADR 013 §7 "later" without a Claude Code session
 | `tools/site/dx-api` | tailnet endpoint: `POST /dx/<ns>/run` queues, `GET /dx/<ns>/status` reports; never runs the agent |
 | `tools/dx/dxstate.py` | the shared state file, spool and caps (one flock) |
 | `tools/dx/run` | the job: evidence pack, prompt, `claude -p`, verifier, commit, push, DM; `--dry-run` calls nothing |
-| env repo `hosts/vivobook/saturn-dx.nix` | user `saturn-dx`, own records clone and signing key, timer every 2 min, endpoint on the Tailscale IP |
+| env repo `hosts/<host>/saturn-dx.nix` | user `saturn-dx`, own records clone and signing key, timer every 2 min, endpoint on the Tailscale IP |
 
 ## Owner defaults (change them in the env module's flags)
 
@@ -22,8 +22,8 @@ admin's private DM. Implements ADR 013 §7 "later" without a Claude Code session
 | Caps | 1 accepted request per 24 h, 8 per 30 days, counted over every accepted request (done, failed or queued), all namespaces together (`--cap-24h`, `--cap-30d`, `--cap-scope global\|ns`) | dx-api, state file |
 | Wall clock | 3 h (`--wall-clock-s 10800`); the run is killed after it and whatever it wrote is verified | run |
 | Budget | `--max-budget-usd 12` per run (`--budget-usd`); ADR 013 §8 budget | run |
-| Model auth | the box's `CLAUDE_CODE_OAUTH_TOKEN` for Saturn PHI jobs (env repo `secrets/vivobook-hl.sops.env`, split to `/run/agent-creds/hl/claude.env`); no new token | nix `--claude-env` |
-| DM | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ADMIN_CHAT_ID` from `secrets/vivobook-ops.sops.env`; a group (negative) chat id is refused | nix `--notify-env` |
+| Model auth | the box's `CLAUDE_CODE_OAUTH_TOKEN` for Saturn PHI jobs (env repo `secrets/<host>-hl.sops.env`, split to `/run/agent-creds/hl/claude.env`); no new token | nix `--claude-env` |
+| DM | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ADMIN_CHAT_ID` from `secrets/<host>-ops.sops.env`; a group (negative) chat id is refused | nix `--notify-env` |
 | Tools | `--restricted --permission-mode dontAsk`; allowed: Read, Grep, Glob, Edit, Write, Agent, `Bash(python3 -I *)`, `Bash(git diff\|status\|log *)`, `Bash(gitleaks *)`, `WebFetch(domain:…)` on the method's literature hosts only (PubMed, E-utilities, PMC, Europe PMC, doi.org, DailyMed, openFDA, arXiv); WebSearch disallowed; file tools confined to the records clone and the product checkout | run |
 | Writes | `docs/log/analysis/`, `inferences/<ns>/`, `docs/health/<ns>/{summary,questions}.md`, `docs/health/*/status.md` (tool-generated), `docs/health/family/actions.md`; anything else fails the run, nothing is committed, the outputs are stashed | run (verifier) |
 | Commit | `docs: <ns> dx loop NN (delta, site trigger) [skip ci]` by "saturn dx-loop", SSH-signed with the job's own key (clone config); pushed to origin main | run |

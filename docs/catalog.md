@@ -31,7 +31,7 @@ spec:
   lifecycle: production    # experimental | trial | production | deprecated
   owner: group:owner
   system: agent-server
-  dependsOn: [resource:tusharpc]
+  dependsOn: [resource:home-server]
   providesApis: [router-api]
   consumesApis: []
 x-saturn: {...}            # below
