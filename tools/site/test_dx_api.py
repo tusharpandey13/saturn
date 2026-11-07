@@ -158,5 +158,38 @@ class NoClone(Base):
         self.assertEqual(self.call("/dx/alice/status")[0], 503)
 
 
+class Ask(Base):
+    """POST /ask/<ns>: a symptom card's ready DM (docs/design/symptom-context-card.md section 10)."""
+    TEXT = "Questions for Alice: eyes burning (18-Jun-2026)\n1. One eye or both?\n2. Better or worse today?\nFacts as written; not advice; doctors decide."
+
+    def test_queue(self):
+        st, _, body = self.call("/ask/alice", {"card": "c1", "text": self.TEXT}, form=True)
+        self.assertEqual(st, 202, body); self.assertIn("Queued for your private Telegram chat", body)
+        files = list((self.state / "dm").glob("*-alice.json"))
+        self.assertEqual(len(files), 1)
+        row = json.loads(files[0].read_text())
+        self.assertEqual((row["ns"], row["card"], row["by"], row["text"]), ("alice", "c1", "tester@example.com", self.TEXT))
+        self.assertFalse(list((self.state / "spool").glob("*.json")))  # not a loop run
+
+    def test_refusals(self):
+        self.assertEqual(self.call("/ask/alice", {"text": self.TEXT}, headers={"Tailscale-User-Login": ""})[0], 403)
+        self.assertEqual(self.call("/ask/alice", {"text": self.TEXT}, headers={"Tailscale-User-Login": "x@example.com"})[0], 403)
+        self.assertEqual(self.call("/ask/zed", {"text": self.TEXT})[0], 404)
+        self.assertEqual(self.call("/ask/alice", {"text": ""})[0], 422)
+        self.assertEqual(self.call("/ask/alice", {"text": "x" * 1201})[0], 422)
+        self.assertEqual(self.call("/ask/alice", {"text": "\n".join(["q"] * 13)})[0], 422)
+        st, _, body = self.call("/ask/alice", {"text": "Questions: dizzy due to heat\n1. Stop the evening medicine?"})
+        self.assertEqual(st, 422); self.assertIn("word list", body)
+        st, _, _ = self.call("/ask/alice", {"text": "Questions: dizzy due to heat\n1. Better today?"})
+        self.assertEqual(st, 202)  # the first line quotes what was said; it is not the card's voice
+        self.assertFalse(list((self.state / "dm").glob("*-zed.json")))
+
+    def test_cap(self):
+        for _ in range(dxstate.ASK_CAP_24H):
+            self.assertEqual(self.call("/ask/alice", {"text": self.TEXT})[0], 202)
+        st, _, body = self.call("/ask/alice", {"text": self.TEXT})
+        self.assertEqual(st, 429, body)
+
+
 if __name__ == "__main__":
     unittest.main()

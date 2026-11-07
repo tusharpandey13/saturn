@@ -26,7 +26,9 @@ PRODUCT = HERE.parents[1]
 sys.path.insert(0, str(HERE))  # python3 -I drops the script dir
 sys.path.insert(0, str(PRODUCT / "tools" / "kb"))
 sys.path.insert(0, str(PRODUCT / "tools" / "stt"))
+sys.path.insert(0, str(PRODUCT / "tools" / "symptom"))
 import charts, md  # noqa: E402
+import cardlib  # noqa: E402  (symptom context cards: docs/design/symptom-context-card.md)
 import records_config  # noqa: E402
 import sttlib  # noqa: E402  (transcript sections and front matter; stdlib only)
 
@@ -502,6 +504,19 @@ def transcode_m4a(src, dst):
         return None
 
 
+AW_RE = re.compile(r'<(span|q|b) class="aw">.*?</\1>', re.S)
+
+
+def own_voice(page_html):
+    """The card's own words: text as written (what was said, facts, label quotes: class "aw") and markup removed."""
+    return html.unescape(re.sub(r"<[^>]+>", " ", AW_RE.sub(" ", page_html)))
+
+
+def label_date(t):
+    t = str(t or "")
+    return fdate(f"{t[:4]}-{t[4:6]}-{t[6:8]}") if re.fullmatch(r"\d{8}", t) else t
+
+
 # -------------------------------------------------------------------------------------------------------- the build
 class Builder:
     def __init__(self, root, out, kb, rc, today, voice_api=None, m4a_cache=None, dx_api=None):
@@ -529,6 +544,12 @@ class Builder:
                         continue
                     if isinstance(h.get("update_id"), int) and h["update_id"] not in self.heard:
                         self.heard[h["update_id"]] = h
+        try:
+            self.cards = cardlib.Cards(kb, root, today, unchecked=self.unchecked, infs=lambda ns: load_inferences(root, ns))
+        except cardlib.CardError as e:
+            raise GuardError(f"symptom cards: {e}")
+        self.sym = {}       # ns -> [card dict] (new symptoms, newest first)
+        self.sym_fid = {}   # trigger fact id -> out-relative owner card page
 
     # ---- machine transcripts (U-06): a statement read by speech recognition that nobody has listened to yet
     def unchecked(self, fid):
@@ -650,6 +671,7 @@ class Builder:
             self.questions[p.ns] = parse_register(qpath.read_text(encoding="utf-8")) if qpath.is_file() else ([], {})
             self.infs = load_inferences(self.root, p.ns)
             trend, latest = self.data.trend(p.ns), self.data.latest(p.ns)
+            self.symptom_cards(p)
             self.trend_pages(p, trend, latest)
             self.voice(p)
             self.overview(p, trend, latest)
@@ -746,10 +768,12 @@ class Builder:
             meta = " · ".join(x for x in [when, typ, party, "family-reported" if reported else "",
                                           "uncertain" if r0["uncertain_ref"] else ""] if x)
             unchecked = key[0] == "one" and self.unchecked(r0["id"])
+            sym = next((self.sym_fid[r["id"]] for r in rs if r["id"] in self.sym_fid), None)
+            symlink = f' · <a class="small" href="{Site.rel(path, sym)}">Symptom card</a>' if sym else ""
             cards.append({"d": day(f0["at"]), "rep": key[0] == "rep", "n": len(rs), "html": (
                 f'<div class="ev{" reported" if reported else ""}{" unchecked" if unchecked else ""}"><span class="ic">{icon(ic)}</span>'
                 f'<div class="d">{ESC(meta)}</div><div class="t">{ESC(gv.short(title, 140))}</div>{detail}'
-                f'<div>{self.src_chip(path, r0["id"])}</div></div>')})
+                f'<div>{self.src_chip(path, r0["id"])}{symlink}</div></div>')})
             if limit and len(cards) >= limit:
                 break
         return cards
@@ -765,6 +789,7 @@ class Builder:
         home = [c for c in allrecent if c["rep"]]
         out.append(f'<h2>What changed <span class="muted small">· last {CHANGE_DAYS} days</span>'
                    f'<a class="more" href="history.html">All history</a></h2>')
+        out.append(self.sym_list(p, path))
         if recent or home:
             out.append('<div class="tl compact">' + "".join(c["html"] for c in recent) + "</div>")
             if home:
@@ -823,6 +848,178 @@ class Builder:
                        'heard.</div></a></div>')
         origin = re.match(r"^[a-z][a-z0-9+.-]*://[^/]+", self.dx_api).group(0) if self.dx_api else None
         self.site.pages[path] = shell(p, path, "Overview", "".join(out), tab="overview", form_action=origin)
+
+    # ---- symptom context cards (docs/design/symptom-context-card.md): built from the KB, label cache and rules only
+    def symptom_cards(self, p):
+        self.sym[p.ns] = self.cards.for_person(p.ns)
+        for c in self.sym[p.ns]:
+            owner, family = f"{p.ns}/symptom/{c['id']}.html", f"{p.ns}/symptom/{c['id']}-family.html"
+            for s in c["said"]:
+                self.sym_fid[s["fid"]] = owner
+            o_html, f_html = self.sym_owner(p, c, owner, family), self.sym_family(p, c, family, owner)
+            for html_, fam, where in ((o_html, False, owner), (f_html, True, family)):
+                hits = cardlib.check_words(own_voice(html_), family=fam)
+                if hits:
+                    raise GuardError(f"symptom card {where}: word list: {hits}")
+            origin = re.match(r"^[a-z][a-z0-9+.-]*://[^/]+", self.dx_api).group(0) if self.dx_api else None
+            title = "Symptom card"
+            self.site.pages[owner] = shell(p, owner, title, o_html, tab="overview", form_action=origin)
+            self.site.pages[family] = shell(p, family, title + " (family)", f_html, tab="overview")
+
+    def sym_list(self, p, path):
+        cards = self.sym.get(p.ns) or []
+        if not cards:
+            return ""
+        rows = []
+        for c in cards:
+            said = "; ".join(s["text"] for s in c["said"] if not s["negated"])
+            n_a = sum(1 for w in c["warnings"] if w["tier"] == "A")
+            mt = f' · <span class="pill mt">{ESC(c["listener"])}</span>' if "not yet" in c["listener"] else ""
+            rows.append(f'<div><a href="{Site.rel(path, f"{p.ns}/symptom/{c["id"]}.html")}"><b>{ESC(gv.short(said, 120))}</b>'
+                        f'<div class="small muted">{ESC(fdate(c["at"], "minute" if len(c["at"]) > 10 else "day"))} · '
+                        f'{len(c["warnings"])} warning signs to watch (Tier A: {n_a}){mt}</div></a>'
+                        f'<div class="xs"><a href="{Site.rel(path, f"{p.ns}/symptom/{c["id"]}.html")}">Card</a> · '
+                        f'<a href="{Site.rel(path, f"{p.ns}/symptom/{c["id"]}-family.html")}">Family version</a></div></div>')
+        return ('<h3>New symptoms <span class="muted small">· context cards</span></h3><div class="list sym">'
+                + "".join(rows) + "</div>")
+
+    def sym_said(self, c, path):
+        items = []
+        for s in c["said"]:
+            pills = []
+            if s["unchecked"]:
+                pills.append(f'<span class="pill mt">machine transcript, not yet listened</span>')
+            if s["negated"]:
+                pills.append('<span class="pill neutral">said as a negative</span>')
+            if s["low_confidence"]:
+                pills.append('<span class="pill neutral">low confidence</span>')
+            kind = "voice note" if s["kind"] == "statement" else "recorded symptom"
+            items.append(f'<li{" class=\"unchecked\"" if s["unchecked"] else ""}><span class="aw">“{ESC(s["text"])}”</span> '
+                         f'<span class="xs muted">{ESC(kind)} · {ESC(fdate(s["at"], "minute" if len(s["at"]) > 10 else "day"))}</span> '
+                         + " ".join(pills) + "</li>")
+        listener = f' · {ESC(c["listener"])}' if c["listener"] else ""
+        return (f'<section class="s1"><h2>1. What was said</h2><ul>{"".join(items)}</ul>'
+                f'<p class="xs muted">Source: {self.src_chip(path, c["said"][0]["fid"])}{listener}. '
+                f'Body site from the words: {ESC(", ".join(s["name"] for s in c["sites"]))}.</p></section>')
+
+    def sym_warn(self, c, family):
+        out = ['<section class="s5"><h2>5. Warning signs</h2>']
+        if c["modifiers"] and not family:
+            out.append('<p class="small">For this person (from the records): '
+                       + ESC("; ".join(m["name"] for m in c["modifiers"])) + ".</p>")
+        for t in cardlib.TIERS:
+            ws = [w for w in c["warnings"] if w["tier"] == t]
+            if not ws:
+                continue
+            label, ptxt = c["tiers"][t]
+            out.append(f'<p class="tierpath"><span class="tier">Tier {t}</span><b>{ESC(label[:1].upper() + label[1:])}:</b> {ESC(ptxt)}</p><ul>')
+            for w in ws:
+                out.append(f'<li><span class="tier">Tier {t}</span>{ESC(w["family"] if family else w["owner"])} '
+                           f'<span class="rid">{ESC(w["id"])}</span></li>')
+            out.append("</ul>")
+        if not family:
+            srcs = list(dict.fromkeys(f'{w["source"]["publisher"]}: {w["source"]["title"]}' for w in c["warnings"]))
+            checked = max((w["source"]["checked"] for w in c["warnings"]), default="")
+            status = "doctor sign-off pending" if c["rules_status"] != "signed_off" else "signed off by the treating doctor"
+            out.append(f'<p class="xs muted">From rules, not free text: generic warning signs (<span class="aw">{ESC("; ".join(srcs))}</span>; checked '
+                       f'{ESC(fdate(checked))}), tiers from the family context page; {status} (rules {ESC(c["rules_version"])}).</p>')
+        out.append("</section>")
+        return "".join(out)
+
+    def sym_close(self, c):
+        cl = c["closing"]
+        label = c["tiers"][cl["tier"]][0]
+        before = "".join(f"<li>{ESC(b)}</li>" for b in cl["before_using"])
+        return ('<section class="s7"><h2>7. What would close it</h2><ul>'
+                f'<li>Better within {ESC(cl["better_days"])} days: say so in a voice note; nothing else to do.</li>'
+                f'<li>Lasts more than {cl["max_days"]} day{"s" if cl["max_days"] != 1 else ""} (from {ESC(fdate(cl["review_on"]))}), '
+                f'or any warning sign above: <span class="tier">Tier {ESC(cl["tier"])}</span>{ESC(label)} (a Tier A sign: Tier A).</li>'
+                f'{before}</ul><p class="xs muted">First said {c["days_since"]} day{"s" if c["days_since"] != 1 else ""} ago.</p></section>')
+
+    def sym_owner(self, p, c, path, family_path):
+        out = [f'<main class="card-sym" data-card="{ESC(c["id"])}">',
+               f'<p><a class="back" href="{Site.rel(path, f"{p.ns}/overview.html")}">‹ Overview</a> · '
+               f'<a href="{Site.rel(path, family_path)}">Family version</a></p>',
+               '<h1>Symptom card</h1><p class="small muted">Built from the records, the label cache and fixed rules; no agent '
+               'run. Things shown together are alongside each other, never a cause.</p>', self.sym_said(c, path)]
+        # 2. same day and day before
+        items = []
+        for a in c["alongside"]:
+            cls = ' class="unchecked"' if a["unchecked"] else ""
+            pill = ' <span class="pill mt">machine transcript, not yet listened</span>' if a["unchecked"] else ""
+            items.append(f'<li{cls}><span class="xs muted">{ESC(fdate(a["at"], "minute" if len(a["at"]) > 10 else "day"))}</span> '
+                         f'<span class="aw">{ESC(gv.short(a["text"], 160))}</span>{pill}</li>')
+        for r in c["readings"]:
+            items.append(f'<li><span class="xs muted">{ESC(fdate(r["day"]))}</span> home {ESC(r["series"])} {ESC(r["value"])} '
+                         f'{ESC(r["unit"])}: {ESC(r["words"])}</li>')
+        out.append('<section class="s2"><h2>2. Same day and day before</h2><p class="xs muted">As written, alongside. Not a cause. '
+                   'Home readings against this person\'s own usual range (the running profile\'s method).</p>'
+                   + (f'<ul>{"".join(items)}</ul>' if items else '<p class="small muted">Nothing else recorded on these two days.</p>')
+                   + "</section>")
+        # 3. medicines alongside
+        m = c["meds"]
+        ch = "".join(f'<li><b class="aw">{ESC(x["drug"])}</b>: <span class="aw">{ESC(x["what"])}</span> on {ESC(fdate(x["at"]))} '
+                     f'({x["days_before"]} day{"s" if x["days_before"] != 1 else ""} before)</li>' for x in m["changes"])
+        lg = ", ".join(f'{x["drug"]} (since {fdate(x["since"])})' for x in m["long"])
+        out.append('<section class="s3"><h2>3. Medicines alongside</h2><p class="xs muted">Shown alongside, not as a cause. '
+                   f'Started, stopped or changed in the {cardlib.CHANGE_DAYS} days before, as recorded.</p>'
+                   + (f"<ul>{ch}</ul>" if ch else '<p class="small">No medicine first recorded, stopped or changed in these days.</p>')
+                   + (f'<p class="small">Long-standing: <span class="aw">{ESC(lg)}</span>.</p>' if lg else "") + "</section>")
+        # 4. labels
+        rows = []
+        for r in c["labels"]:
+            name = f'<b class="aw">{ESC(r["drug"])}</b>' + (f' <span class="aw">({ESC(r["generic"])})</span>' if r["generic"] else "")
+            if not r["parts"]:
+                rows.append(f"<li>{name}: {ESC(r['state'])}.</li>")
+                continue
+            parts = []
+            for pt in r["parts"]:
+                who = f'{ESC(pt["query"])}: ' if len(r["parts"]) > 1 else ""
+                if pt["quotes"]:
+                    qs = "".join(f'<li>{"label mentions"} <q class="aw">{ESC(q["text"])}</q> <span class="setid">set id '
+                                 f'{ESC(q["set_id"])} · {ESC(q["section"])} · label {ESC(label_date(q["effective"]))}</span></li>'
+                                 for q in pt["quotes"])
+                    parts.append(f"{who}<ul>{qs}</ul>")
+                else:
+                    sid = f' <span class="setid">set id {ESC(pt["set_id"])}</span>' if pt.get("set_id") else ""
+                    parts.append(f"{who}{ESC(pt['state'])}{sid}")
+            fetched = f' <span class="xs muted">(fetched {ESC(fdate(r["fetched_at"]))})</span>' if r.get("fetched_at") else ""
+            rows.append(f"<li>{name}{fetched}: " + "; ".join(parts) + "</li>")
+        out.append('<section class="s4"><h2>4. What the labels say</h2><p class="xs muted">US label text (openFDA/DailyMed, public '
+                   f'domain) that mentions: {ESC(", ".join(c["terms"][:12]))}. A label lists what was reported, not what '
+                   'happened here.</p>' + (f'<ul>{"".join(rows)}</ul>' if rows else '<p class="small">No current medicines recorded.</p>')
+                   + "</section>")
+        out.append(self.sym_warn(c, family=False))
+        # 6. what to ask + DM
+        qs = "".join(f"<li>{ESC(q)}</li>" for q in c["questions"])
+        msg = cardlib.dm_text(c, p.display)
+        if self.dx_api:
+            form = (f'<form method="post" action="{ESC(self.dx_api)}/ask/{ESC(p.ns)}" accept-charset="utf-8" class="voice dx">'
+                    f'<input type="hidden" name="card" value="{ESC(c["id"])}"><input type="hidden" name="text" value="{ESC(msg)}">'
+                    '<div class="modes"><button type="submit">Send these questions to my DM</button></div>'
+                    '<p class="xs muted">Goes to the owner\'s private Telegram chat only (never the group), within about 2 '
+                    'minutes.</p></form>')
+        else:
+            first, _, rest = msg.partition("\n")  # the first line quotes what was said (as written)
+            form = (f'<pre class="dm"><span class="aw">{ESC(first)}</span>\n{ESC(rest)}</pre>'
+                    '<p class="xs muted">Read-only build: no send endpoint.</p>')
+        out.append(f'<section class="s6"><h2>6. What to ask</h2><ol>{qs}</ol>{form}</section>')
+        out.append(self.sym_close(c))
+        if c["inferred"]:
+            i = c["inferred"]
+            out.append('<div class="inferred" role="note"><div class="label">' + icon("status") + 'Agent-inferred · not from a '
+                       f'document</div><p>Most likely link ({ESC(i["bucket"] or "")}): {ESC(i["statement"])}</p>'
+                       f'<div class="foot">{ESC(i["id"])} from the diagnostic loop. Not a diagnosis. Doctors decide.</div></div>')
+        out.append("</main>")
+        return "".join(out)
+
+    def sym_family(self, p, c, path, owner_path):
+        return "".join([f'<main class="card-sym family" data-card="{ESC(c["id"])}">',
+                        f'<p><a class="back" href="{Site.rel(path, f"{p.ns}/overview.html")}">‹ Overview</a> · '
+                        f'<a href="{Site.rel(path, owner_path)}">Full card</a></p>',
+                        '<h1>What to watch</h1><p class="small muted">Plain words for the family: what was said, what to '
+                        'watch for, and when it is done.</p>', self.sym_said(c, path), self.sym_warn(c, family=True),
+                        self.sym_close(c), "</main>"])
 
     def dx_html(self, p, path):
         """Agent run block: newest diagnostic-loop note (tools/dx/run, ADR 013) and, with --dx-api, the trigger form."""

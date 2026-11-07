@@ -25,6 +25,8 @@ Without --ns the oldest spool file in <state>/spool is taken (exit 0 and nothing
  6. commit "docs: <ns> dx loop NN (delta, site trigger) [skip ci]" as "saturn dx-loop" (signing follows the clone's
     git config, as tools/site/voice-api), push origin main (pull --rebase and retry once); a refused remote leaves the
     commit local and the state "awaiting-key";
+ 0. before anything else, sends the ready DMs a symptom card queued (<state>/dm/, POST /ask/<ns> on
+    tools/site/dx-api) to the admin's private chat; sent ones are deleted, failed ones wait, older than 24 h are dropped.
  7. a 10-line result to the admin's private DM (TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID from --notify-env; a
     group chat id is refused), and the state row (note, commit, pushed, cost, turns).
 Exit: 0 done or nothing to do; 1 failed; 2 usage/preflight; 3 committed locally, push refused (awaiting key).
@@ -255,6 +257,23 @@ def tele_send(notify_env, text, api="https://api.telegram.org"):
             return r.status == 200
     except Exception as e:  # noqa: BLE001 (a failed DM must not fail the run)
         log(f"DM failed: {type(e).__name__}"); return False
+
+
+def send_dms(state, notify_env, api):
+    """Ready DMs queued by a symptom card's button (POST /ask/<ns>): oldest first, to the admin's private chat only
+    (tele_send refuses group ids). Sent -> deleted; failed -> kept for the next timer run; older than 24 h -> dropped."""
+    now = dxstate.utcnow()
+    for path, row in state.pending_dms():
+        try:
+            age = now - dxstate.parse(row["requested_at"])
+        except (KeyError, ValueError):
+            path.unlink(); continue
+        if age > dxstate.DM_MAX_AGE:
+            log(f"dm dropped (older than 24 h): {path.name}"); path.unlink(); continue
+        if notify_env and tele_send(notify_env, row.get("text") or "", api):
+            path.unlink(); log(f"dm sent: {path.name}")
+        else:
+            log(f"dm kept for the next run: {path.name}")
 
 
 def section(text, head_re):
@@ -528,6 +547,7 @@ def main(argv=None):
     else:
         if a.dry_run:
             ap.error("--dry-run needs --ns")
+        send_dms(state, a.notify_env, a.telegram_api)
         row = state.take()
         if row is None:
             return 0

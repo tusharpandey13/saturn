@@ -14,6 +14,11 @@ Routes:
                           picks up. 202 queued; 409 already queued/running or cap reached ("next allowed at ...");
                           403 identity required / not in --allow-login; 404 unknown namespace; 503 awaiting key (the job's deploy key is
                           not registered yet) or records clone not ready.
+  POST /ask/<ns>          a symptom card's "Send these questions to my DM" form (fields card, text): same identity
+                          rule; text 1-1200 characters, at most 12 lines, the card word list on every line after the
+                          first (the first quotes what was said); cap 20 per 24 h. Writes <state>/dm/<ts>-<ns>.json;
+                          tools/dx/run sends it to the admin's private chat on its next timer start (never a group).
+                          202 queued; 403; 404; 422 text refused; 429 cap.
   GET  /dx/<ns>/status    last run (state, times, note path, commit, pushed), caps, next_allowed_at; HTML when the
                           client accepts text/html (a browser), else JSON.
 Caps (owner defaults, tools/dx/README.md): 1 accepted request per 24 h and 8 per 30 days, counted from the state file
@@ -27,10 +32,14 @@ HERE = pathlib.Path(__file__).resolve().parent
 PRODUCT = HERE.parents[1]
 sys.path.insert(0, str(PRODUCT / "tools" / "kb"))
 sys.path.insert(0, str(PRODUCT / "tools" / "dx"))
+sys.path.insert(0, str(PRODUCT / "tools" / "symptom"))
 import records_config  # noqa: E402
 import dxstate  # noqa: E402
+import cardlib  # noqa: E402  (the card word list)
 
 ROUTE_RE = re.compile(r"^/dx/([a-z][a-z0-9-]*)/(run|status)$")
+ASK_RE = re.compile(r"^/ask/([a-z][a-z0-9-]*)$")
+ASK_MAX, ASK_LINES = 1200, 12
 MAX_BODY = 16 * 1024
 MAX_BY = 120
 DEFAULT_BY = "dx-trigger"
@@ -86,6 +95,24 @@ class Api:
             status, reason, nxt = err
             raise ApiError(status, reason, {"next_allowed_at": nxt})
         return 202, {"ok": True, "queued": True, "run": row, "site": self.site}
+
+    def ask(self, ns, by, from_header, fields):
+        if not from_header:
+            raise ApiError(403, "identity required")
+        if by.lower() not in self.allow:
+            raise ApiError(403, "this identity may not send")
+        self.check_ns(ns)
+        text = str(fields.get("text") or "").replace("\r\n", "\n").strip()
+        card = re.sub(r"[^A-Za-z0-9._-]", "", str(fields.get("card") or ""))[:120]
+        if not text or len(text) > ASK_MAX or text.count("\n") >= ASK_LINES:
+            raise ApiError(422, f"text must be 1 to {ASK_MAX} characters and at most {ASK_LINES} lines")
+        hits = cardlib.check_words("\n".join(text.splitlines()[1:]))
+        if hits:
+            raise ApiError(422, f"word list: {hits[0]!r}")
+        row, err = self.state.enqueue_dm(ns, card, by, text)
+        if err:
+            raise ApiError(err[0], err[1])
+        return 202, {"ok": True, "queued": True, "dm": row}
 
     def status(self, ns):
         self.check_ns(ns)
@@ -192,22 +219,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         is_form, hdr = False, None
         try:
-            m = ROUTE_RE.match(self.path.split("?")[0])
-            if not m or m.group(2) != "run":
+            path = self.path.split("?")[0]
+            m, ask = ROUTE_RE.match(path), ASK_RE.match(path)
+            if not ask and (not m or m.group(2) != "run"):
                 raise ApiError(404, "not found")
             fields, is_form = self._fields()
             hdr = (self.headers.get("Tailscale-User-Login") or "").strip()
             by = clean_by(hdr)
-            status, out = self.server.api.run(m.group(1), by, bool(hdr))
+            if ask:
+                status, out = self.server.api.ask(ask.group(1), by, bool(hdr), fields)
+            else:
+                status, out = self.server.api.run(m.group(1), by, bool(hdr))
         except ApiError as e:
             if is_form:
                 page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
-                        f"<title>Not queued</title></head><body><p>Not queued: {esc(e.msg)}.</p><p>Go back to the overview.</p></body></html>")
+                        f"<title>Not queued</title></head><body><p>Not queued: {esc(e.msg)}.</p><p>Go back to the page.</p></body></html>")
                 self._send(e.status, page, "text/html; charset=utf-8")
             else:
                 self._json(e.status, {"ok": False, "error": e.msg, **e.extra})
             self._done(e.status, hdr); return
-        if is_form:
+        if is_form and "dm" in out:
+            page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
+                    "<title>Queued</title></head><body><p>Queued for your private Telegram chat: the questions arrive within about "
+                    f"2 minutes (later while a loop run is going). Go back to the card.</p><p><small>{FOOT}</small></p></body></html>")
+            self._send(status, page, "text/html; charset=utf-8")
+        elif is_form:
             row = out["run"]
             page = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow">'
                     f"<title>Queued</title></head><body><p>Queued: a delta run of the loop for {esc(row['ns'])}, requested by "

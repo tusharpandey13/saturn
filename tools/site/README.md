@@ -39,3 +39,13 @@ diagnostic loop, ADR 013) in its own records clone and reports to the admin DM. 
 30 days, are enforced by the endpoint, not the page. The overview's CSP `form-action` is widened to that origin only.
 Without the flag the overview is read-only (status line plus "Read-only build: no run endpoint."). Defaults, caps,
 tool restrictions and the verifier: [tools/dx/README.md](../dx/README.md). Tests: `python3 -I tools/site/test_dx_api.py`.
+
+Symptom context cards ([design](../../docs/design/symptom-context-card.md), `tools/symptom`): every source with a new
+symptom (an observation with category symptom or a voice-note statement with category symptom, last 14 days) gets
+`<ns>/symptom/<id>.html` (owner: what was said with listener status, same day and day before, medicines alongside,
+label mentions with set ids, rule-based warning signs with rule id and tier, at most 5 questions, what would close it,
+and an agent-inferred line only when an inference cites the symptom) and `<ns>/symptom/<id>-family.html` (sections 1, 5
+in calm words, 7). The overview lists them under "What changed"; timeline rows link to them. The build reads only
+`<records>/labels/` (written by `tools/symptom/labels fetch`) and fails on a word-list hit in the card's own words. With
+`--dx-api URL` the owner card posts its questions to `<URL>/ask/<ns>` (one DM to the admin; CSP `form-action` widened
+to that origin on card pages); without it the message is shown to copy.

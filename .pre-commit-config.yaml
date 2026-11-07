@@ -61,6 +61,12 @@ repos:
         entry: python3 -I tools/inference/test_inference.py
         pass_filenames: false
         files: ^(tools/inference/|tools/kb/records_config.py|schema/schema.sql)
+      - id: symptom-cards
+        name: symptom context cards, label cache, card DM path (synthetic records, stub APIs)
+        language: system
+        entry: sh -c 'python3 -I tools/symptom/test_cards.py && python3 -I tools/symptom/test_labels.py && python3 -I tools/site/test_dx_api.py && python3 -I tools/dx/test_dx.py'
+        pass_filenames: false
+        files: ^(tools/symptom/|tools/site/|tools/dx/|tools/crossref/|tools/inference/inference|tools/kb/|schema/schema.sql)
       - id: catalog
         name: service catalog tool (synthetic example catalog)
         language: system

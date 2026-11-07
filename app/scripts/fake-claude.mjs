@@ -26,7 +26,10 @@ if (mode === "limit") {
 const none = { readings: [], symptoms: [], media_kind: "none", confidence: 0.9, unreadable_reason: null };
 const results = [...texts.join("\n").matchAll(/Message (\d+): [^\n]*/g)].map(([line, n]) => {
   const bp = line.match(/Text: """(\d{2,3})\/(\d{2,3})(?:\s+(\d{2,3}))?/);
-  if (bp) return { msg: +n, ...none, readings: [{ type: "bp", value: +bp[1], value2: +bp[2], value3: bp[3] ? +bp[3] : null, unit: "mmHg", measured_at: null }] };
+  // "chakkar" (dizziness) in the same text -> one symptom row, so the e2e reaches a symptom card on the site
+  const symptoms = /chakkar/i.test(line) ? [{ symptom_type: "dizziness", location: null, side: "unknown", character: [], severity: null, duration_min: null,
+    at_rest: null, associated: [], triggers: [], onset_at: null, free_text: "chakkar" }] : [];
+  if (bp) return { msg: +n, ...none, symptoms, readings: [{ type: "bp", value: +bp[1], value2: +bp[2], value3: bp[3] ? +bp[3] : null, unit: "mmHg", measured_at: null }] };
   if (/Attachment follows/.test(line)) return { msg: +n, ...none, media_kind: "device_reading", confidence: 0.3, unreadable_reason: "display blurred" };
   return { msg: +n, ...none };
 });

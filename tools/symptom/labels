@@ -1,0 +1,179 @@
+#!/usr/bin/env -S python3 -I
+"""Label cache for symptom cards (design: docs/design/symptom-context-card.md section 6). The only networked step.
+
+Usage (from a product checkout, after tools/kb/build):
+  tools/symptom/labels fetch --records DIR [--drug ref:drug:ID]... [--max-age-days 90] [--force] [--api URL] [--today YYYY-MM-DD]
+      fetch openFDA drug labels for the current medicines (v_meds_current; plus any stopped in the last 30 days) with no cache entry or an
+      entry older than --max-age-days; --drug limits to those ids; --force refetches. Writes <records>/labels/<id>.json.
+  tools/symptom/labels check --records DIR
+      offline: list those medicines without a cache entry (exit 1 when any).
+
+Per drug: the generic and the ref:drug ingredients are the US (INN) names. A combination is asked first as
+"A and B", then each ingredient alone; each name with product_type HUMAN PRESCRIPTION DRUG first, then any type. Among
+several labels: has adverse_reactions, the longest adverse_reactions, the newest effective_time, then set_id. Only the
+sections boxed_warning, warnings_and_cautions, warnings, precautions and adverse_reactions are kept, with set_id (the
+DailyMed set id) and effective_time. openFDA and SPL label text are public domain; no key is needed at this volume
+(openFDA: 240 requests per minute, 1,000 per day per IP without a key); the tool sleeps between requests. A network
+error keeps the old entry, carries on with the next drug and exits 1. Stdlib only. Record and flag only.
+"""
+import argparse, datetime, json, os, pathlib, re, sqlite3, sys, time, urllib.error, urllib.parse, urllib.request
+
+API = "https://api.fda.gov"
+KEEP = ("boxed_warning", "warnings_and_cautions", "warnings", "precautions", "adverse_reactions")
+CHOICE = ("openFDA openfda.generic_name exact match; prefer product_type HUMAN PRESCRIPTION DRUG; has adverse_reactions; "
+          "longest adverse_reactions; newest effective_time; then set_id")
+UA = "saturn-labels/1"
+GAP = 0.3
+
+
+class FetchError(Exception):
+    pass
+
+
+def names_for(con, drug_id, generic):
+    names = [g.strip().lower() for g in re.split(r"\s*(?:/|\+|,|\band\b)\s*", generic or "") if g.strip()]
+    r = con.execute("SELECT data FROM ref WHERE id = ?", (drug_id,)).fetchone()
+    for i in (json.loads(r[0]).get("ingredients") or []) if r and r[0] else []:
+        n = i.get("name") if isinstance(i, dict) else i
+        if isinstance(n, str) and n.strip() and n.strip().lower() not in names:
+            names.append(n.strip().lower())
+    return [n for n in names if re.fullmatch(r"[a-z0-9][a-z0-9 .,'()-]*", n)]
+
+
+def current(con, today):
+    """Current medicines plus those whose latest statement (e.g. a stop) is within the last 30 days: a card shows the
+    labels of medicines stopped in the 14 days before a symptom too."""
+    since = (datetime.date.fromisoformat(today) - datetime.timedelta(days=30)).isoformat()
+    rows = con.execute("SELECT DISTINCT drug, generic FROM v_meds_current WHERE drug LIKE 'ref:drug:%' AND "
+                       "(display_status NOT IN ('stopped', 'not-in-current-list') OR substr(at, 1, 10) >= ?) ORDER BY drug",
+                       (since,)).fetchall()
+    return [(d, g) for d, g in rows]
+
+
+class Client:
+    def __init__(self, api):
+        self.api, self.last = api.rstrip("/"), 0.0
+
+    def search(self, name, rx_only):
+        q = f'openfda.generic_name:"{name}"' + (' AND openfda.product_type:"HUMAN PRESCRIPTION DRUG"' if rx_only else "")
+        url = f"{self.api}/drug/label.json?search={urllib.parse.quote(q)}&limit=25"
+        dt = time.monotonic() - self.last
+        if dt < GAP:
+            time.sleep(GAP - dt)
+        self.last = time.monotonic()
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode("utf-8")).get("results") or []
+        except urllib.error.HTTPError as e:
+            if e.code == 404:  # openFDA answers 404 NOT_FOUND when nothing matches
+                return []
+            raise FetchError(f"HTTP {e.code} for {name!r}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise FetchError(f"{type(e).__name__} for {name!r}")
+
+
+def pick(results):
+    with_ar = [r for r in results if r.get("adverse_reactions")]
+    pool = with_ar or results
+    return sorted(pool, key=lambda r: (-len(" ".join(r.get("adverse_reactions") or [])), -int(r.get("effective_time") or 0),
+                                       r.get("set_id") or ""))[0] if pool else None
+
+
+def entry(client, name):
+    res = client.search(name, True) or client.search(name, False)
+    best = pick(res)
+    if not best:
+        return {"query": name, "status": "not-available"}
+    of = best.get("openfda") or {}
+    return {"query": name, "status": "found", "set_id": best.get("set_id"), "effective_time": best.get("effective_time"),
+            "title": ((of.get("brand_name") or of.get("generic_name") or [name])[0]),
+            "product_type": (of.get("product_type") or [None])[0], "candidates": len(res), "choice": CHOICE,
+            "sections": {k: " ".join(best[k]) for k in KEEP if best.get(k)}}
+
+
+def fetch_one(client, con, drug_id, generic, today):
+    names = names_for(con, drug_id, generic)
+    labels = []
+    if len(names) > 1:
+        for combo in (" and ".join(names), " and ".join(sorted(names))):
+            e = entry(client, combo)
+            if e["status"] == "found":
+                labels = [e]
+                break
+    if not labels:
+        labels = [entry(client, n) for n in names]
+    found = sum(1 for e in labels if e["status"] == "found")
+    status = "not-available" if not found else "found" if found == len(labels) else "partial"
+    return {"schema": "label-cache/1", "drug_id": drug_id, "queried": names, "fetched_at": today, "source": "openFDA drug/label",
+            "licence": "US label text: public domain (openFDA, DailyMed SPL)", "status": status, "labels": labels}
+
+
+def write_atomic(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def cache_path(root, drug_id):
+    return root / "labels" / (drug_id.split(":", 2)[2] + ".json")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("cmd", choices=("fetch", "check"))
+    ap.add_argument("--records", required=True)
+    ap.add_argument("--db", default=None, help="kb.sqlite (default <records>/data/kb.sqlite)")
+    ap.add_argument("--drug", action="append", default=[])
+    ap.add_argument("--max-age-days", type=int, default=90)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--api", default=API)
+    ap.add_argument("--today", default=None)
+    a = ap.parse_args(argv)
+    root = pathlib.Path(a.records).resolve()
+    db = pathlib.Path(a.db) if a.db else root / "data" / "kb.sqlite"
+    if not db.is_file():
+        print(f"error: {db} missing: run tools/kb/build first", file=sys.stderr)
+        return 2
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    today = a.today or datetime.date.today().isoformat()
+    meds = current(con, today)
+    if a.drug:
+        want = set(a.drug)
+        meds = [m for m in meds if m[0] in want] + [(d, None) for d in want - {m[0] for m in meds}]
+    if a.cmd == "check":
+        missing = [d for d, _ in meds if not cache_path(root, d).is_file()]
+        for d in missing:
+            print(f"missing: {d}")
+        print(f"{len(meds)} current medicine(s), {len(meds) - len(missing)} with a label cache entry, {len(missing)} missing")
+        return 1 if missing else 0
+    client, counts, failed = Client(a.api), {"found": 0, "partial": 0, "not-available": 0, "kept": 0}, 0
+    for drug_id, generic in meds:
+        p = cache_path(root, drug_id)
+        if p.is_file() and not a.force:
+            try:
+                old = json.loads(p.read_text(encoding="utf-8"))
+                age = (datetime.date.fromisoformat(today) - datetime.date.fromisoformat(old["fetched_at"])).days
+                if age <= a.max_age_days:
+                    counts["kept"] += 1
+                    continue
+            except (ValueError, KeyError):
+                pass
+        if generic is None:
+            r = con.execute("SELECT json_extract(data, '$.generic') FROM ref WHERE id = ?", (drug_id,)).fetchone()
+            generic = r[0] if r else None
+        try:
+            obj = fetch_one(client, con, drug_id, generic, today)
+        except FetchError as e:
+            failed += 1
+            print(f"error: {drug_id}: {e}; old entry kept", file=sys.stderr)
+            continue
+        write_atomic(p, obj)
+        counts[obj["status"]] += 1
+    print("labels: " + ", ".join(f"{k} {v}" for k, v in counts.items()) + (f", failed {failed}" if failed else ""))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

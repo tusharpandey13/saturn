@@ -55,7 +55,8 @@ Format: `<ns>:<class>:<local>`. `ns` is one of the `namespaces` in `records.yaml
 | Cross-check flags and claims register (ADR 012) | `crossref/` (checks, owner feedback, derived flag and claim state, run log) and the generated `docs/health/<ns>/flags.md`, `claims.md`; written by `tools/crossref` ([README](../tools/crossref/README.md)); give feedback with its `feedback` command |
 | Agent-inferred records (inferences; diagnostic loop, ADR 013) | `inferences/<ns>/inferences.ndjson` (append-only snapshots, last row per id wins) and the generated `docs/health/<ns>/status.md`; written only by `tools/inference` ([README](../tools/inference/README.md)); never KB facts |
 | Fitness data (ADR 015; PHI) | raw `sources/<ns>/media/{strava,polar,zwift,mywhoosh}/` (gzip, never edited), rows `data/<ns>/docs/<date>-fitness-…ndjson`, page `docs/health/<ns>/fitness.md`; written only by `tools/fitness` ([README](../tools/fitness/README.md)); query `v_fitness` |
-| Records-local config | `records.yaml`, `config/thresholds.yaml` (optional red-flag thresholds, below), `meta/stt-vocab.txt` (optional STT vocabulary), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
+| Label cache for symptom cards (public-domain US label text, per drug id) | `labels/<drug>.json`, written only by `tools/symptom/labels fetch` ([design](design/symptom-context-card.md)); refetch after a medicine ingest and commit; never edited by hand |
+| Records-local config | `records.yaml`, `config/thresholds.yaml` (optional red-flag thresholds, below), `meta/stt-vocab.txt` (optional STT vocabulary), `config/symptom-card.json` (optional symptom-card overrides), `meta/extraction-context.md` (optional extraction context), the denylist and the docs-site sanitiser |
 
 ### Fitness data (device-reported)
 
@@ -148,7 +149,7 @@ Facts the KB build derives from Telegram (`data/telegram/YYYY-MM.ndjson`) cannot
 
 | New input | Update |
 |---|---|
-| Prescription / medicine photo | `medications.md` (+ discrepancies), `timeline.md`, `questions.md`; mark briefs `regenerate: true` |
+| Prescription / medicine photo | `medications.md` (+ discrepancies), `timeline.md`, `questions.md`; mark briefs `regenerate: true`; `tools/symptom/labels fetch` for a new drug id |
 | Test result / imaging | `timeline.md`, `summary.md` "results pending", `problems.md` if a doctor wrote a diagnosis |
 | Visit / admission / event | `timeline.md`, `care-team.md` (last contact), `summary.md` recent events, `family/actions.md` |
 | Family / patient report or voice log | `docs/log/extraction/patient-reported/`, then `timeline.md` (tagged family-reported), `questions.md` |

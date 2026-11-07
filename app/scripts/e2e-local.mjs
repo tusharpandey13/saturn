@@ -116,7 +116,7 @@ async function main() {
   check((await post({ update_id: 1 }, "nope")).status === 401, "expected 401");
 
   console.log("4/9 vitals text in the group -> inbox, no group reply (ack_mode all); redelivery is a no-op");
-  const text = { update_id: 900001, message: { message_id: 1, date: now(), chat: { id: GROUP }, from: { id: ALICE, is_bot: false }, text: "120/80 72" } };
+  const text = { update_id: 900001, message: { message_id: 1, date: now(), chat: { id: GROUP }, from: { id: ALICE, is_bot: false }, text: "120/80 72 chakkar" } };
   check((await post(text)).status === 200, "webhook not 200");
   check((await post(text)).status === 200, "redelivery not 200");
 
@@ -211,6 +211,15 @@ async function main() {
   check(kb.some((r) => JSON.stringify(r).includes('"value":120') && JSON.stringify(r).includes('"value2":80')), "BP 120/80 not in NDJSON");
   const built = execFileSync("python3", ["-I", join(APP, "..", "tools", "kb", "build"), "--records", EXAMPLE, "--telegram", join(root, "data", "telegram"), "--db", join(root, "kb.sqlite")], { encoding: "utf8" });
   check(built.startsWith("ok:"), `kb build: ${built}`);
+  // batch -> KB -> site: the dizziness said with the BP text gets a symptom context card (no agent run)
+  const siteOut = mkdtempSync(join(tmpdir(), "saturn-e2e-site-"));
+  const today = new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10); // IST date
+  execFileSync("python3", ["-I", join(APP, "..", "tools", "site", "build"), "--records", EXAMPLE, "--db", join(root, "kb.sqlite"), "--out", siteOut, "--today", today], { encoding: "utf8" });
+  const cardsBuilt = readdirSync(siteOut, { recursive: true }).filter((f) => /\/symptom\/[^/]+(?<!-family)\.html$/.test(String(f)));
+  check(cardsBuilt.length === 1, `symptom cards on the site: ${JSON.stringify(cardsBuilt)}`);
+  const cardHtml = readFileSync(join(siteOut, String(cardsBuilt[0])), "utf8");
+  check(["1. What was said", "5. Warning signs", "7. What would close it"].every((h) => cardHtml.includes(h)) && /dizz/i.test(cardHtml), "symptom card content");
+  rmSync(siteOut, { recursive: true, force: true });
 
   console.log("9/9 finish -> inbox rows done, digest DM'd to the admin, nothing to the group");
   const before = sent().length;

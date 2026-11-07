@@ -299,6 +299,36 @@ class RunTest(unittest.TestCase):
         self.assertFalse(RUN.tele_send(str(self.notify), "x", self.api))
         self.assertEqual(TeleStub.got, [])
 
+    def test_card_dm_is_sent_to_the_admin_only(self):
+        st = dxstate.State(self.state)
+        row, err = st.enqueue_dm("alice", "c1", "owner@example", "Questions for Alice: x\n1. Better today?")
+        self.assertIsNone(err)
+        r = self.run_tool()  # empty run spool: the DM still goes out, no loop run starts
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(TeleStub.got, [("/bott0k/sendMessage", {"chat_id": 123, "text": "Questions for Alice: x\n1. Better today?",
+                                                                 "disable_web_page_preview": True})])
+        self.assertEqual(list((self.state / "dm").iterdir()), [])
+        self.assertFalse((self.state / "state.json").exists())
+
+    def test_card_dm_kept_on_failure_and_group_refused(self):
+        st = dxstate.State(self.state)
+        st.enqueue_dm("alice", "c1", "owner@example", "Questions for Alice: x")
+        self.notify.write_text("TELEGRAM_BOT_TOKEN=t0k\nTELEGRAM_ADMIN_CHAT_ID=-100123\n")  # a group id: refused, kept
+        self.assertEqual(self.run_tool().returncode, 0)
+        self.assertEqual(TeleStub.got, [])
+        self.assertEqual(len(list((self.state / "dm").iterdir())), 1)
+        old = dxstate.utcnow() - datetime.timedelta(hours=25)
+        st.enqueue_dm("alice", "c2", "owner@example", "old", now=old)
+        for f in (self.state / "dm").iterdir():
+            d = json.loads(f.read_text())
+            if d["card"] == "c2":
+                self.assertEqual(d["requested_at"], dxstate.iso(old))
+        self.notify.write_text("TELEGRAM_BOT_TOKEN=t0k\nTELEGRAM_ADMIN_CHAT_ID=123\n")
+        r = self.run_tool()
+        self.assertIn("dm dropped (older than 24 h)", r.stderr + r.stdout)
+        self.assertEqual([b["text"] for _, b in TeleStub.got], ["Questions for Alice: x"])
+        self.assertEqual(list((self.state / "dm").iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

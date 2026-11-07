@@ -5,6 +5,8 @@ Layout of the state directory (owned by the job's user; PHI-free apart from name
   state.lock        flock target
   spool/<ns>.json   a queued request (the row); tools/dx/run takes the oldest and deletes it
   awaiting-key      marker written by the host when the job's deploy key is not registered yet
+  dm/<ts>-<ns>.json a ready admin DM queued by a symptom card's button (POST /ask/<ns>); tools/dx/run sends it
+  asks.json         {"asks": [{ns, card, by, requested_at}]} accepted DM requests (cap ASK_CAP_24H per rolling 24 h)
   runs/<id>/        the job's working files for one run (prompt, evidence pack, claude output): never committed
 
 Row: {id, ns, by, requested_at, state, started_at, finished_at, note, commit, pushed, error, cost_usd, turns, rounds}
@@ -17,6 +19,8 @@ import contextlib, datetime, fcntl, json, pathlib, re
 
 CAP_24H = 1
 CAP_30D = 8
+ASK_CAP_24H = 20       # ready DMs from symptom cards per rolling 24 h (all namespaces)
+DM_MAX_AGE = datetime.timedelta(hours=24)  # an unsent DM older than this is dropped (logged)
 WINDOWS = ((CAP_24H, datetime.timedelta(hours=24)), (CAP_30D, datetime.timedelta(days=30)))
 ACTIVE = ("queued", "running")
 STATES = ("queued", "running", "done", "failed", "awaiting-key")
@@ -48,8 +52,10 @@ class State:
             raise ValueError("scope must be global or ns")
         self.scope = scope
         self.spool = self.root / "spool"
+        self.dm = self.root / "dm"
         self.root.mkdir(parents=True, exist_ok=True)
         self.spool.mkdir(exist_ok=True)
+        self.dm.mkdir(exist_ok=True)
         (self.root / "runs").mkdir(exist_ok=True)
 
     # ---- lock and file
@@ -176,3 +182,35 @@ class State:
         return {"ns": ns, "state": (last or {}).get("state", "never"), "last_run": last, "awaiting_key": self.awaiting_key(),
                 "can_run": ok and not self.active(ns, data) and not self.awaiting_key(), "cap_reason": reason, "next_allowed_at": nxt,
                 "caps": {"per_24h": self.windows[0][0], "per_30d": self.windows[1][0], "scope": self.scope}}
+
+
+    # ---- ready DMs from symptom cards (docs/design/symptom-context-card.md section 10)
+    def enqueue_dm(self, ns, card, by, text, now=None, cap=ASK_CAP_24H):
+        """-> (row, None) or (None, (http_status, reason)). Caps accepted asks per rolling 24 h; writes dm/<ts>-<ns>.json."""
+        now = now or utcnow()
+        if not NS_RE.match(ns or ""):
+            return None, (400, "bad namespace")
+        with self.locked():
+            p = self.root / "asks.json"
+            data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {"asks": []}
+            data["asks"] = [a for a in data["asks"] if now - parse(a["requested_at"]) < datetime.timedelta(days=2)]
+            if sum(1 for a in data["asks"] if now - parse(a["requested_at"]) < datetime.timedelta(hours=24)) >= cap:
+                return None, (429, f"cap reached: {cap} messages per 24 h")
+            row = {"ns": ns, "card": card, "by": by, "requested_at": iso(now)}
+            data["asks"].append(row)
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+            tmp.replace(p)
+            name = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{len(data['asks']):03d}-{ns}.json"
+            (self.dm / name).write_text(json.dumps(dict(row, text=text), ensure_ascii=False) + "\n", encoding="utf-8")
+            return row, None
+
+    def pending_dms(self):
+        """Job side: [(path, row)] oldest first."""
+        out = []
+        for f in sorted(self.dm.glob("*.json")):
+            try:
+                out.append((f, json.loads(f.read_text(encoding="utf-8"))))
+            except ValueError:
+                f.unlink()
+        return out

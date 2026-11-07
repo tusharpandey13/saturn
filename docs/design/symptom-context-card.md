@@ -51,7 +51,7 @@ part; pages `<ns>/symptom/<slug>.html` (owner) and `<ns>/symptom/<slug>-family.h
   `ref:drug` rows hold Indian brands with `generic` and `ingredients`, so the mapping is generic-by-generic. One generic
   returns several labels (repackagers): pick deterministically (rule in §6). openFDA and SPL label text are public
   domain (openFDA licence: CC0/public domain; US government works); brand names are trademarks and are not reproduced
-  beyond the label title. A product with no US label (many Indian combinations, supplements, citicoline-type products)
+  beyond the label title. A product with no US label (many Indian combinations and supplements)
   is "no label available", said plainly.
 - **Red flags.** Wording is transcribed from public NHS pages (headaches, red eye, chest pain, stomach ache, shortness
   of breath, dizziness, stroke symptoms, heart failure symptoms, UTI, hives, apixaban side effects), checked
@@ -153,7 +153,8 @@ several sites may match; order = the file's order.
   product type (OTC). **Choice among labels:** has `adverse_reactions`, then the longest `adverse_reactions` text (the
   full prescribing information, not a short repackager summary), then the newest `effective_time`, then `set_id`; the
   rule is written into `choice`.
-- **Refresh:** `labels fetch --records DIR [--drug ID]... [--max-age-days 90]` fetches current medicines with no entry
+- **Refresh:** `labels fetch --records DIR [--drug ID]... [--max-age-days 90]` fetches current medicines (and those
+  stopped in the last 30 days) with no entry
   or an entry older than the max age; `--force` refetches. Sleeps 0.3 s between requests. A network error leaves the old
   entry untouched and exits 1 after the rest (never writes a half entry).
 - **Offline behaviour:** no entry → "label not fetched yet"; an entry older than 180 days → shown with its fetch date.
@@ -177,7 +178,7 @@ several sites may match; order = the file's order.
 
 - `when`: modifier ids that must all hold; `[]` = generic. A modifier holds from the KB at build time:
   `current_generic_any` against `v_meds_current.generic` and the drug's ingredients (current = not `stopped` /
-  `not-in-current-list`); `antiplatelet_any` likewise; `text_any` against the text of active facts of `kinds`
+  `not-in-current-list`); `text_any` against the text of active facts of `kinds`
   (`text_as_written`, `label`, `value_text`) at word start, skipping a term followed by `(-)` or preceded by `no `,
   within `within_days` of today when set. The card lists the modifiers that held ("For this person: on a blood thinner").
 - `tier`: A, B or C. `owner` and `family` wording are fixed text; `family` is calm (no alarming words; §11).
