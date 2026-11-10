@@ -13,12 +13,12 @@
     "e2e:local": "npm run render && node scripts/e2e-local.mjs"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261024.1",
-    "@types/node": "^26.6.5",
+    "@cloudflare/workers-types": "^5.20261103.1",
+    "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.5",
-    "wrangler": "^4.152.0"
+    "vitest": "^5.1.0",
+    "wrangler": "^4.156.2"
   },
   "description": "Saturn ingest Worker and daily batch",
   "license": "Apache-2.0",
