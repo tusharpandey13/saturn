@@ -7,6 +7,6 @@
     "test": "node --test"
   },
   "dependencies": {
-    "markdown-it": "14.3.3"
+    "markdown-it": "15.0.3"
   }
 }
